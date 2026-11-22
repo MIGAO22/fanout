@@ -89,6 +89,7 @@ func (s *PoolService) Close() {
 		}
 		delete(s.run, id)
 	}
+	clearPoolPorts()
 }
 
 // ensureListener 让监听与组对齐：端口尽量不变（已分发的配置才会继续有效），
@@ -119,6 +120,7 @@ func (s *PoolService) ensureListener(p *Pool) error {
 			log.Printf("出口组 %s 端口回写失败: %v", p.Name, saveErr)
 		}
 	}
+	notePoolPort(p.Port)
 
 	pr := &poolRun{
 		ln:     ln,
@@ -195,6 +197,7 @@ func (s *PoolService) dropListener(id string) {
 	defer s.mu.Unlock()
 	if pr, ok := s.run[id]; ok {
 		if pr.ln != nil {
+			unnotePoolPort(listenPort(pr.ln))
 			_ = pr.ln.Close()
 		}
 		delete(s.run, id)
@@ -468,18 +471,55 @@ func (s *PoolService) egress(identity string) (poolEgress, bool) {
 	return poolEgress{}, false
 }
 
-// poolPorts 返回所有组监听占用的端口，供分配新端口时避开。
+// 组监听端口单独登记在这里，而不是现问 PoolService。
+//
+// 原因是一次自我死锁：Manager.Start 持有 m.mu 写锁时要避开组端口，
+// 而组端口若走 egresses() → resolveMembers() → mgr.Tunnels() 就会去要
+// 同一把 m.mu 的读锁。Go 的 RWMutex 不可重入，同一个 goroutine 拿着写锁再
+// RLock 会永久停摆——并且是把 m.mu 扣着不放，于是新建出口、健康巡检、
+// 存状态、界面轮询一起卡死。所以这条路径上只允许碰下面这一把小锁。
+// 登记表自身从不嵌套调用别的锁，锁序里不再有环。
+var (
+	poolPortMu  sync.Mutex
+	poolPortSet = map[int]bool{}
+)
+
+func notePoolPort(port int) {
+	if port <= 0 {
+		return
+	}
+	poolPortMu.Lock()
+	poolPortSet[port] = true
+	poolPortMu.Unlock()
+}
+
+func unnotePoolPort(port int) {
+	if port <= 0 {
+		return
+	}
+	poolPortMu.Lock()
+	delete(poolPortSet, port)
+	poolPortMu.Unlock()
+}
+
+// clearPoolPorts 清空登记表，只在进程退出时用。
+func clearPoolPorts() {
+	poolPortMu.Lock()
+	poolPortSet = map[int]bool{}
+	poolPortMu.Unlock()
+}
+
+// poolPorts 返回组监听占用的端口，供分配新端口时避开。
 //
 // 组监听绑在 127.0.0.1，入站和隧道绑在 0.0.0.0，两者在 Linux 上会互斥：
 // 已经被 127.0.0.1:8080 占住的端口，再 bind 0.0.0.0:8080 会 EADDRINUSE。
 // 所以只要组起来了，这个端口就必须算作已占用，不然新建入站会撞上去。
 func poolPorts() map[int]bool {
-	out := map[int]bool{}
-	if poolsSvc == nil {
-		return out
-	}
-	for _, e := range poolsSvc.egresses() {
-		out[e.Port] = true
+	poolPortMu.Lock()
+	defer poolPortMu.Unlock()
+	out := make(map[int]bool, len(poolPortSet))
+	for p := range poolPortSet {
+		out[p] = true
 	}
 	return out
 }

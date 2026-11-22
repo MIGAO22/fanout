@@ -475,8 +475,11 @@ func (t *Tunnel) serve() error {
 		time.Sleep(time.Second)
 	}
 	if err != nil {
-		// 确实被别的进程长期占用了，才换端口
-		alt, perr := freeRandomPort(map[int]bool{port: true})
+		// 确实被别的进程长期占用了，才换端口。
+		// 组监听绑在 127.0.0.1，和这里要绑的 0.0.0.0 互斥，必须一起避开。
+		taken := poolPorts()
+		taken[port] = true
+		alt, perr := freeRandomPort(taken)
 		if perr != nil {
 			return fmt.Errorf("监听 %d 失败且无备用端口: %w", port, err)
 		}
