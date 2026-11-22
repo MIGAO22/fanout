@@ -21,6 +21,14 @@ const socksDialTimeout = 15 * time.Second
 // dialerInNetns 返回一个在指定 netns 内建立出站连接的 dial 函数。
 // 每次拨号都要切一次 netns，因为 socket 的归属在创建时确定。
 func dialerInNetns(nsName string) func(network, addr string) (net.Conn, error) {
+	return dialerInNetnsTimeout(nsName, socksDialTimeout)
+}
+
+// dialerInNetnsTimeout 同 dialerInNetns，但能指定单次拨号的预算。
+//
+// 出口组要用更短的预算：一条成员卡住时得尽快降级到下一条，
+// 否则光第一条就等满 15 秒，"保活"成了空话。
+func dialerInNetnsTimeout(nsName string, budget time.Duration) func(network, addr string) (net.Conn, error) {
 	return func(network, addr string) (net.Conn, error) {
 		type result struct {
 			conn net.Conn
@@ -52,7 +60,7 @@ func dialerInNetns(nsName string) func(network, addr string) (net.Conn, error) {
 
 			// 隧道内只有 IPv4 路由。不限定的话会选中 AAAA 记录，
 			// 那条连接绕开隧道从母机的 IPv6 出去，暴露真实地址。
-			conn, dialErr := net.DialTimeout(forceIPv4Network(network), addr, socksDialTimeout)
+			conn, dialErr := net.DialTimeout(forceIPv4Network(network), addr, budget)
 
 			if err := unix.Setns(int(origin.Fd()), unix.CLONE_NEWNET); err != nil {
 				if conn != nil {

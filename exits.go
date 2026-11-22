@@ -33,12 +33,44 @@ type Exit struct {
 	Inbounds  []ExitInbound `json:"inbounds"`
 }
 
+// PoolMemberView 是组内一条出口的界面视图。
+type PoolMemberView struct {
+	Host      string `json:"host"`
+	Slot      int    `json:"slot"`
+	Status    string `json:"status"`
+	ExitIP    string `json:"exit_ip"`
+	LatencyMs int64  `json:"latency_ms"` // 0 表示还没有样本
+	Cooling   bool   `json:"cooling"`
+}
+
+// PoolView 是一个出口组在界面上的一行。
+type PoolView struct {
+	ID        string           `json:"id"`
+	Identity  string           `json:"identity"` // 入站绑定串用的就是它
+	Name      string           `json:"name"`
+	Mode      string           `json:"mode"`
+	ModeLabel string           `json:"mode_label"`
+	ModeDesc  string           `json:"mode_desc"`
+	RRStep    int              `json:"rr_step"`
+	Port      int              `json:"port"`
+	Running   bool             `json:"running"`
+	Up        int              `json:"up"`
+	Total     int              `json:"total"`
+	SocksUser string           `json:"socks_user"`
+	SocksPass string           `json:"socks_pass"`
+	Members   []PoolMemberView `json:"members"`
+	Inbounds  []ExitInbound    `json:"inbounds"`
+}
+
 // ExitsView 是主界面需要的全部数据。
 type ExitsView struct {
 	Exits []Exit `json:"exits"`
 	// Direct 是没绑到任何出口的入站，仍然要能看见，否则用户会以为它们不见了
 	Direct []ExitInbound `json:"direct"`
-	Panel  string        `json:"panel"` // 面板不可用时的原因，空表示正常
+	// Pools 是出口组，排在单出口之后；没有组时是空数组而不是 null，
+	// 前端每几秒轮询一次，省得它为 null 特判。
+	Pools []PoolView `json:"pools"`
+	Panel string     `json:"panel"` // 面板不可用时的原因，空表示正常
 	// Backend 是 "3x-ui" 或 "native"。界面据此决定是否提供新建入站入口：
 	// 接管面板时入站归面板管，自建模式才由 fanout 自己建。
 	Backend string `json:"backend"`
@@ -117,6 +149,14 @@ func (m *Manager) ExitsOf() ExitsView {
 		})
 	}
 
+	view.Pools = poolViews(tunnels)
+	byPool := map[string]int{}
+	for i, pv := range view.Pools {
+		byPool[pv.Identity] = i
+	}
+	// 组的可用性写进同一张 live 表：入站的"绑定是否在线"对组和隧道是一个含义
+	mergePoolLive(live)
+
 	list, err := cachedInbounds(live)
 	if err != nil {
 		view.Panel = err.Error()
@@ -132,7 +172,57 @@ func (m *Manager) ExitsOf() ExitsView {
 			view.Exits[i].Inbounds = append(view.Exits[i].Inbounds, row)
 			continue
 		}
+		if i, ok := byPool[ib.BoundTo]; ib.BoundTo != "" && ok {
+			view.Pools[i].Inbounds = append(view.Pools[i].Inbounds, row)
+			continue
+		}
 		view.Direct = append(view.Direct, row)
 	}
 	return view
+}
+
+// poolViews 把出口组连同此刻的组员状态摊给界面。
+//
+// 组里的成员已经换了节点（主机名对不上任何隧道）时仍然列出来，标成 unknown：
+// 悄悄从界面上少一条，用户只会以为组变弱了，看不出是改名导致的。
+func poolViews(tunnels []*Tunnel) []PoolView {
+	if poolsSvc == nil {
+		return []PoolView{}
+	}
+	byHost := map[string]*Tunnel{}
+	for _, t := range tunnels {
+		byHost[t.host()] = t
+	}
+
+	out := make([]PoolView, 0, len(poolsSvc.pools()))
+	for _, p := range poolsSvc.pools() {
+		pv := PoolView{
+			ID: p.ID, Identity: p.identity(), Name: p.Name, Mode: p.Mode,
+			ModeLabel: poolModeLabels[p.Mode], ModeDesc: poolModeDesc[p.Mode],
+			RRStep: p.RRStep, Port: p.Port,
+			SocksUser: p.Cred.User, SocksPass: p.Cred.Pass,
+		}
+		live := map[string]bool{}
+		for _, e := range egressPools() {
+			if e.Identity == pv.Identity {
+				pv.Running, pv.Up = true, e.Up
+			}
+		}
+		for _, m := range poolsSvc.resolveMembers(p.ID) {
+			pv.Total++
+			if m.Up {
+				live[m.Host] = true
+			}
+			status := "missing"
+			if t := byHost[m.Host]; t != nil {
+				status = t.status()
+			}
+			pv.Members = append(pv.Members, PoolMemberView{
+				Host: m.Host, Slot: m.Slot, Status: status, ExitIP: m.ExitIP,
+				LatencyMs: m.Latency.Milliseconds(), Cooling: m.Cooling,
+			})
+		}
+		out = append(out, pv)
+	}
+	return out
 }

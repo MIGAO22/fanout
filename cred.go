@@ -65,10 +65,15 @@ func validateCred(c SocksCred) error {
 // 两种后端共用：本机 Xray 连的是 fanout 自己的 SOCKS5 端口，
 // 端口既然要认证，出站配置就必须带上同一套凭据。
 func socksServerJSON(t *Tunnel) map[string]any {
-	cred := t.credential()
+	return socksServerPortCred(t.port(), t.credential())
+}
+
+// socksServerPortCred 是 socksServerJSON 的去 Tunnel 版本。
+// 出口组的监听不是 Tunnel，端口与凭据从 Pool 来。
+func socksServerPortCred(port int, cred SocksCred) map[string]any {
 	server := map[string]any{
 		"address": "127.0.0.1",
-		"port":    t.Port,
+		"port":    port,
 	}
 	if cred.User != "" {
 		server["users"] = []any{map[string]any{

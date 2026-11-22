@@ -449,6 +449,198 @@ function renderOrphans(){
     + '</div></div>';
 }
 
+/* ───────────── 出口组 ───────────── */
+
+let poolMeta = null;   // /api/pools 的策略清单，第一次打开编辑器时才取
+let poolEdit = '';     // 正在编辑的组 ID，空串表示新建
+let poolMode = 'single';
+
+function poolState(p){
+  if(!p.running) return 'failed';
+  return p.up > 0 ? 'up' : 'failed';
+}
+
+function renderPools(){
+  const box = $('#pools');
+  if(!box) return;
+  if(booting){ box.innerHTML = ''; return; }
+  const pools = view.pools || [];
+  const head = '<div class="panel" style="margin-top:6px"><div class="ph">'
+    + '<h3>' + ICON.swap + ' 出口组</h3>'
+    + '<span class="n">' + pools.length + ' 个</span><span class="spacer"></span>'
+    + '<button class="btn sm" id="newpool">' + ICON.plus + '新建出口组</button></div>';
+  if(!pools.length){
+    box.innerHTML = head + '<div class="pb"><div class="orow" style="border:0">'
+      + '<span class="none">一条节点链接只绑一条出口，掉了就只能等它自己重连。'
+      + '把几条出口编成一个组，组内自动选路：掉线换下一条、按次轮询、挑最快的、或同时抢跑。</span>'
+      + '</div></div></div>';
+    return;
+  }
+  box.innerHTML = head + '<div class="pb">'
+    + pools.map(poolRow).join('') + '</div></div>';
+}
+
+function poolRow(p){
+  const st = poolState(p);
+  const mem = (p.members || []).map(m => {
+    const ok = m.status === 'up';
+    const bits = [m.status, m.exit_ip, m.latency_ms ? m.latency_ms + 'ms' : '', m.cooling ? '冷却中' : '']
+      .filter(Boolean).join(' · ');
+    return '<span class="chip' + (ok ? '' : ' off') + '" title="' + esc(m.host + ' · ' + bits) + '">'
+      + '<span class="p">' + esc(m.status === 'up' ? 'OK' : (m.status === 'missing' ? '没了' : m.status)) + '</span>'
+      + esc(m.host) + '</span>';
+  }).join('');
+
+  const ibs = (p.inbounds || []).length
+    ? (p.inbounds || []).map(i =>
+        '<button class="chip' + (i.enable === false ? ' off' : '') + '" data-detail="' + i.id
+        + '" title="' + esc((i.remark || i.protocol) + ' · ' + i.protocol + ' :' + i.port) + '">'
+        + '<span class="p">' + esc(i.protocol) + '</span>'
+        + '<span class="pt">:' + i.port + '</span></button>').join('')
+    : '<span class="chip none">还没有节点链接绑上来</span>';
+
+  const warn = !p.running
+    ? '<div class="errbox"><b>组没在跑</b>本机监听没起来，绑到它的链接会直接失败</div>'
+    : (p.up === 0 ? '<div class="errbox"><b>组内没有可用出口</b>连接会失败，不会退回母机直连</div>' : '');
+
+  return '<div class="poolblk">'
+    + '<div class="orow">'
+    + '<span class="orb ' + st + '" title="' + (p.running ? '监听中' : '未监听') + '"></span>'
+    + '<span class="nm">' + esc(p.name)
+    +   ' <span class="pt">' + esc(p.mode_label) + '</span>'
+    +   ' <span class="pt">' + p.up + '/' + p.total + ' 可用</span></span>'
+    + '<span class="spacer"></span>'
+    + '<span class="none">' + esc(p.mode_desc || '') + '</span>'
+    + '</div>'
+    + '<div class="chips" style="margin:0 0 8px">' + mem + '</div>'
+    + '<div class="chips" style="margin:0 0 10px">' + ibs + '</div>'
+    + warn
+    + '<div class="acts" style="margin-bottom:12px">'
+    +   '<button class="btn sm" data-pedit="' + esc(p.id) + '">编辑</button>'
+    +   '<button class="btn sm" data-pcred="' + esc(p.id) + '" title="换本机 SOCKS5 口令，并同步到节点链接后端">重置口令</button>'
+    +   '<button class="btn sm" data-pdel="' + esc(p.id) + '" data-name="' + esc(p.name) + '">删除</button>'
+    + '</div></div>';
+}
+
+async function openPool(id){
+  let meta;
+  try{
+    if(!poolMeta) poolMeta = await api('/api/pools');
+    meta = poolMeta;
+  }catch(e){ return toast(e.message, 'bad'); }
+
+  const p = id ? (view.pools || []).find(x => x.id === id) : null;
+  poolEdit = p ? p.id : '';
+  poolMode = p ? p.mode : 'single';
+  $('#poodlgtitle').textContent = p ? '编辑出口组' : '新建出口组';
+  $('#poname').value = p ? p.name : '';
+  $('#postep').value = p ? p.rr_step : (meta.rr_step || 5);
+
+  $('#pomode').innerHTML = (meta.modes || []).map(m =>
+    '<button type="button" data-pm="' + esc(m.mode) + '">' + esc(m.label) + '</button>').join('');
+  paintPoolMode();
+
+  // 已不在出口列表里的旧成员单独列出并默认不勾：
+  // 勾着保存会被后端判成"出口不存在"而整次失败，悄悄丢掉又是在改用户的组。
+  const cur = p ? (p.members || []).map(m => m.host) : [];
+  const alive = view.exits || [];
+  const dead = cur.filter(h => !alive.some(e => e.host === h));
+  const rows = alive.slice().sort((a, b) => (a.status === 'up' ? 0 : 1) - (b.status === 'up' ? 0 : 1));
+  $('#pohosts').innerHTML = rows.map(e =>
+      '<label><input type="checkbox" value="' + esc(e.host) + '"'
+      + (cur.indexOf(e.host) >= 0 ? ' checked' : '') + '>'
+      + '<span class="h">' + esc(e.host) + '</span>'
+      + '<span class="n">' + esc(e.country || e.region || '') + ' ' + esc(e.exit_ip || e.status) + '</span></label>'
+    ).join('')
+    + dead.map(h => '<label class="dead"><input type="checkbox" value="' + esc(h) + '">'
+        + '<span class="h">' + esc(h) + '</span><span class="n">已失效，保存后从组里移除</span></label>').join('')
+    || '<div class="none">还没有可用的出口，先开一条再建组。</div>';
+  syncPoolSel();
+
+  openModal('pooldlg');
+}
+
+function paintPoolMode(){
+  $$('#pomode button').forEach(b => b.classList.toggle('on', b.dataset.pm === poolMode));
+  const meta = (poolMeta && poolMeta.modes || []).find(m => m.mode === poolMode);
+  $('#podesc').textContent = meta ? meta.desc : '';
+  // 步长只对轮询有意义，其他模式下留着输入框只会让人以为调了有用
+  $('#postepwrap').hidden = poolMode !== 'roundrobin';
+}
+
+function syncPoolSel(){
+  const n = $$('#pohosts input:checked').length;
+  $('#pomsel').textContent = '已选 ' + n + ' 条';
+  $('#posave').disabled = n === 0;
+}
+
+$('#pomode').addEventListener('click', e => {
+  const b = e.target.closest('[data-pm]');
+  if(!b) return;
+  poolMode = b.dataset.pm;
+  paintPoolMode();
+});
+$('#pohosts').addEventListener('change', syncPoolSel);
+
+$('#posave').onclick = async () => {
+  const btn = $('#posave');
+  const hosts = $$('#pohosts input:checked').map(i => i.value);
+  if(!hosts.length) return toast('至少勾选一条出口', 'bad');
+  btn.disabled = true;
+  try{
+    await api('/api/pool/save', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        id: poolEdit, name: $('#poname').value.trim(), mode: poolMode,
+        rr_step: parseInt($('#postep').value, 10) || 5, hosts,
+      }),
+    });
+    toast(poolEdit ? '出口组已保存' : '出口组已创建', 'ok');
+    closeModal('pooldlg');
+    await poll();
+  }catch(e){ toast(e.message, 'bad'); }
+  btn.disabled = false;
+};
+
+document.addEventListener('click', async e => {
+  const nb = e.target.closest('#newpool');
+  if(nb) return openPool('');
+
+  const ed = e.target.closest('[data-pedit]');
+  if(ed) return openPool(ed.dataset.pedit);
+
+  const del = e.target.closest('[data-pdel]');
+  if(del){
+    if(!confirm('删除出口组「' + del.dataset.name + '」？绑在它上面的节点链接会一起解绑回直连。')) return;
+    const btn = del; btn.disabled = true;
+    try{
+      const r = await api('/api/pool/delete', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({id: del.dataset.pdel}),
+      });
+      toast('已删除' + ((r.unbound || []).length ? '，并解绑 ' + r.unbound.length + ' 条链接' : ''), 'ok');
+      poolMeta = null;
+      await poll();
+    }catch(err){ toast(err.message, 'bad'); btn.disabled = false; }
+    return;
+  }
+
+  const cr = e.target.closest('[data-pcred]');
+  if(cr){
+    const btn = cr; btn.disabled = true;
+    try{
+      const r = await api('/api/pool/cred', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({id: cr.dataset.pcred}),
+      });
+      toast('已重置本机口令：' + r.user + ' / ' + r.pass + '（只影响 127.0.0.1 这一跳）', 'ok');
+      await poll();
+    }catch(err){ toast(err.message, 'bad'); }
+    btn.disabled = false;
+  }
+});
+
 /* ───────────── 节点链接表格 ───────────── */
 
 function renderNodes(){
@@ -560,6 +752,7 @@ async function poll(){
     // 链接由 xray-cf-lite 的订阅体系发，fanout 这边导不出来
     $('#exportAll').hidden = isXCL();
     renderExits();
+    renderPools();
     renderOrphans();
     renderKPI();
     if(!$('#view-nodes').hidden) renderNodes();
@@ -910,30 +1103,68 @@ async function openDetail(id){
   }
 }
 
+// ownerOf 找一条入站挂在哪个出口上：先看单出口，再看出口组。
+// 返回 null 表示没绑，走直连。
+function ownerOf(id){
+  const e = (view.exits || []).find(x => (x.inbounds || []).some(i => i.id === id));
+  if(e) return {kind: 'exit', ref: e};
+  const p = (view.pools || []).find(x => (x.inbounds || []).some(i => i.id === id));
+  if(p) return {kind: 'pool', ref: p};
+  return null;
+}
+
+// curBound 把 ownerOf 的结果换成下拉框的选中值：
+// 单出口用主机名，组用 pool-<id>，两者在同一个 select 里共存。
+function curBound(o){
+  if(!o) return '';
+  return o.kind === 'pool' ? o.ref.identity : o.ref.host;
+}
+
+function ownerBadge(o){
+  if(!o) return '<span class="badge idle">直连，不出口</span>';
+  if(o.kind === 'pool'){
+    const p = o.ref;
+    const k = !p.running || p.up === 0 ? 'bad' : (p.up < p.total ? 'warn' : 'ok');
+    return '<span class="badge ' + k + '"><i class="d"></i>'
+      + esc(p.name) + ' · ' + esc(p.mode_label) + ' · ' + p.up + '/' + p.total + ' 可用</span>';
+  }
+  const owner = o.ref;
+  return '<span class="badge ' + (owner.status === 'up' ? 'ok' : owner.status === 'starting' ? 'warn' : 'bad')
+    + '"><i class="d"></i>' + esc(owner.country || owner.region || owner.host) + ' · '
+    + esc(owner.exit_ip || STATUS[owner.status] || owner.status) + '</span>';
+}
+
 // 轮询只更新「当前出口」这一行，不动正在编辑的输入框
 function refreshDetailOwner(){
   if(!curDetail) return;
   const el = $('#downer');
   if(!el) return;
-  const owner = (view.exits || []).find(x => (x.inbounds || []).some(i => i.id === curDetail.id));
-  el.innerHTML = owner
-    ? '<span class="badge ' + (owner.status === 'up' ? 'ok' : owner.status === 'starting' ? 'warn' : 'bad')
-      + '"><i class="d"></i>' + esc(owner.country || owner.region || owner.host) + ' · '
-      + esc(owner.exit_ip || STATUS[owner.status] || owner.status) + '</span>'
-    : '<span class="badge idle">直连，不出口</span>';
+  el.innerHTML = ownerBadge(ownerOf(curDetail.id));
 }
 
 // 出口下拉：列出所有已连通的隧道，外加「直连」。绑定按 Xray 的 inboundTag 走。
 function exitOptions(currentHost){
   const up = (view.exits || []).filter(e => e.status === 'up');
+  // 出口组排在单出口之前：会去看这个下拉的人多半正是为了保活才来的
+  const pools = (view.pools || []).filter(p => p.running && p.up > 0);
+  const pg = pools.length
+    ? '<optgroup label="出口组（组内自动选路）">'
+      + pools.map(p => '<option value="' + esc(p.identity) + '"'
+          + (p.identity === currentHost ? ' selected' : '') + '>'
+          + esc(p.name + ' · ' + p.mode_label + ' · ' + p.up + '/' + p.total) + '</option>').join('')
+      + '</optgroup>'
+    : '';
   return '<option value=""' + (currentHost ? '' : ' selected') + '>直连（不走隧道）</option>'
+    + pg
+    + '<optgroup label="单出口">'
     + up.map(e => '<option value="' + esc(e.host) + '"'
         + (e.host === currentHost ? ' selected' : '') + '>'
-        + esc((e.exit_ip || e.host) + ' · ' + (e.country || e.region)) + '</option>').join('');
+        + esc((e.exit_ip || e.host) + ' · ' + (e.country || e.region)) + '</option>').join('')
+    + '</optgroup>';
 }
 
 function renderDetail(d){
-  const owner = (view.exits || []).find(x => (x.inbounds || []).some(i => i.id === d.id));
+  const owner = ownerOf(d.id);
 
   const clients = (d.clients || []).map((c, i) => {
     const link = (d.links || [])[i] || '';
@@ -961,7 +1192,7 @@ function renderDetail(d){
       '<dl class="kvs">'
     + '<dt>当前出口</dt><dd><span id="downer"></span></dd>'
     + '<dt>改绑到</dt><dd><select class="inp" id="dbind" data-tag="' + esc(d.tag) + '" '
-    +   'style="max-width:280px;height:29px;font-size:12.5px">' + exitOptions(owner ? owner.host : '') + '</select></dd>'
+    +   'style="max-width:280px;height:29px;font-size:12.5px">' + exitOptions(curBound(owner)) + '</select></dd>'
     + '<dt>协议</dt><dd>' + tlsLine + '</dd>'
     + '<dt>监听</dt><dd>' + esc(d.listen || '0.0.0.0') + '</dd>'
     + '<dt>inboundTag</dt><dd>' + esc(d.tag) + '</dd>'

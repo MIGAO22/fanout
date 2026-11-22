@@ -167,6 +167,10 @@ func (m *Manager) Start(node Node) (*Tunnel, error) {
 	for _, other := range m.tunnels {
 		taken[other.port()] = true
 	}
+	// 出口组的监听绑在 127.0.0.1，和这里要绑的 0.0.0.0 互斥，必须一起避开
+	for p := range poolPorts() {
+		taken[p] = true
+	}
 	port, err := freeRandomPort(taken)
 	if err != nil {
 		m.mu.Unlock()
@@ -537,6 +541,22 @@ func (m *Manager) ReconcileOutbounds() {
 	}
 }
 
+// SyncPoolEgress 让后端把出口组的 socks 出站补写进配置。
+//
+// 增删改组之后都要调一次：组的绑定是一条指向本机端口的 outbound，
+// 配置里没有那条出站时 Xray 会直接拒绝整份规则。
+// 没有隧道时照样要写——先建组、后拉起出口是常见顺序。
+func (m *Manager) SyncPoolEgress() error {
+	p, err := openPanel()
+	if err != nil {
+		return err
+	}
+	tunnels := m.Tunnels()
+	// ResyncOutbound 的语义是"重写 fanout 那批出站"，具体那条隧道并不参与计算，
+	// 三个后端都是整段重建，所以传 nil 是安全的。
+	return p.ResyncOutbound(nil, tunnels)
+}
+
 // syncCred 把新凭据写进后端的 socks 出站。
 //
 // 两种后端的做法不同：自建模式整份重建配置，3x-ui 模式只改出站那一段。
@@ -583,6 +603,10 @@ func (m *Manager) rebind(oldHost string, t *Tunnel) error {
 	if err != nil {
 		return fmt.Errorf("节点链接后端不可用: %w", err)
 	}
+	// 出口组只改自己账本里的成员名：组的身份是 pool-<id>，
+	// 换了节点不需要动 Xray 一个字，这也正是这层设计想要的效果。
+	// 绑到组的入站由 x.Rebind 按旧节点 tag 匹配，天然不会被卷进来。
+	poolsSvc.renameHost(oldHost, t.host())
 	return x.Rebind(oldHost, t, m.Tunnels())
 }
 

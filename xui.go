@@ -538,7 +538,15 @@ const xuiTagPrefix = "fanout-"
 // tunnelTag 用节点主机名而非槽位号做标识：槽位在 fanout 重启后会重新分配，
 // 用它做 tag 会让已有的入站绑定悄悄串到别的节点上。
 func tunnelTag(t *Tunnel) string {
-	return xuiTagPrefix + sanitizeTag(t.Node.HostName)
+	return egressTag(t.Node.HostName)
+}
+
+// egressTag 把任意出口身份算成 outboundTag。
+//
+// 出口身份平时是节点主机名，绑到出口组时是 pool-<id>。两种都过 sanitizeTag，
+// 这样组身份和主机名在同一份配置里不会撞 tag。
+func egressTag(identity string) string {
+	return xuiTagPrefix + sanitizeTag(identity)
 }
 
 // sanitizeTag 把主机名收敛成安全的 tag 片段。
@@ -607,23 +615,36 @@ func toStringSlice(v any) []string {
 	return nil
 }
 
-// Bind 把某个入站的流量导向指定隧道。slot 传 0 表示解绑，恢复直连。
+// Bind 把某个入站的流量导向指定出口。hostname 传空表示解绑，恢复直连。
+//
+// hostname 可以是节点主机名，也可以是出口组身份 pool-<id>：
+// 后者指向 fanout 自己的组监听，组内怎么挑出口与本方法无关。
 //
 // 只动 fanout- 前缀的出站与规则，用户手工配置的条目原样保留。
 func (x *XUI) Bind(inboundTag string, hostname string, tunnels []*Tunnel) error {
-	var target *Tunnel
+	tag := ""
 	if hostname != "" {
-		for _, t := range tunnels {
-			if t.Node.HostName == hostname {
-				target = t
-				break
+		if _, isPool := poolIdentityToID(hostname); isPool {
+			e, ok := egressPool(hostname)
+			if !ok {
+				return fmt.Errorf("出口组 %s 不存在或监听没起来", hostname)
 			}
-		}
-		if target == nil {
-			return fmt.Errorf("节点 %s 没有运行中的隧道", hostname)
-		}
-		if target.Status != "up" {
-			return fmt.Errorf("节点 %s 的隧道还没连通（当前 %s）", hostname, target.Status)
+			tag = e.Tag
+		} else {
+			var target *Tunnel
+			for _, t := range tunnels {
+				if t.Node.HostName == hostname {
+					target = t
+					break
+				}
+			}
+			if target == nil {
+				return fmt.Errorf("节点 %s 没有运行中的隧道", hostname)
+			}
+			if target.Status != "up" {
+				return fmt.Errorf("节点 %s 的隧道还没连通（当前 %s）", hostname, target.Status)
+			}
+			tag = tunnelTag(target)
 		}
 	}
 
@@ -633,6 +654,7 @@ func (x *XUI) Bind(inboundTag string, hostname string, tunnels []*Tunnel) error 
 			live[sanitizeTag(t.Node.HostName)] = true
 		}
 	}
+	mergePoolLive(live)
 	current, err := x.Inbounds(live)
 	if err != nil {
 		return err
@@ -681,11 +703,11 @@ func (x *XUI) Bind(inboundTag string, hostname string, tunnels []*Tunnel) error 
 		}
 	}
 
-	if target != nil {
+	if tag != "" {
 		cleaned = append(cleaned, map[string]any{
 			"type":        "field",
 			"inboundTag":  []any{inboundTag},
-			"outboundTag": tunnelTag(target),
+			"outboundTag": tag,
 		})
 	}
 
@@ -719,6 +741,17 @@ func (x *XUI) syncOutbounds(setting map[string]any, tunnels []*Tunnel) {
 			"protocol": "socks",
 			"settings": map[string]any{
 				"servers": []any{socksServerJSON(t)},
+			},
+		})
+	}
+	// 出口组在 Xray 眼里就是一个普通的 socks 出站，指向 fanout 自己的组监听端口，
+	// 组内怎么选路 Xray 不知道也不需要知道。
+	for _, e := range egressPools() {
+		kept = append(kept, map[string]any{
+			"tag":      e.Tag,
+			"protocol": "socks",
+			"settings": map[string]any{
+				"servers": []any{socksServerPortCred(e.Port, e.Cred)},
 			},
 		})
 	}
@@ -839,6 +872,9 @@ func (x *XUI) usedPorts() (map[int]bool, error) {
 		return nil, err
 	}
 	used := map[int]bool{}
+	for p := range poolPorts() {
+		used[p] = true
+	}
 	for _, ib := range list {
 		used[ib.Port] = true
 	}

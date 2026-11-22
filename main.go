@@ -96,6 +96,14 @@ func main() {
 		go mgr.ReconcileOutbounds()
 	}
 
+	// 出口组的监听是 Xray 出站指向的本机端口，得在界面开起来之前就绪，
+	// 否则第一批连接会撞上还没听的端口。加载失败只影响组，单出口照常工作。
+	if ps, err := newPoolService(*workDir, mgr); err != nil {
+		log.Printf("出口组加载失败（单出口不受影响）: %v", err)
+	} else {
+		poolsSvc = ps
+	}
+
 	go mgr.WatchHealth()
 
 	stop := make(chan os.Signal, 1)
@@ -103,6 +111,9 @@ func main() {
 	go func() {
 		<-stop
 		log.Println("正在清理所有隧道...")
+		if poolsSvc != nil {
+			poolsSvc.Close()
+		}
 		mgr.Shutdown()
 		closePanel()
 		unlock() // os.Exit 会绕过 defer，这里手动放锁
@@ -131,6 +142,10 @@ func main() {
 	mux.HandleFunc("/api/xui/detail", apiXUIDetail)
 	mux.HandleFunc("/api/xui/links", apiXUILinks)
 	mux.HandleFunc("/api/xui/delete", apiXUIDelete(mgr))
+	mux.HandleFunc("/api/pools", apiPools(mgr))
+	mux.HandleFunc("/api/pool/save", apiPoolSave(mgr))
+	mux.HandleFunc("/api/pool/delete", apiPoolDelete(mgr))
+	mux.HandleFunc("/api/pool/cred", apiPoolCred(mgr))
 	mux.HandleFunc("/api/panel/inbound/new", apiInboundCreate(mgr))
 	mux.HandleFunc("/api/panel/inbound/update", apiInboundUpdate(mgr))
 	mux.HandleFunc("/api/panel/client/add", apiClientAdd(mgr))

@@ -139,6 +139,9 @@ func (s *nativeStore) usedPorts() map[int]bool {
 	// 先并入外部工具（如 xray-cf-lite）占用的端口，再叠加自己的入站，
 	// 这样随机分配和手填校验都会避开它们，避免端口撞车。
 	used := externalUsedPorts()
+	for p := range poolPorts() {
+		used[p] = true
+	}
 	for _, ib := range s.Inbounds {
 		used[ib.Port] = true
 	}

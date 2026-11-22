@@ -227,24 +227,45 @@ func (x *XCL) syncOutbounds(cfg map[string]any, tunnels []*Tunnel) {
 			},
 		})
 	}
+	for _, e := range egressPools() {
+		kept = append(kept, map[string]any{
+			"tag":      e.Tag,
+			"protocol": "socks",
+			"settings": map[string]any{
+				"servers": []any{socksServerPortCred(e.Port, e.Cred)},
+			},
+		})
+	}
 	cfg["outbounds"] = kept
 }
 
-// Bind 把某个入站的流量导向指定隧道。hostname 留空表示解绑，恢复走 xray-cf-lite 的 direct。
+// Bind 把某个入站的流量导向指定出口。hostname 留空表示解绑，恢复走 xray-cf-lite 的 direct。
+//
+// hostname 也可以是出口组身份 pool-<id>。
 func (x *XCL) Bind(inboundTag string, hostname string, tunnels []*Tunnel) error {
-	var target *Tunnel
+	tag := ""
 	if hostname != "" {
-		for _, t := range tunnels {
-			if t.host() == hostname {
-				target = t
-				break
+		if _, isPool := poolIdentityToID(hostname); isPool {
+			e, ok := egressPool(hostname)
+			if !ok {
+				return fmt.Errorf("出口组 %s 不存在或监听没起来", hostname)
 			}
-		}
-		if target == nil {
-			return fmt.Errorf("节点 %s 没有运行中的隧道", hostname)
-		}
-		if target.status() != "up" {
-			return fmt.Errorf("节点 %s 的隧道还没连通（当前 %s）", hostname, target.status())
+			tag = e.Tag
+		} else {
+			var target *Tunnel
+			for _, t := range tunnels {
+				if t.host() == hostname {
+					target = t
+					break
+				}
+			}
+			if target == nil {
+				return fmt.Errorf("节点 %s 没有运行中的隧道", hostname)
+			}
+			if target.status() != "up" {
+				return fmt.Errorf("节点 %s 的隧道还没连通（当前 %s）", hostname, target.status())
+			}
+			tag = tunnelTag(target)
 		}
 	}
 
@@ -254,6 +275,7 @@ func (x *XCL) Bind(inboundTag string, hostname string, tunnels []*Tunnel) error 
 			live[sanitizeTag(t.host())] = true
 		}
 	}
+	mergePoolLive(live)
 	current, err := x.Inbounds(live)
 	if err != nil {
 		return err
@@ -302,11 +324,11 @@ func (x *XCL) Bind(inboundTag string, hostname string, tunnels []*Tunnel) error 
 		}
 	}
 
-	if target != nil {
+	if tag != "" {
 		cleaned = append(cleaned, map[string]any{
 			"type":        "field",
 			"inboundTag":  []any{inboundTag},
-			"outboundTag": tunnelTag(target),
+			"outboundTag": tag,
 		})
 	}
 

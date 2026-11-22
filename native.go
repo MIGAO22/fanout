@@ -156,23 +156,36 @@ func (n *Native) InboundLinks(ids []int, publicHost string) ([]string, error) {
 	return out, nil
 }
 
+// Bind 把入站绑到一条出口或一个出口组上。hostname 传空表示解绑。
+//
+// 组身份（pool-<id>）直接存进 BoundTo：自建模式的出站本来就由绑定串推导，
+// 少一层映射就少一处两边对不上的可能。
 func (n *Native) Bind(inboundTag string, hostname string, tunnels []*Tunnel) error {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
-	var target *Tunnel
+	boundTo := ""
 	if hostname != "" {
-		for _, t := range tunnels {
-			if t.host() == hostname {
-				target = t
-				break
+		if _, isPool := poolIdentityToID(hostname); isPool {
+			if _, ok := egressPool(hostname); !ok {
+				return fmt.Errorf("出口组 %s 不存在或监听没起来", hostname)
 			}
-		}
-		if target == nil {
-			return fmt.Errorf("节点 %s 没有运行中的隧道", hostname)
-		}
-		if target.status() != "up" {
-			return fmt.Errorf("节点 %s 的隧道还没连通（当前 %s）", hostname, target.status())
+			boundTo = sanitizeTag(hostname)
+		} else {
+			var target *Tunnel
+			for _, t := range tunnels {
+				if t.host() == hostname {
+					target = t
+					break
+				}
+			}
+			if target == nil {
+				return fmt.Errorf("节点 %s 没有运行中的隧道", hostname)
+			}
+			if target.status() != "up" {
+				return fmt.Errorf("节点 %s 的隧道还没连通（当前 %s）", hostname, target.status())
+			}
+			boundTo = sanitizeTag(target.host())
 		}
 	}
 
@@ -187,11 +200,7 @@ func (n *Native) Bind(inboundTag string, hostname string, tunnels []*Tunnel) err
 		return fmt.Errorf("入站 %s 不存在", inboundTag)
 	}
 
-	if target == nil {
-		found.BoundTo = ""
-	} else {
-		found.BoundTo = sanitizeTag(target.host())
-	}
+	found.BoundTo = boundTo
 	return n.apply(tunnels)
 }
 

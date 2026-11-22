@@ -98,9 +98,27 @@ func buildXrayConfig(inbounds []*nativeInbound, tunnels []*Tunnel) map[string]an
 		})
 	}
 
+	// 出口组的出站只要组还在监听就一直写进配置，不看组内当下有几条活着。
+	// 成员全掉时让流量撞进组监听、由它立刻报错，比把规则删掉强：
+	// 删了规则这条入站就掉回 direct，用户的真实出口 IP 会直接暴露出去。
+	poolTags := map[string]bool{}
+	for _, e := range egressPools() {
+		outs = append(outs, map[string]any{
+			"tag":      e.Tag,
+			"protocol": "socks",
+			"settings": map[string]any{
+				"servers": []any{socksServerPortCred(e.Port, e.Cred)},
+			},
+		})
+		poolTags[sanitizeTag(e.Identity)] = true
+	}
+
 	rules := []any{}
 	for _, ib := range inbounds {
-		if !ib.Enable || ib.BoundTo == "" || !live[ib.BoundTo] {
+		if !ib.Enable || ib.BoundTo == "" {
+			continue
+		}
+		if !live[ib.BoundTo] && !poolTags[ib.BoundTo] {
 			continue
 		}
 		rules = append(rules, map[string]any{
