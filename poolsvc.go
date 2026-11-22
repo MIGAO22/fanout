@@ -100,19 +100,23 @@ func (s *PoolService) ensureListener(p *Pool) error {
 		return nil
 	}
 
-	port := p.Port
-	ln, err := listenPool(port)
+	ln, err := listenPool(p.Port)
 	if err != nil {
 		alt, altErr := freeRandomPort(s.takenPortsLocked())
 		if altErr != nil {
-			return fmt.Errorf("监听 %d 失败且无备用端口: %v", port, err)
+			return fmt.Errorf("监听 %d 失败且无备用端口: %v", p.Port, err)
 		}
 		if ln, err = listenPool(alt); err != nil {
 			return fmt.Errorf("监听 %d 也失败: %v", alt, err)
 		}
-		p.Port = alt
+	}
+	// 实际端口必须从 listener 读回来：新建的组 Port 是 0，而 :0 在 net.Listen 里
+	// 是"随便给一个"并且会成功，上面那条失败兜底根本不会触发。不回写的话
+	// 发给 Xray 的出站就是 port 0，组内每条连接都被拒（界面上只看到 EOF）。
+	if got := listenPort(ln); got > 0 && got != p.Port {
+		p.Port = got
 		if saveErr := s.store.save(s.dir); saveErr != nil {
-			log.Printf("出口组 %s 换端口后存盘失败: %v", p.Name, saveErr)
+			log.Printf("出口组 %s 端口回写失败: %v", p.Name, saveErr)
 		}
 	}
 
@@ -155,14 +159,22 @@ func listenPool(port int) (net.Listener, error) {
 	return nil, err
 }
 
+// listenPort 取监听真正绑上的端口，取不到返回 0。
+func listenPort(ln net.Listener) int {
+	if tcp, ok := ln.Addr().(*net.TCPAddr); ok {
+		return tcp.Port
+	}
+	return 0
+}
+
 // takenPortsLocked 汇总已占用的端口，避免新组抢了隧道或别的组的端口。
 // 调用方必须持有 s.mu。
 func (s *PoolService) takenPortsLocked() map[int]bool {
 	taken := externalUsedPorts()
 	for _, pr := range s.run {
 		if pr.ln != nil {
-			if tcp, ok := pr.ln.Addr().(*net.TCPAddr); ok {
-				taken[tcp.Port] = true
+			if port := listenPort(pr.ln); port > 0 {
+				taken[port] = true
 			}
 		}
 	}

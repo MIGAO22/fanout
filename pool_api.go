@@ -126,6 +126,16 @@ func checkPoolHosts(p *Pool, tunnels []*Tunnel) error {
 //
 // 顺序很要紧：Xray 里留着一条指向不存在 outbund 的规则会让整份配置加载失败，
 // 连带其他入站一起掉线。所以先解绑、再删组、最后重写出站。
+// boundIs 判断一条入站的绑定串指的是不是这个组。
+//
+// 三种后端存的形态不同：接管 3x-ui 与 xray-cf-lite 存的是带前缀的出站 tag
+// （fanout-pool-p1），自建模式存的是裸身份（pool-p1）。只比一种会漏掉另外两种，
+// 而漏掉的后果不是"没解绑"这么轻：组删掉之后规则还指着不存在的 outboundTag，
+// Xray 会拒绝加载整份配置，所有节点链接一起断。
+func boundIs(boundTo, identity string) bool {
+	return boundTo == sanitizeTag(identity) || boundTo == egressTag(identity)
+}
+
 func apiPoolDelete(m *Manager) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -163,7 +173,7 @@ func apiPoolDelete(m *Manager) http.HandlerFunc {
 		}
 		var unbound []int
 		for _, ib := range list {
-			if ib.BoundTo != sanitizeTag(identity) {
+			if !boundIs(ib.BoundTo, identity) {
 				continue
 			}
 			if err := panel.Bind(ib.Tag, "", m.Tunnels()); err != nil {
