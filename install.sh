@@ -75,7 +75,11 @@ INITEOF
 
 svc_enable_start() {
   if [[ "$INIT_SYS" == systemd ]]; then
-    systemctl enable --now fanout
+    # enable --now 对「已经 active」的单元是空操作。重装/升级时服务通常正在跑，
+    # 于是新二进制躺在磁盘上、老进程还在服务老界面，看着就像装错了版本。
+    # 这里显式 restart，让磁盘上的那份真正接管。
+    systemctl enable fanout >/dev/null 2>&1 || true
+    systemctl restart fanout
   else
     rc-update add fanout default >/dev/null 2>&1 || true
     rc-service fanout restart
@@ -160,14 +164,27 @@ if [[ ${#need_cmd[@]} -gt 0 ]]; then
 fi
 
 echo "[2/6] 获取程序"
-# REPO 决定「去哪里拿预编译包」和「以后从哪个仓库自更新」。
-# 没显式给时，在 clone 出来的源码目录里就从 origin 推断——否则衍生版本
-# 装完仍然会去追上游的 release，一次 f update 就把改动覆盖掉了。
+# SELF_REPO 是本仓库自己的身份，REPO 决定「去哪拿预编译包」和「以后从哪自更新」。
+# 认不出来源时必须停手，绝不能退回上游：上游二进制没有这里的界面重写和连接层加固，
+# 静默装上就等于把原版部署上去，而且界面长得像、版本号也像，装完根本发现不了。
+SELF_REPO="MIGAO22/fanout"
+REPO_EXPLICIT="${REPO:+1}"
 if [[ -z "${REPO:-}" ]]; then
   origin_url=$(git remote get-url origin 2>/dev/null || true)
   REPO=$(printf '%s' "$origin_url" | sed -E 's#.*github\.com[:/]##; s#\.git$##')
 fi
-REPO="${REPO:-byJoey/fanout}"
+if [[ -z "$REPO" ]]; then
+  echo "      认不出该从哪个仓库装：不在 git clone 里，也没有 REPO=" >&2
+  echo "      装本仓库请显式指定：REPO=${SELF_REPO} bash install.sh" >&2
+  exit 1
+fi
+if [[ "$REPO" != "$SELF_REPO" && -z "$REPO_EXPLICIT" ]]; then
+  echo "      推断出的来源是 ${REPO}，与本仓库 ${SELF_REPO} 不一致，已停手。" >&2
+  echo "      真要装 ${REPO} 的版本，请显式加 REPO=${REPO}" >&2
+  echo "      （那个版本没有本仓库的界面重写与连接层加固）" >&2
+  exit 1
+fi
+echo "      来源仓库：${REPO}"
 ARCH=$(uname -m)
 case "$ARCH" in
   x86_64)  GOARCH=amd64 ;;
@@ -176,7 +193,7 @@ case "$ARCH" in
 esac
 
 if [[ -f main.go ]] && command -v go >/dev/null; then
-  echo "      从源码编译（自更新源：${REPO}）"
+  echo "      从源码编译"
   src_ver=$(git describe --tags --always --dirty 2>/dev/null || echo dev)
   go build -trimpath \
     -ldflags "-s -w -X main.version=${src_ver} -X main.updateRepo=${REPO}" \
@@ -197,6 +214,17 @@ else
   [[ -f "$TMP/f.sh" ]] && install -m 755 "$TMP/f.sh" /usr/local/bin/f
   rm -rf "$TMP"
 fi
+
+# 装完直接验界面特征：go:embed 有没有把新 index.html 打进去、拿到的包
+# 是不是本仓库构建的，一眼就能定死，不用等部署完对着旧界面发懵。
+# kpiRing 是重设计版独有的元素，改前端时别把它删了。
+# 只在来源确实是本仓库时才断言——显式指定别的仓库时，人家界面长什么样我们说了不算。
+if [[ "$REPO" == "$SELF_REPO" ]] && ! grep -aq -- 'kpiRing' "$BIN"; then
+  echo "      装好的二进制里没有本仓库的界面特征，说明拿到的不是本仓库构建的版本。" >&2
+  echo "      来源是 ${REPO}，请确认该仓库的 Release 确实由本仓库代码产出。" >&2
+  exit 1
+fi
+echo "      已装：$("$BIN" -version 2>/dev/null || echo '版本未知')"
 
 echo "[3/6] 准备 Xray"
 # 没有现成面板接管时 fanout 自己跑 Xray，需要一份二进制。
@@ -300,5 +328,6 @@ echo "  ────────────────────────
 echo "  交流群  https://t.me/+ft-zI76oovgwNmRh"
 echo "  油管    https://youtube.com/@joeyblog"
 echo "  博客    https://joeyblog.net"
-echo "  项目    https://github.com/byJoey/fanout"
+echo "  本项目  https://github.com/MIGAO22/fanout"
+echo "  上游    https://github.com/byJoey/fanout"
 echo

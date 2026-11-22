@@ -5,7 +5,9 @@ set -uo pipefail
 WORK_DIR=/var/lib/fanout
 SERVICE=fanout
 BIN=/usr/local/bin/fanout
-REPO="${REPO:-byJoey/fanout}"
+# 本仓库构建的更新来源。绝不能默认指向上游：菜单里一次「更新」就会把
+# 界面重写和连接层加固整个覆盖回原版。要换源请显式带 REPO=owner/repo。
+REPO="${REPO:-MIGAO22/fanout}"
 
 G='\033[0;32m'; R='\033[0;31m'; Y='\033[0;33m'; B='\033[0;36m'; D='\033[2m'; N='\033[0m'
 
@@ -284,7 +286,7 @@ do_update() {
 
   echo -e "\n  当前 $("$BIN" -version 2>/dev/null || echo '-')"
   tmp=$(mktemp -d)
-  echo "  正在下载最新版..."
+  echo "  正在下载最新版（来源 ${REPO}）..."
   if ! curl -fsSL "https://github.com/${REPO}/releases/latest/download/fanout-linux-${goarch}.tar.gz" \
        -o "$tmp/f.tar.gz"; then
     echo -e "  ${R}下载失败${N}"; rm -rf "$tmp"; return
