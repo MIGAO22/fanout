@@ -160,6 +160,13 @@ if [[ ${#need_cmd[@]} -gt 0 ]]; then
 fi
 
 echo "[2/6] 获取程序"
+# REPO 决定「去哪里拿预编译包」和「以后从哪个仓库自更新」。
+# 没显式给时，在 clone 出来的源码目录里就从 origin 推断——否则衍生版本
+# 装完仍然会去追上游的 release，一次 f update 就把改动覆盖掉了。
+if [[ -z "${REPO:-}" ]]; then
+  origin_url=$(git remote get-url origin 2>/dev/null || true)
+  REPO=$(printf '%s' "$origin_url" | sed -E 's#.*github\.com[:/]##; s#\.git$##')
+fi
 REPO="${REPO:-byJoey/fanout}"
 ARCH=$(uname -m)
 case "$ARCH" in
@@ -169,15 +176,19 @@ case "$ARCH" in
 esac
 
 if [[ -f main.go ]] && command -v go >/dev/null; then
-  echo "      从源码编译"
-  go build -trimpath -ldflags "-s -w" -o "$BIN" .
+  echo "      从源码编译（自更新源：${REPO}）"
+  src_ver=$(git describe --tags --always --dirty 2>/dev/null || echo dev)
+  go build -trimpath \
+    -ldflags "-s -w -X main.version=${src_ver} -X main.updateRepo=${REPO}" \
+    -o "$BIN" .
 else
   echo "      下载预编译版本 (${GOARCH})"
   TMP=$(mktemp -d)
   URL="https://github.com/${REPO}/releases/latest/download/fanout-linux-${GOARCH}.tar.gz"
   if ! curl -fsSL "$URL" -o "$TMP/f.tar.gz"; then
     echo "      下载失败: $URL" >&2
-    echo "      也可以 clone 仓库后在源码目录运行本脚本" >&2
+    echo "      该仓库没有 v* 的 Release 时这条地址就是 404；" >&2
+    echo "      改用「clone 仓库后在源码目录里跑本脚本」，需要 Go 1.21+" >&2
     exit 1
   fi
   tar xzf "$TMP/f.tar.gz" -C "$TMP"

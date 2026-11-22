@@ -76,31 +76,43 @@ SOCKS5 监听在母机，出站连接用 `setns` 切进对应 netns 建立。
 
 需要 root，Linux（依赖 netns）。Windows / macOS 不能跑，只能交叉编译。
 
-### 从源码装（本仓库，推荐）
+### 一行装（预编译，推荐）
+
+```bash
+REPO=MIGAO22/fanout bash <(curl -fsSL https://raw.githubusercontent.com/MIGAO22/fanout/main/install.sh)
+```
+
+拿的是 [Releases](https://github.com/MIGAO22/fanout/releases/latest) 里由
+[release workflow](.github/workflows/release.yml) 构建的
+`fanout-linux-amd64.tar.gz` / `fanout-linux-arm64.tar.gz`，机器上不用装 Go。
+`REPO=` 必须带——不带时脚本默认去上游 `byJoey/fanout` 找包，装到的是原版界面。
+
+### 从源码装
 
 ```bash
 git clone https://github.com/MIGAO22/fanout.git
 cd fanout
-REPO=MIGAO22/fanout bash install.sh
+bash install.sh
 ```
 
-带源码目录时 `install.sh` 会从源码编译（需要 Go 1.21+）。
-依赖（openvpn / curl / openssl / iproute / iptables）按发行版自动装，
+在源码目录里脚本自动改走编译路径（需要 Go 1.21+），仓库名从 `origin` 推断，
+不用手动带 `REPO=`。
+
+两条路径的依赖处理一样：openvpn / curl / openssl / iproute / iptables 按发行版自动装，
 apt、dnf、yum、pacman、apk、zypper 都认。没装 3x-ui 时还会顺带下载一份
 Xray 到 `/var/lib/fanout/bin/`，装了则跳过，入站交给面板管。
-
 服务用 systemd 或 OpenRC 都能装，装完自动开机自启。
 
-> 想直接用预编译二进制，得先在本仓库打一个 `v*` tag 触发
-> [release workflow](.github/workflows/release.yml)（amd64 / arm64 都出），
-> 之后 `REPO=MIGAO22/fanout bash <(curl -fsSL https://raw.githubusercontent.com/MIGAO22/fanout/main/install.sh)`
-> 就能拉到这里构建的版本。不打 tag 的话请走上面包源码安装。
+> **发新版本。** 推一个 `v*` tag 就会触发 release workflow 出 amd64 / arm64
+> 两个包和 checksums；不打 tag 就没有 Release，`releases/latest/download/...`
+> 那条地址是 404，一行装会直接失败。
 
 > **自更新指向哪个仓库。** `f update` 和设置里的「更新」卡片默认查上游
 > `byJoey/fanout`，直接把上游二进制换上来会静默覆盖掉本仓库的界面改动。
-> release workflow 构建时已经用 `-X main.updateRepo=$GITHUB_REPOSITORY`
-> 把自己指到自己的仓库；自己 `go build` 的话，要么加同样的 ldflags，
-> 要么用环境变量兜住：`FANOUT_UPDATE_REPO=MIGAO22/fanout`。
+> 上面两条安装路径都不会踩到：release workflow 用
+> `-X main.updateRepo=$GITHUB_REPOSITORY`，源码编译则用推断出来的仓库名。
+> 自己手动 `go build` 的话，要么加同样的 ldflags，要么用环境变量兜住：
+> `FANOUT_UPDATE_REPO=MIGAO22/fanout`。
 > 想保持和上游一致、不介意丢掉这些改动，就别设这两个值。
 
 **Alpine** 默认不带 bash，先装一下：
@@ -208,7 +220,7 @@ REALITY 的密钥对和 shortId 自动生成；TLS 不填证书就生成自签�
 
 ```
   状态      运行中
-  版本      fanout v0.1.1
+  版本      fanout v1.4.0
   开机自启  enabled
 
   管理地址  http://1.2.3.4:8899/gwPuWHvaNr/
