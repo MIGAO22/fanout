@@ -26,7 +26,95 @@ type WebSettings struct {
 	// SubToken 是订阅地址里的口令。订阅要免登录才能被客户端拉取，
 	// 所以这串就是它唯一的门槛，等同于密码，不要外传。
 	SubToken string `json:"sub_token,omitempty"`
+	// Conn 是连接层的可调参数：健康检查节奏、重连退避、面板写入合并之类。
+	// 这些原来全是写死的常量，但 VPN Gate 的质量随地区和时间差很多，
+	// 同一套阈值在美国 VPS 和家用宽带上不可能都合适，只能交给使用者。
+	Conn ConnSettings `json:"conn,omitempty"`
 }
+
+// ConnSettings 是连接层的调参入口。全部以秒为单位（面板写入合并用毫秒），
+// 零值/越界一律回落到默认值，见 normalized。
+type ConnSettings struct {
+	// HealthInterval 是健康检查的轮询间隔（秒）。
+	HealthInterval int `json:"health_interval,omitempty"`
+	// HealthFailures 是连续失败几次才判掉线。
+	HealthFailures int `json:"health_failures,omitempty"`
+	// HealthTimeout 是单次探测的超时（秒）。
+	HealthTimeout int `json:"health_timeout,omitempty"`
+	// BackoffMin / BackoffMax 是自动重连的退避区间（秒）。
+	BackoffMin int `json:"backoff_min,omitempty"`
+	BackoffMax int `json:"backoff_max,omitempty"`
+	// ConnectBudget 是单个节点从拉起 openvpn 到拿到出口 IP 的总预算（秒）。
+	// 超过就判这个节点连不上、换下一个候选——家宽节点冷启动可能很慢，
+	// 但让一条出口在同一个坏节点上磨几分钟，不如早点换人。
+	ConnectBudget int `json:"connect_budget,omitempty"`
+	// MaxTries 是一轮里最多试几个候选节点。
+	MaxTries int `json:"max_tries,omitempty"`
+	// PanelDebounce 是面板配置写入的合并窗口（毫秒）。
+	// 批量开 N 条出口时，每条 up 都会请求重建配置；不合并的话
+	// 自建模式会连着重启 N 次 Xray，已连上的客户端被反复打断。
+	PanelDebounce int `json:"panel_debounce,omitempty"`
+	// NodeTTL 是节点列表的缓存时长（秒）。
+	// VPN Gate 那份 CSV 有几十 MB，多条隧道同时重连时不该各拉各的。
+	NodeTTL int `json:"node_ttl,omitempty"`
+	// ScoreMode 决定挑节点时看什么：speed 只看速度、idle 偏爱没人用的、
+	// ping 只看延迟、balanced 综合这三样。
+	ScoreMode string `json:"score_mode,omitempty"`
+	// ReconnectLimit 是一轮健康检查里最多同时重连几条出口。
+	// VPN Gate 的机房常常整段一起掉线，全放开了重连等于自己打自己。
+	ReconnectLimit int `json:"reconnect_limit,omitempty"`
+}
+
+// 连接层默认参数。改这里要同步改 web/app.js 里输入框的占位默认值。
+const (
+	defHealthInterval = 10
+	defHealthFailures = 3
+	defHealthTimeout  = 6
+	defBackoffMin     = 5
+	defBackoffMax     = 60
+	defConnectBudget  = 35
+	defMaxTries       = 6
+	defPanelDebounce  = 1500
+	defNodeTTL        = 600
+	defScoreMode      = "balanced"
+	defReconnectLimit = 2
+)
+
+// normalized 把零值和离谱值夹回可用区间。
+// 界面上填错不该让程序退化成"每 0 秒全量重连"这种自伤行为。
+func (c ConnSettings) normalized() ConnSettings {
+	clamp := func(v, def, lo, hi int) int {
+		if v <= 0 {
+			return def
+		}
+		if v < lo {
+			return lo
+		}
+		if v > hi {
+			return hi
+		}
+		return v
+	}
+	c.HealthInterval = clamp(c.HealthInterval, defHealthInterval, 3, 3600)
+	c.HealthFailures = clamp(c.HealthFailures, defHealthFailures, 1, 20)
+	c.HealthTimeout = clamp(c.HealthTimeout, defHealthTimeout, 2, 120)
+	c.BackoffMin = clamp(c.BackoffMin, defBackoffMin, 1, 600)
+	c.BackoffMax = clamp(c.BackoffMax, defBackoffMax, c.BackoffMin, 3600)
+	c.ConnectBudget = clamp(c.ConnectBudget, defConnectBudget, 10, 600)
+	c.MaxTries = clamp(c.MaxTries, defMaxTries, 1, 30)
+	c.PanelDebounce = clamp(c.PanelDebounce, defPanelDebounce, 0, 60000)
+	c.NodeTTL = clamp(c.NodeTTL, defNodeTTL, 30, 86400)
+	c.ReconnectLimit = clamp(c.ReconnectLimit, defReconnectLimit, 1, 16)
+	switch c.ScoreMode {
+	case "speed", "idle", "ping", "balanced":
+	default:
+		c.ScoreMode = defScoreMode
+	}
+	return c
+}
+
+// connConf 取当前连接层参数（已夹过界）。
+func connConf() ConnSettings { return getWebSettings().Conn.normalized() }
 
 // residentialOnly 返回"只用家宽"是否开启。没配过时默认开：
 // fanout 存在的意义就是把家宽扇成出口，机房 IP 对用户没价值。
@@ -46,6 +134,27 @@ func setResidentialOnly(v bool) error {
 	webSettingsCur.ResidentialOnly = &v
 	webSettingsMu.Unlock()
 	return saveWebSettings()
+}
+
+// setConn 改连接层参数并落盘。写入前先夹一遍界，
+// 免得界面填了个 0 就把健康检查间隔存成 0 秒。
+func setConn(c ConnSettings) error {
+	c = c.normalized()
+	webSettingsMu.Lock()
+	webSettingsCur.Conn = c
+	webSettingsMu.Unlock()
+	return saveWebSettings()
+}
+
+// connWake 让长跑循环立刻察觉参数变了：健康检查原来用 time.Tick，
+// 改了间隔要等下一轮才生效，最坏得等一个旧间隔。
+var connWake = make(chan struct{}, 1)
+
+func notifyConnChange() {
+	select {
+	case connWake <- struct{}{}:
+	default: // 已经有一次唤醒在排队，不必重复
+	}
 }
 
 var (

@@ -25,6 +25,11 @@ func (m *Manager) Provision(req ProvisionRequest) (*Job, error) {
 	if req.Count < 1 {
 		return nil, fmt.Errorf("数量至少为 1")
 	}
+	// 挑节点之前先保证列表够新。原来只有启动和手动点刷新才拉一次，
+	// 挂着几小时后节点早已大量失效，挑出来的第一批基本都是死节点，
+	// 每条隧道都要各自把候选试完才连上。拉取失败就用旧的，不阻断开出口。
+	_, _ = m.ensureNodes()
+
 	var picks []Node
 	var err error
 	if req.EveryRegion {
@@ -77,12 +82,15 @@ func (m *Manager) runProvision(job *Job, picks []Node, templateID int) {
 		wg.Add(1)
 		go func(i int, t *Tunnel) {
 			defer wg.Done()
-			m.waitUp(t)
-			if t.Status == "up" {
-				job.Set(i, "ok", t.ExitIP)
+			if m.waitUp(t) == "up" {
+				job.Set(i, "ok", t.exitIP())
 				return
 			}
-			job.Set(i, "failed", firstLine(t.Err))
+			why := firstLine(t.state().Err)
+			if why == "" {
+				why = "等待连接结果超时"
+			}
+			job.Set(i, "failed", why)
 		}(i, t)
 	}
 	wg.Wait()
@@ -94,8 +102,8 @@ func (m *Manager) runProvision(job *Job, picks []Node, templateID int) {
 	step := len(picks)
 	var hosts []string
 	for _, t := range started {
-		if t != nil && t.Status == "up" {
-			hosts = append(hosts, t.Node.HostName)
+		if t != nil && t.status() == "up" {
+			hosts = append(hosts, t.host())
 		}
 	}
 	if len(hosts) == 0 {
@@ -118,16 +126,29 @@ func (m *Manager) runProvision(job *Job, picks []Node, templateID int) {
 	job.Set(step, "ok", fmt.Sprintf("已创建 %d 个入站", len(ports)))
 }
 
-// waitUp 等一条隧道跑完 bringUp。bringUp 最多试 6 个候选节点，
-// 每个节点等 tun0 最长 40 秒，所以这里给足余量。
-func (m *Manager) waitUp(t *Tunnel) {
-	const maxWait = 5 * time.Minute
+// waitUp 等一条隧道跑到终态，返回那个状态。
+//
+// 上界必须按当前设置现算：候选数和单节点握手预算都可调，写死的值要么提前把
+// 还在重试的出口报成失败，要么在全挂时白等好几分钟。
+// 一轮 = 最多 MaxTries 个候选 × connect_budget，再加一次退避的余量
+// （持久重试会在候选全挂后退避重来，那期间状态还是 starting）。
+func (m *Manager) waitUp(t *Tunnel) string {
+	cfg := connConf()
+	// 一个候选节点最坏要等：tun0 就绪预算 + 一次出口 IP 探测
+	per := time.Duration(cfg.ConnectBudget)*time.Second +
+		2*time.Duration(cfg.HealthTimeout)*time.Second
+	maxWait := time.Duration(cfg.MaxTries)*per +
+		time.Duration(cfg.BackoffMax)*time.Second + 30*time.Second
 	deadline := time.Now().Add(maxWait)
-	for time.Now().Before(deadline) {
-		if t.Status == "up" || t.Status == "failed" || t.Status == "stopped" {
-			return
+	for {
+		st := t.status()
+		if st == "up" || st == "failed" || st == "stopped" {
+			return st
 		}
-		time.Sleep(time.Second)
+		if time.Now().After(deadline) {
+			return "timeout"
+		}
+		time.Sleep(300 * time.Millisecond)
 	}
 }
 
@@ -141,7 +162,7 @@ func (m *Manager) pickNodes(region string, count int, avoid map[string]bool) ([]
 
 	used := map[string]bool{}
 	for _, t := range m.tunnels {
-		used[t.Node.HostName] = true
+		used[t.host()] = true
 	}
 
 	pool := m.nodePoolLocked()
@@ -178,7 +199,7 @@ func (m *Manager) pickEveryRegion(perRegion int) ([]Node, error) {
 	m.mu.RLock()
 	used := map[string]bool{}
 	for _, t := range m.tunnels {
-		used[t.Node.HostName] = true
+		used[t.host()] = true
 	}
 	room := m.maxSlots - len(m.tunnels)
 	pool := m.nodePoolLocked()
@@ -279,7 +300,7 @@ func (m *Manager) Regions() []RegionStat {
 
 	used := map[string]bool{}
 	for _, t := range m.tunnels {
-		used[t.Node.HostName] = true
+		used[t.host()] = true
 	}
 
 	byCode := map[string]*RegionStat{}

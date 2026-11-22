@@ -4,9 +4,11 @@ import (
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
+	"math/rand"
 	"net/http"
 	"net/url"
 	"os"
@@ -26,10 +28,21 @@ type XUI struct {
 	Port     int    `json:"port"`
 	BasePath string `json:"base_path"`
 	Scheme   string `json:"scheme"`
-	token    string
 	client   *http.Client
 	// workDir 是 fanout 的工作目录，新建 TLS 入站时自签证书落在这里。
 	workDir string
+
+	// token 会被并发读写：界面轮询读入站的同时，另一个请求可能正因为
+	// 未授权而换新 token。其余字段建好就不再变。
+	mu    sync.Mutex
+	token string
+}
+
+// bearer 取当前 token。
+func (x *XUI) bearer() string {
+	x.mu.Lock()
+	defer x.mu.Unlock()
+	return x.token
 }
 
 // base 返回访问面板用的前缀。
@@ -103,7 +116,7 @@ func xuiCertConfigured(text string) bool {
 func panelAccess() (scheme, host string, ok bool) {
 	cmd := exec.Command(xuiMenu)
 	cmd.Stdin = strings.NewReader("11\n\n0\n")
-	out, err := cmd.Output()
+	out, err := cmdOutput(cmd)
 	if err != nil && len(out) == 0 {
 		return "", "", false
 	}
@@ -127,7 +140,7 @@ func DetectXUI(workDir string) (*XUI, error) {
 		return nil, fmt.Errorf("本机未安装或未运行 3x-ui")
 	}
 
-	out, err := exec.Command(xuiBinary, "setting", "-show").Output()
+	out, err := cmdOutput(exec.Command(xuiBinary, "setting", "-show"))
 	if err != nil {
 		return nil, fmt.Errorf("读取面板设置失败: %w", err)
 	}
@@ -143,7 +156,7 @@ func DetectXUI(workDir string) (*XUI, error) {
 		if on {
 			scheme = "https"
 		}
-	} else if certOut, err := exec.Command(xuiBinary, "setting", "-getCert").Output(); err == nil {
+	} else if certOut, err := cmdOutput(exec.Command(xuiBinary, "setting", "-getCert")); err == nil {
 		if xuiCertConfigured(string(certOut)) {
 			scheme = "https"
 		}
@@ -187,7 +200,7 @@ func DetectXUI(workDir string) (*XUI, error) {
 	}
 
 	// 没有可用 token，这条命令会自动生成一个
-	tokOut, err := exec.Command(xuiBinary, "setting", "-getApiToken").Output()
+	tokOut, err := cmdOutput(exec.Command(xuiBinary, "setting", "-getApiToken"))
 	if err != nil {
 		return nil, fmt.Errorf("获取 API token 失败: %w", err)
 	}
@@ -241,17 +254,73 @@ func localClient() *http.Client {
 	}
 }
 
-// post 调用面板 API。v3.5.0 里 Bearer token 只对 /panel/api/ 前缀生效。
+// post 调用面板 API，不重试。用于会改变状态且不幂等的调用。
 func (x *XUI) post(path string, form url.Values) ([]byte, error) {
-	return x.call(http.MethodPost, path, form)
+	return x.call(http.MethodPost, path, form, false)
+}
+
+// postSafe 调用面板 API 并在故障后重试。只能用于幂等调用：
+// 整体写入类（xray/update）和删除类重试不会造成重复对象。
+func (x *XUI) postSafe(path string, form url.Values) ([]byte, error) {
+	return x.call(http.MethodPost, path, form, true)
 }
 
 // get 调用面板的只读 API。inbounds/list 是 GET。
 func (x *XUI) get(path string) ([]byte, error) {
-	return x.call(http.MethodGet, path, nil)
+	return x.call(http.MethodGet, path, nil, true)
 }
 
-func (x *XUI) call(method, path string, form url.Values) ([]byte, error) {
+// errPanelAuth 表示面板认为 token 不可用。
+var errPanelAuth = errors.New("面板拒绝当前 API token")
+
+// 面板偶尔正好在我写配置的瞬间重启：这时连接被拒，重试一次就通。
+// 原来一次都不重试，用户看到的是"操作失败"，其实过 0.5 秒就好了。
+const panelRetries = 3
+
+func panelBackoff(attempt int) time.Duration {
+	d := 200 * time.Millisecond * time.Duration(1<<uint(attempt-1))
+	return d + time.Duration(rand.Intn(120))*time.Millisecond
+}
+
+// call 调面板 API。safe 决定网络故障时是否重试。
+//
+// 不重试的那条路径是给 inbounds/add 这类"再来一次就多一个对象"的调用留的：
+// 响应丢了不代表请求没生效，重试会造出重复入站。
+func (x *XUI) call(method, path string, form url.Values, safe bool) ([]byte, error) {
+	tries := 1
+	if safe {
+		tries = panelRetries
+	}
+	var last error
+	refreshed := false
+	for attempt := 1; attempt <= tries; attempt++ {
+		if attempt > 1 {
+			time.Sleep(panelBackoff(attempt - 1))
+		}
+		obj, err := x.once(method, path, form)
+		switch {
+		case err == nil:
+			return obj, nil
+		case errors.Is(err, errPanelAuth) && !refreshed:
+			// 面板换过或清空过 token 之后会一直回未授权。不在这里自愈的话，
+			// 所有面板操作从此全废，只能靠重启 fanout 恢复。
+			// 只刷一次：`x-ui setting -getApiToken` 每次都会新建一条记录，
+			// 反复刷会把面板的 api_tokens 表撑爆。
+			refreshed = true
+			if !x.refreshToken() {
+				return nil, err
+			}
+			attempt-- // 刷新不算一次故障重试，别把它从预算里扣掉
+			last = err
+		default:
+			last = err
+		}
+	}
+	return nil, last
+}
+
+// once 发一次请求并解开面板的统一响应壳。
+func (x *XUI) once(method, path string, form url.Values) ([]byte, error) {
 	endpoint := fmt.Sprintf("%s/%s", x.base(), strings.TrimPrefix(path, "/"))
 
 	var body io.Reader
@@ -262,7 +331,7 @@ func (x *XUI) call(method, path string, form url.Values) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Authorization", "Bearer "+x.token)
+	req.Header.Set("Authorization", "Bearer "+x.bearer())
 	if form != nil {
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	}
@@ -275,6 +344,9 @@ func (x *XUI) call(method, path string, form url.Values) ([]byte, error) {
 	raw, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, err
+	}
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		return nil, fmt.Errorf("%w: 调用 %s 返回 HTTP %d", errPanelAuth, path, resp.StatusCode)
 	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("调用 %s 返回 HTTP %d", path, resp.StatusCode)
@@ -294,6 +366,30 @@ func (x *XUI) call(method, path string, form url.Values) ([]byte, error) {
 	return envelope.Obj, nil
 }
 
+// refreshToken 向面板重新要一个 API token 并换上。成功返回 true。
+func (x *XUI) refreshToken() bool {
+	out, err := cmdOutput(exec.Command(xuiBinary, "setting", "-getApiToken"))
+	if err != nil {
+		return false
+	}
+	tm := reXUIToken.FindStringSubmatch(stripANSI(string(out)))
+	if tm == nil {
+		return false
+	}
+	x.mu.Lock()
+	x.token = tm[1]
+	x.mu.Unlock()
+
+	cachedTokenMu.Lock()
+	cachedToken = tm[1]
+	cachedTokenMu.Unlock()
+	if x.workDir != "" {
+		saveToken(x.workDir, tm[1])
+	}
+	log.Printf("已换新 3x-ui API token")
+	return true
+}
+
 // xrayConfig 是 /panel/api/xray/ 返回的结构。
 // 注意 obj 本身是一个 JSON 字符串，要二次解析。
 type xrayConfig struct {
@@ -303,7 +399,7 @@ type xrayConfig struct {
 
 // loadXray 读取当前 Xray 配置模板。
 func (x *XUI) loadXray() (map[string]any, string, error) {
-	obj, err := x.post("panel/api/xray/", nil)
+	obj, err := x.postSafe("panel/api/xray/", nil)
 	if err != nil {
 		return nil, "", err
 	}
@@ -336,16 +432,23 @@ func (x *XUI) saveXray(setting map[string]any, testURL string) error {
 	if testURL != "" {
 		form.Set("outboundTestUrl", testURL)
 	}
-	if _, err := x.post("panel/api/xray/update", form); err != nil {
+	// 整体写入模板，重试不会造出多余对象，所以允许在网络抖动后再试。
+	if _, err := x.postSafe("panel/api/xray/update", form); err != nil {
 		return err
 	}
 
 	// 只写模板不够：面板要重载 Xray 才会用新的 outbounds 与 routing 生成运行配置，
 	// 否则路由改动看起来保存成功了，实际流量还按旧规则走。
-	if _, err := x.post("panel/api/server/restartXrayService", nil); err != nil {
-		return fmt.Errorf("配置已保存但重载 Xray 失败: %w", err)
-	}
-	return nil
+	//
+	// 重载走合并窗口：绑定 8 条出口就是 8 次模板写入 + 8 次重启，
+	// 客户端会被反复踢下线，而面板重启一次要两三秒，整批操作大半时间花在重启上。
+	// 模板是完整的当前状态，重载又是"按模板重新生成"，所以只需要最后那一次。
+	return deferRestart("3x-ui", func() error {
+		if _, err := x.post("panel/api/server/restartXrayService", nil); err != nil {
+			return fmt.Errorf("配置已保存但重载 Xray 失败: %w", err)
+		}
+		return nil
+	})
 }
 
 // Inbound 是面板里已有的一个入站。
@@ -844,7 +947,7 @@ func (x *XUI) addInbound(payload map[string]any) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	req.Header.Set("Authorization", "Bearer "+x.token)
+	req.Header.Set("Authorization", "Bearer "+x.bearer())
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := x.client.Do(req)
@@ -948,7 +1051,7 @@ func (x *XUI) jsonRequest(method, endpoint string, body []byte) ([]byte, error) 
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Authorization", "Bearer "+x.token)
+	req.Header.Set("Authorization", "Bearer "+x.bearer())
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := x.client.Do(req)
@@ -1136,7 +1239,7 @@ func (x *XUI) InboundLinks(ids []int, publicHost string) ([]string, error) {
 // 面板的 del 只动 inbounds，残留的规则会让后续绑定读到不存在的入站标签。
 func (x *XUI) DeleteInbounds(ids []int, tunnels []*Tunnel) error {
 	for _, id := range ids {
-		if _, err := x.post(fmt.Sprintf("panel/api/inbounds/del/%d", id), nil); err != nil {
+		if _, err := x.postSafe(fmt.Sprintf("panel/api/inbounds/del/%d", id), nil); err != nil {
 			return fmt.Errorf("删除入站 %d 失败: %w", id, err)
 		}
 	}
@@ -1239,7 +1342,7 @@ func (x *XUI) postJSON(path string, payload any, what string) error {
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Authorization", "Bearer "+x.token)
+	req.Header.Set("Authorization", "Bearer "+x.bearer())
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := x.client.Do(req)
@@ -1543,13 +1646,10 @@ func forceIPv4(outbound map[string]any) {
 // Alpine 这类发行版用 OpenRC 而不是 systemd，只查 systemctl 会误判成"没装"，
 // 于是装了面板也会退回自建模式，两个 Xray 抢端口。
 func xuiRunning() bool {
-	if exec.Command("systemctl", "is-active", "--quiet", "x-ui").Run() == nil {
+	if cmdRun(exec.Command("systemctl", "is-active", "--quiet", "x-ui")) == nil {
 		return true
 	}
-	if exec.Command("rc-service", "x-ui", "status").Run() == nil {
-		return true
-	}
-	return false
+	return cmdRun(exec.Command("rc-service", "x-ui", "status")) == nil
 }
 
 // CreateInbound 通过面板的 inbounds/add API 新建一个入站。

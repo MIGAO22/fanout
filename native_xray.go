@@ -9,6 +9,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -61,8 +62,8 @@ func findXray(workDir string) (string, error) {
 func buildXrayConfig(inbounds []*nativeInbound, tunnels []*Tunnel) map[string]any {
 	live := map[string]bool{}
 	for _, t := range tunnels {
-		if t.Status == "up" {
-			live[sanitizeTag(t.Node.HostName)] = true
+		if t.status() == "up" {
+			live[sanitizeTag(t.host())] = true
 		}
 	}
 
@@ -85,7 +86,7 @@ func buildXrayConfig(inbounds []*nativeInbound, tunnels []*Tunnel) map[string]an
 		map[string]any{"tag": "block", "protocol": "blackhole"},
 	}
 	for _, t := range tunnels {
-		if t.Status != "up" {
+		if t.status() != "up" {
 			continue
 		}
 		outs = append(outs, map[string]any{
@@ -261,9 +262,13 @@ func trimOutput(b []byte) string {
 }
 
 // xrayProc 管理自建模式下的 xray 进程。
+//
+// 自带锁：重载现在可能来自合并定时器的 goroutine，不再总是由持有 Native.mu
+// 的调用方驱动，进程句柄这份状态得自己保护自己。
 type xrayProc struct {
 	bin  string
 	dir  string
+	mu   sync.Mutex
 	cmd  *exec.Cmd
 	logf *os.File
 }
@@ -288,19 +293,42 @@ func (p *xrayProc) restart(cfgPath string) error {
 		f.Close()
 		return fmt.Errorf("启动 Xray 失败: %w", err)
 	}
+
+	// Wait 的结果放进带缓冲的 channel：原来靠轮询 cmd.ProcessState，
+	// 而 ProcessState 是 Wait 返回时才写的，那个判断实际从没生效过。
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+
+	p.mu.Lock()
 	p.cmd, p.logf = cmd, f
-	go cmd.Wait() // 回收子进程，避免僵尸
+	p.mu.Unlock()
 	p.writePID(cmd.Process.Pid)
 
 	// 起得来但立刻退出的情况要能被发现，否则界面会显示成功而实际不通
-	time.Sleep(400 * time.Millisecond)
-	if cmd.ProcessState != nil && cmd.ProcessState.Exited() {
+	select {
+	case err := <-done:
+		f.Close()
+		p.mu.Lock()
+		p.cmd, p.logf = nil, nil
+		p.mu.Unlock()
+		_ = os.Remove(p.pidPath())
+		if err != nil {
+			return fmt.Errorf("Xray 启动后立刻退出: %v，详见 %s", err, logPath)
+		}
 		return fmt.Errorf("Xray 启动后立刻退出，详见 %s", logPath)
+	case <-time.After(400 * time.Millisecond):
 	}
 	return nil
 }
 
+// stop 收掉当前进程。restart 内部也会调，所以拆成不加锁的 stopLocked。
 func (p *xrayProc) stop() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.stopLocked()
+}
+
+func (p *xrayProc) stopLocked() {
 	if p.cmd != nil && p.cmd.Process != nil {
 		_ = p.cmd.Process.Kill()
 		p.cmd = nil

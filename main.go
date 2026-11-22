@@ -111,6 +111,7 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", handleIndex)
+	mux.HandleFunc("/app.js", handleAppJS)
 	mux.HandleFunc("/api/nodes", apiNodes(mgr))
 	mux.HandleFunc("/api/tunnels", apiTunnels(mgr))
 	mux.HandleFunc("/api/start", apiStart(mgr))
@@ -230,6 +231,7 @@ func apiStart(m *Manager) http.HandlerFunc {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "缺少 host 参数"})
 			return
 		}
+		_, _ = m.ensureNodes()
 		nodes, _ := m.Nodes()
 		for _, n := range nodes {
 			if n.HostName == host {
@@ -291,6 +293,9 @@ func apiSwap(m *Manager) http.HandlerFunc {
 // apiRegions 给新建向导用：各地区还剩多少空闲节点。
 func apiRegions(m *Manager) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		// 向导是用户主动打开的，这里顺手把列表刷新到 TTL 以内，
+		// 免得看到的地区数还是几小时前的
+		_, _ = m.ensureNodes()
 		writeJSON(w, http.StatusOK, m.Regions())
 	}
 }
@@ -323,11 +328,12 @@ func apiCred(m *Manager) http.HandlerFunc {
 // GET 返回当前值（不含明文口令）；POST 按传入的字段逐项应用，任一项失败即整体回报。
 func apiSettings(auth *Auth, srv *webServer) http.HandlerFunc {
 	type settingsReq struct {
-		Password        *string `json:"password"`         // 非空则改口令
-		BasePath        *string `json:"base_path"`        // 提供即改访问路径（空串=去掉前缀）
-		Port            *int    `json:"port"`             // 提供即改监听端口
-		ListenAddr      *string `json:"listen_addr"`      // 提供即改监听地址
-		ResidentialOnly *bool   `json:"residential_only"` // 提供即改"只用家宽"
+		Password        *string       `json:"password"`         // 非空则改口令
+		BasePath        *string       `json:"base_path"`        // 提供即改访问路径（空串=去掉前缀）
+		Port            *int          `json:"port"`             // 提供即改监听端口
+		ListenAddr      *string       `json:"listen_addr"`      // 提供即改监听地址
+		ResidentialOnly *bool         `json:"residential_only"` // 提供即改"只用家宽"
+		Conn            *ConnSettings `json:"conn"`             // 提供即改连接层参数
 	}
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPost {
@@ -359,6 +365,13 @@ func apiSettings(auth *Auth, srv *webServer) http.HandlerFunc {
 					return
 				}
 			}
+			// 改连接层参数。同样必须在改端口之前：applyWebSettings 会整份覆盖设置。
+			if in.Conn != nil {
+				if err := setConn(*in.Conn); err != nil {
+					writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+					return
+				}
+			}
 			// 改端口 / 监听地址：合成一份新的 WebSettings 一起应用，避免绑两次
 			if in.Port != nil || in.ListenAddr != nil {
 				next := getWebSettings()
@@ -373,6 +386,11 @@ func apiSettings(auth *Auth, srv *webServer) http.HandlerFunc {
 					return
 				}
 			}
+			// 探测超时/合并窗口这类参数改了要立刻体现在界面上：
+			// 后台循环每轮都重新读 connConf()，这里只需唤醒一次即可
+			if in.Conn != nil {
+				notifyConnChange()
+			}
 		}
 
 		cfg := getWebSettings()
@@ -386,7 +404,9 @@ func apiSettings(auth *Auth, srv *webServer) http.HandlerFunc {
 			"listen_addr":      listen,
 			"has_password":     true,
 			"residential_only": cfg.residentialOnly(),
-			"version":          version,
+			// 回报夹过界的实际生效值，界面显示的就该是程序真正在用的数
+			"conn":    cfg.Conn.normalized(),
+			"version": version,
 		})
 	}
 }
@@ -553,8 +573,8 @@ func apiXUIInbounds(m *Manager) http.HandlerFunc {
 func liveHosts(m *Manager) map[string]bool {
 	live := map[string]bool{}
 	for _, t := range m.Tunnels() {
-		if t.Status == "up" {
-			live[sanitizeTag(t.Node.HostName)] = true
+		if t.status() == "up" {
+			live[sanitizeTag(t.host())] = true
 		}
 	}
 	return live
@@ -603,8 +623,8 @@ func apiXUIClone(m *Manager) http.HandlerFunc {
 			}
 		} else {
 			for _, t := range tunnels {
-				if t.Status == "up" {
-					hosts = append(hosts, t.Node.HostName)
+				if t.status() == "up" {
+					hosts = append(hosts, t.host())
 				}
 			}
 		}

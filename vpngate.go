@@ -197,6 +197,62 @@ func parseNodeCSV(body string) ([]Node, error) {
 	if len(nodes) == 0 {
 		return nil, fmt.Errorf("节点列表为空")
 	}
-	sort.Slice(nodes, func(i, j int) bool { return nodes[i].SpeedMbps > nodes[j].SpeedMbps })
+	scoreNodes(nodes, connConf().ScoreMode)
 	return nodes, nil
+}
+
+// nodeScore 给一个节点打分，分高者优先挑到。
+//
+// 只用 SpeedMbps 排序是不够的，那列数字有两个毛病：
+//   - 它是 VPN Gate 别人跑过的历史测速，新上线的节点常常是 0，
+//     按它排序等于把"没测过"当成"最慢"，好节点被压到最后。
+//   - 它完全不反映此刻这个节点有多挤。NumVpnSessions 才是实时负载，
+//     志愿者家宽挂了 30 个会话时实测速度能掉到标称值的零头。
+//
+// Ping 是到 VPN Gate 日本主站的延迟，不是到本机的，只能当相对参考，
+// 所以权重给得比负载还低。
+func nodeScore(n Node, mode string) float64 {
+	speed := 0.25 // 没测过速：不给 0，也不给满分
+	if n.SpeedMbps > 0 {
+		// 饱和曲线：40 Mbps 记半分。线性归一会让 900 和 300 差出三倍，
+		// 而家宽出口真正拉开体验的是"够不够用"，不是绝对带宽。
+		speed = n.SpeedMbps / (n.SpeedMbps + 40)
+	}
+	// 会话数 0 表示空着，是好事；50 个以上基本挤满了
+	load := 1.0
+	if n.Sessions > 0 {
+		s := float64(n.Sessions)
+		if s > 50 {
+			s = 50
+		}
+		load = 1 - s/50
+	}
+	ping := 0.5 // 没测过：当中游
+	if n.Ping > 0 {
+		p := float64(n.Ping)
+		if p > 600 {
+			p = 600
+		}
+		ping = 1 - p/600
+	}
+
+	var ws, wl, wp float64
+	switch mode {
+	case "speed":
+		ws, wl, wp = 0.80, 0.10, 0.10
+	case "idle":
+		ws, wl, wp = 0.10, 0.55, 0.35
+	case "ping":
+		ws, wl, wp = 0.10, 0.20, 0.70
+	default: // balanced
+		ws, wl, wp = 0.45, 0.30, 0.25
+	}
+	return ws*speed + wl*load + wp*ping
+}
+
+// scoreNodes 按策略就地排序。稳定排序，同分的保持列表原有顺序。
+func scoreNodes(nodes []Node, mode string) {
+	sort.SliceStable(nodes, func(i, j int) bool {
+		return nodeScore(nodes[i], mode) > nodeScore(nodes[j], mode)
+	})
 }

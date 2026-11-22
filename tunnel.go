@@ -1,11 +1,13 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -21,6 +23,10 @@ type SocksCred struct {
 }
 
 // Tunnel 是一条运行中的隧道：一个 netns + 一个 openvpn 进程 + 一个本地 SOCKS5 端口。
+//
+// Status/Err/ExitIP/Node/Port/Since 这几项会被三类人同时碰：拉起它的后台 goroutine、
+// 健康检查、以及界面每几秒一次的轮询。写一律走下面的 setter，读走 state()，
+// 否则 -race 下就是数据竞争，实际表现是界面读到半更新的状态。
 type Tunnel struct {
 	Slot   int       `json:"slot"`
 	Port   int       `json:"port"`
@@ -33,7 +39,7 @@ type Tunnel struct {
 
 	ns       string
 	listener net.Listener
-	ovpn     *exec.Cmd
+	ovpn     *ovpnProc
 	mu       sync.Mutex
 	// swapped 是这条出口换节点时用过的 hostname，按时间先后排。
 	// 手动换节点要避开它们：只排除"当前这个"的话，连点两次就会在
@@ -46,6 +52,115 @@ type Tunnel struct {
 	// 两边对不上，那个入站就掉成了没人认领的孤儿。
 	// 这个字段跟着状态一起落盘，重启后照着它把入站接回来。
 	prevHost string
+}
+
+// ovpnProc 包住 openvpn 子进程，顺带把"进程什么时候退出"变成可等的 channel。
+//
+// 原来代码是 `go cmd.Wait()` 丢弃结果，于是 cmd.ProcessState 永远不为 nil 之前
+// 主流程已经开始轮询，退出判断形同虚设——openvpn 秒退也要空等满 40 秒才发现。
+type ovpnProc struct {
+	cmd  *exec.Cmd
+	done chan error // 进程退出后由 wait goroutine 写入
+}
+
+// kill 结束进程。幂等：进程已退或从没起来都不报错。
+func (o *ovpnProc) kill() {
+	if o == nil || o.cmd == nil || o.cmd.Process == nil {
+		return
+	}
+	_ = o.cmd.Process.Kill()
+	// 把 done 排空一次，避免 Wait 的结果没人收
+	select {
+	case <-o.done:
+	default:
+	}
+}
+
+// TunnelState 是运行态的一次一致性快照。
+type TunnelState struct {
+	Status string
+	Err    string
+	ExitIP string
+	Node   Node
+	Port   int
+	Since  time.Time
+}
+
+func (t *Tunnel) state() TunnelState {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return TunnelState{
+		Status: t.Status, Err: t.Err, ExitIP: t.ExitIP,
+		Node: t.Node, Port: t.Port, Since: t.Since,
+	}
+}
+
+func (t *Tunnel) status() string { return t.state().Status }
+func (t *Tunnel) exitIP() string { return t.state().ExitIP }
+func (t *Tunnel) host() string   { return t.state().Node.HostName }
+func (t *Tunnel) port() int      { return t.state().Port }
+func (t *Tunnel) node() Node     { return t.state().Node }
+
+// setStatus 改状态与附带的说明。给 Err 传空串表示清掉上一次的失败原因。
+func (t *Tunnel) setStatus(status, errMsg string) {
+	t.mu.Lock()
+	t.Status = status
+	t.Err = errMsg
+	t.mu.Unlock()
+}
+
+// setUp 是连上之后的收尾：状态、出口 IP、清错误、重置计时。
+// 三件事必须一次做完，界面才不会读到 status=up 但 exit_ip 还是空的中间态。
+func (t *Tunnel) setUp(ip string) {
+	t.mu.Lock()
+	t.Status = "up"
+	t.ExitIP = ip
+	t.Err = ""
+	t.Since = time.Now()
+	t.mu.Unlock()
+}
+
+func (t *Tunnel) setNode(n Node) {
+	t.mu.Lock()
+	t.Node = n
+	t.mu.Unlock()
+}
+
+func (t *Tunnel) setExitIP(ip string) {
+	t.mu.Lock()
+	t.ExitIP = ip
+	t.mu.Unlock()
+}
+
+// ovpnProc 取当前 openvpn 进程句柄（可能为 nil）。
+func (t *Tunnel) proc() *ovpnProc {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.ovpn
+}
+
+func (t *Tunnel) setProc(o *ovpnProc) {
+	t.mu.Lock()
+	t.ovpn = o
+	t.mu.Unlock()
+}
+
+// listenerRef 取当前 SOCKS5 监听，取不到返回 nil。
+func (t *Tunnel) getListener() net.Listener {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.listener
+}
+
+// MarshalJSON 让落盘也走锁。
+//
+// saveState 会把整个隧道数组 json.Marshal 一遍，那是在别的 goroutine 里读的，
+// 不加锁就与 setter 冲突。type plain Tunnel 没有继承本方法，不会递归。
+func (t *Tunnel) MarshalJSON() ([]byte, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	type plain Tunnel
+	return json.Marshal((*plain)(t))
 }
 
 // prevHostOf 读"换节点未收尾"标记。
@@ -221,11 +336,53 @@ func (t *Tunnel) teardownNetns() {
 	runQuiet("iptables", "-w", "5", "-D", "FORWARD", "-d", cidr, "-j", "ACCEPT")
 }
 
+// ovpnTuning 是给 openvpn 加的一串保活与快速失败参数。
+//
+// 原版只给了 --connect-retry-max/--connect-timeout，其它全用 openvpn 默认值，
+// 有两个默认值在 VPN Gate 这种志愿者节点上是有害的：
+//
+//   - --resolv-retry 默认 infinite：节点主机名解析不了时 openvpn 会永远重试 DNS，
+//     进程既不退出也不报错，fanout 只能干等满就绪超时才换下一个候选。
+//   - 没有 --keepalive：志愿者节点最常见的失效方式是"TCP 还连着但不再转发"，
+//     没有心跳就没人发现，这条出口在界面上一直是绿的，实际全在超时。
+func ovpnTuning(budget time.Duration) []string {
+	// 握手窗口必须显著小于总预算，否则一个卡在半程的节点会把整轮候选都拖住。
+	hand := int((budget / 3).Seconds())
+	if hand < 5 {
+		hand = 5
+	}
+	if hand > 20 {
+		hand = 20
+	}
+	return []string{
+		// 每 15 秒发一次控制通道心跳，45 秒没回应就重启数据通道。
+		// 45 秒这个值要比重连判定快，让 openvpn 自己能恢复的它自己恢复，
+		// 别动不动就惊动 fanout 换节点。
+		"--keepalive", "15", "45",
+		"--hand-window", strconv.Itoa(hand),
+		"--tls-timeout", "1",
+		"--connect-timeout", "15",
+		"--connect-retry", "3", "30",
+		// 三次连不上就退出。留着进程在 netns 里无限重连没有意义：
+		// fanout 手上还有别的候选节点，换人的成功率比它继续磨高得多。
+		"--connect-retry-max", "3",
+		// 解析失败别无限重试（见上）
+		"--resolv-retry", "3",
+		// 很多 Gate 配置里写了不止一个 remote，默认按顺序试，
+		// 第一个往往是先挂的那个；随机化让多次尝试落在不同地址上。
+		"--remote-random",
+		// 隧道 MTU 比物理链路小，不夹 MSS 的话大包静默丢失，
+		// 表现是"能连上但网页打不开"。
+		"--mssfix", "1380",
+	}
+}
+
 // startOpenVPN 在 netns 内拉起 openvpn，并等待 tun0 拿到地址。
+// 就绪与否以"tun0 上有了 IPv4"为准——这是 SOCKS5 能出网的真正前提。
 func (t *Tunnel) startOpenVPN(dir string) error {
 	ns := t.nsName()
 	cfgPath := filepath.Join(dir, ns+".ovpn")
-	if err := os.WriteFile(cfgPath, []byte(t.Node.Config), 0600); err != nil {
+	if err := os.WriteFile(cfgPath, []byte(t.node().Config), 0600); err != nil {
 		return fmt.Errorf("写配置失败: %w", err)
 	}
 	authPath := filepath.Join(dir, "auth.txt")
@@ -233,38 +390,72 @@ func (t *Tunnel) startOpenVPN(dir string) error {
 		return fmt.Errorf("写凭据失败: %w", err)
 	}
 
+	budget := time.Duration(connConf().ConnectBudget) * time.Second
+
 	logPath := filepath.Join(dir, ns+".log")
-	cmd := exec.Command("ip", "netns", "exec", ns, "openvpn",
+	args := []string{
 		"--config", cfgPath,
 		"--auth-user-pass", authPath,
 		"--auth-nocache",
 		"--dev", "tun0",
-		"--connect-retry-max", "2",
-		"--connect-timeout", "20",
 		"--data-ciphers", "AES-128-CBC:AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305",
 		"--verb", "3",
 		"--log", logPath,
-	)
+	}
+	args = append(args, ovpnTuning(budget)...)
+	cmd := exec.Command("ip", append([]string{"netns", "exec", ns, "openvpn"}, args...)...)
+
+	// 自己 Wait 并把结果送进 channel：既回收了子进程不留僵尸，
+	// 又让"进程已退出"变成可等待的事件，而不是靠轮询 ProcessState。
+	done := make(chan error, 1)
 	if err := cmdStart(cmd); err != nil {
 		return fmt.Errorf("启动 openvpn 失败: %w", err)
 	}
-	t.ovpn = cmd
-	go cmd.Wait() // 回收子进程，避免僵尸
+	go func() { done <- cmd.Wait() }()
 
-	// openvpn 建好 tun0 前 SOCKS5 无法正常出网，这里等它就绪
-	deadline := time.Now().Add(40 * time.Second)
-	for time.Now().Before(deadline) {
-		if out, err := cmdOutput(exec.Command("ip", "netns", "exec", ns, "ip", "-4", "addr", "show", "tun0")); err == nil {
-			if strings.Contains(string(out), "inet ") {
+	old := t.proc()
+	t.setProc(&ovpnProc{cmd: cmd, done: done})
+	// 上一节点的进程如果还在（换节点时走到这一步），现在可以收了：
+	// 新进程已经起来了，旧 netns 也早就拆过，留着只会占着一个口。
+	old.kill()
+
+	waitErr := t.waitTunUp(ns, budget, done)
+	if waitErr != nil {
+		return fmt.Errorf("%v，详见 %s", waitErr, logPath)
+	}
+	return nil
+}
+
+// tun0Up 看 netns 里的 tun0 是否已经拿到地址。
+func tun0Up(ns string) bool {
+	out, err := cmdOutput(exec.Command("ip", "netns", "exec", ns, "ip", "-4", "addr", "show", "tun0"))
+	return err == nil && strings.Contains(string(out), "inet ")
+}
+
+// waitTunUp 等 tun0 就绪。进程提前退出或超过预算都立刻返回失败。
+//
+// 原来是一段固定 40 秒的 1 秒轮询：节点连不上要满 40 秒才知道，
+// 一轮 6 个候选全挂就是 4 分钟。这里改成"事件 + 预算"，
+// 进程一退就返回，好节点通常 2-3 秒就过。
+func (t *Tunnel) waitTunUp(ns string, budget time.Duration, done chan error) error {
+	deadline := time.After(budget)
+	tick := time.NewTicker(400 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		select {
+		case <-deadline:
+			return fmt.Errorf("等待 tun0 就绪超时（预算 %.0f 秒）", budget.Seconds())
+		case err := <-done:
+			if err != nil {
+				return fmt.Errorf("openvpn 退出: %v", err)
+			}
+			return fmt.Errorf("openvpn 意外结束")
+		case <-tick.C:
+			if tun0Up(ns) {
 				return nil
 			}
 		}
-		if cmd.ProcessState != nil && cmd.ProcessState.Exited() {
-			return fmt.Errorf("openvpn 提前退出，详见 %s", logPath)
-		}
-		time.Sleep(time.Second)
 	}
-	return fmt.Errorf("等待 tun0 就绪超时，详见 %s", logPath)
 }
 
 // serve 在母机上监听 SOCKS5 端口，出站连接则在 netns 内建立。
@@ -273,10 +464,11 @@ func (t *Tunnel) startOpenVPN(dir string) error {
 func (t *Tunnel) serve() error {
 	// 端口要尽量保持不变，否则用户已经分发出去的客户端配置会失效。
 	// 进程刚重启时旧监听可能还在 TIME_WAIT，这里给几秒重试窗口。
+	port := t.port()
 	var ln net.Listener
 	var err error
 	for i := 0; i < 6; i++ {
-		ln, err = net.Listen("tcp", fmt.Sprintf("0.0.0.0:%d", t.Port))
+		ln, err = net.Listen("tcp", fmt.Sprintf("0.0.0.0:%d", port))
 		if err == nil {
 			break
 		}
@@ -284,17 +476,19 @@ func (t *Tunnel) serve() error {
 	}
 	if err != nil {
 		// 确实被别的进程长期占用了，才换端口
-		port, perr := freeRandomPort(map[int]bool{t.Port: true})
+		alt, perr := freeRandomPort(map[int]bool{port: true})
 		if perr != nil {
-			return fmt.Errorf("监听 %d 失败且无备用端口: %w", t.Port, err)
+			return fmt.Errorf("监听 %d 失败且无备用端口: %w", port, err)
 		}
-		ln, err = net.Listen("tcp", fmt.Sprintf("0.0.0.0:%d", port))
+		ln, err = net.Listen("tcp", fmt.Sprintf("0.0.0.0:%d", alt))
 		if err != nil {
-			return fmt.Errorf("监听 %d 失败: %w", port, err)
+			return fmt.Errorf("监听 %d 失败: %w", alt, err)
 		}
-		t.Port = port
+		t.setPort(alt)
 	}
+	t.mu.Lock()
 	t.listener = ln
+	t.mu.Unlock()
 	dial := dialerInNetns(t.nsName())
 
 	go func() {
@@ -326,32 +520,41 @@ func (t *Tunnel) setCredential(c SocksCred) {
 	t.Cred = c
 }
 
+func (t *Tunnel) setPort(p int) {
+	t.mu.Lock()
+	t.Port = p
+	t.mu.Unlock()
+}
+
 // probeExitIP 通过隧道查询出口 IP，用于确认这条隧道确实换了 IP。
+// 探测源与超时策略见 health.go 的 probeExitIPIn。
+//
+// 这里用健康检查的超时而不是 connect_budget：连接一个候选节点的总预算
+// 已经是 tun0 就绪 + 一次出口查询，两者都用大预算会让"每个候选都要等两遍"，
+// 上层重试整轮的等待也跟着翻倍。
 func (t *Tunnel) probeExitIP() (string, error) {
-	out, err := cmdOutput(exec.Command("ip", "netns", "exec", t.nsName(),
-		"curl", "-s", "--max-time", "15", "http://api.ipify.org"))
-	if err != nil {
-		return "", fmt.Errorf("查询出口 IP 失败: %w", err)
-	}
-	ip := strings.TrimSpace(string(out))
-	if net.ParseIP(ip) == nil {
-		return "", fmt.Errorf("出口 IP 返回异常: %q", ip)
-	}
-	return ip, nil
+	budget := 2 * time.Duration(connConf().HealthTimeout) * time.Second
+	return probeExitIPIn(t.nsName(), budget)
 }
 
 // stop 停止这条隧道并清理它占用的所有资源。
+//
+// 拆 netns、删 veth、改 iptables 都是秒级的慢操作，原先整段在 t.mu 里跑，
+// 期间所有读状态的 goroutine（包括界面轮询）都被卡在锁上。
+// 现在锁只保护字段变更那几行，清理放到锁外。
 func (t *Tunnel) stop() {
 	t.mu.Lock()
-	defer t.mu.Unlock()
-	if t.listener != nil {
-		t.listener.Close()
-		t.listener = nil
-	}
-	if t.ovpn != nil && t.ovpn.Process != nil {
-		_ = t.ovpn.Process.Kill()
-		t.ovpn = nil
-	}
-	t.teardownNetns()
+	ln := t.listener
+	proc := t.ovpn
+	t.listener = nil
+	t.ovpn = nil
 	t.Status = "stopped"
+	t.ExitIP = ""
+	t.mu.Unlock()
+
+	if ln != nil {
+		_ = ln.Close()
+	}
+	proc.kill()
+	t.teardownNetns()
 }

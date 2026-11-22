@@ -4,9 +4,19 @@ import (
 	"net"
 	"os"
 	"runtime"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
+
+// socksDialTimeout 是给隧道内一次拨号的硬超时。
+//
+// 原来用无超时的 net.Dial：隧道刚掉但 netns 还没拆时，目标地址会被
+// 内核一直挂着 SYN，拨号要等到 TCP 自己的重试上限（两分钟以上）。
+// 这段时间这个客户端连接既不报错也不动，界面看起来就是"卡住"。
+// 超时同样覆盖 DNS 查询——拨号的 deadline 会传解析器，
+// 所以隧道内解析不了主机名也不会无限挂着。
+const socksDialTimeout = 15 * time.Second
 
 // dialerInNetns 返回一个在指定 netns 内建立出站连接的 dial 函数。
 // 每次拨号都要切一次 netns，因为 socket 的归属在创建时确定。
@@ -40,9 +50,9 @@ func dialerInNetns(nsName string) func(network, addr string) (net.Conn, error) {
 				return
 			}
 
-			// 隧道内只有 IPv4 路由。不限定的话 net.Dial 可能选中 AAAA 记录，
-			// 那条连接会绕开隧道从母机的 IPv6 出去，暴露真实地址。
-			conn, dialErr := net.Dial(forceIPv4Network(network), addr)
+			// 隧道内只有 IPv4 路由。不限定的话会选中 AAAA 记录，
+			// 那条连接绕开隧道从母机的 IPv6 出去，暴露真实地址。
+			conn, dialErr := net.DialTimeout(forceIPv4Network(network), addr, socksDialTimeout)
 
 			if err := unix.Setns(int(origin.Fd()), unix.CLONE_NEWNET); err != nil {
 				if conn != nil {

@@ -339,12 +339,15 @@ func copyFileMode(src, dst string, mode os.FileMode) error {
 // restartSelf 通过 init 系统重启 fanout 服务，拉起刚替换的新二进制。
 // systemd / openrc 各一套；都不可用时退回直接自我 exec。
 func restartSelf() {
+	// 必须在母机命名空间里发这道重启命令：openrc 的 start-stop-daemon 是
+	// rc-service 的子进程，命名空间会一路继承下去，新 fanout 一开机就把
+	// 隧道内当成"母机"，之后建的所有出口全在隧道里。
 	if hasCmd("systemctl") && dirExists("/run/systemd/system") {
-		_ = exec.Command("systemctl", "restart", "fanout").Start()
+		_ = cmdStart(exec.Command("systemctl", "restart", "fanout"))
 		return
 	}
 	if hasCmd("rc-service") {
-		_ = exec.Command("rc-service", "fanout", "restart").Start()
+		_ = cmdStart(exec.Command("rc-service", "fanout", "restart"))
 		return
 	}
 	// 没有 init 系统托管：直接退出，让外部守护（若有）拉起；

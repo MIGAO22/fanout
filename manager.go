@@ -18,7 +18,30 @@ type Manager struct {
 	workDir  string
 	maxSlots int
 	jobs     JobStore
+
+	// 节点列表的并发控制：一次拉取要下几十 MB 的 CSV，
+	// 多个入口（界面轮询、重试、新建向导）同时触发会把带宽和 VPN Gate 一起打爆。
+	fetchMu    sync.Mutex
+	fetchWait  chan fetchResult
+	fetchFailA time.Time
+	// nodesMode 记住这份列表是按哪种打分策略排的，换了策略就要重排。
+	nodesMode string
 }
+
+// fetchResult 是一次节点列表拉取的产物，通过 channel 广播给所有等待者。
+type fetchResult struct {
+	count int
+	err   error
+}
+
+// 拉取节点列表的整体超时，以及失败后的冷却时间。
+//
+// 冷却是有意的：拉取失败时列表还是旧的（可能已过 TTL），若不加冷却，
+// 每次挑节点都会重新去拉那份几十 MB 的 CSV，故障期间等于自我 DDoS。
+const (
+	nodeFetchTimeout  = 60 * time.Second
+	nodeFetchCooldown = 45 * time.Second
+)
 
 func NewManager(maxSlots int, workDir string) *Manager {
 	return &Manager{
@@ -28,17 +51,78 @@ func NewManager(maxSlots int, workDir string) *Manager {
 	}
 }
 
-// RefreshNodes 重新拉取节点列表。
+// RefreshNodes 无条件重新拉取节点列表。
 func (m *Manager) RefreshNodes() (int, error) {
-	nodes, err := fetchNodes(60 * time.Second)
-	if err != nil {
-		return 0, err
+	return m.refreshNodes()
+}
+
+// ensureNodes 保证手上这份节点列表够新。
+//
+// TTL 内直接用缓存；过期才去拉，且同一时刻只允许一次拉取在跑，
+// 其余调用者等它的结果。列表还没拉到过时（启动阶段）必须真拉一次。
+// 拉取失败退回旧列表，让挑节点照常进行——用略旧的节点列表远比开不出出口好。
+func (m *Manager) ensureNodes() (int, error) {
+	cfg := connConf()
+	ttl := time.Duration(cfg.NodeTTL) * time.Second
+	m.mu.RLock()
+	have, age, mode := len(m.nodes), time.Since(m.fetched), m.nodesMode
+	m.mu.RUnlock()
+
+	// 换了打分策略也当作过期：不然改完设置立刻开出口，挑到的还是按旧策略
+	// 排的队，要等一次自然刷新才见效。mode 为空是旧状态文件恢复来的列表，
+	// 没记策略，照重排处理。
+	if have > 0 && age < ttl && mode == cfg.ScoreMode {
+		return have, nil
 	}
-	m.mu.Lock()
-	m.nodes = nodes
-	m.fetched = time.Now()
-	m.mu.Unlock()
-	return len(nodes), nil
+	if have > 0 && nodeFetchCooldown > 0 && time.Since(m.fetchFailAt()) < nodeFetchCooldown {
+		return have, nil
+	}
+	return m.refreshNodes()
+}
+
+func (m *Manager) fetchFailAt() time.Time {
+	m.fetchMu.Lock()
+	defer m.fetchMu.Unlock()
+	return m.fetchFailA
+}
+
+// refreshNodes 拉一次节点列表，并发的调用共用同一次结果。
+func (m *Manager) refreshNodes() (int, error) {
+	m.fetchMu.Lock()
+	if m.fetchWait != nil {
+		ch := m.fetchWait
+		m.fetchMu.Unlock()
+		res := <-ch
+		return res.count, res.err
+	}
+	ch := make(chan fetchResult, 1)
+	m.fetchWait = ch
+	m.fetchMu.Unlock()
+
+	res := fetchResult{}
+	nodes, err := fetchNodes(nodeFetchTimeout)
+	if err != nil {
+		res.err = err
+	} else {
+		m.mu.Lock()
+		m.nodes = nodes
+		m.fetched = time.Now()
+		m.nodesMode = connConf().ScoreMode
+		m.mu.Unlock()
+		res.count = len(nodes)
+	}
+
+	m.fetchMu.Lock()
+	if err != nil {
+		m.fetchFailA = time.Now()
+	} else {
+		m.fetchFailA = time.Time{}
+	}
+	m.fetchWait = nil
+	m.fetchMu.Unlock()
+
+	ch <- res
+	return res.count, res.err
 }
 
 func (m *Manager) Nodes() ([]Node, time.Time) {
@@ -81,7 +165,7 @@ func (m *Manager) Start(node Node) (*Tunnel, error) {
 	// 端口随机取，避免固定规律撞上机器上的其他服务
 	taken := map[int]bool{}
 	for _, other := range m.tunnels {
-		taken[other.Port] = true
+		taken[other.port()] = true
 	}
 	port, err := freeRandomPort(taken)
 	if err != nil {
@@ -117,13 +201,6 @@ func (m *Manager) bringUp(t *Tunnel, notify bool) {
 	m.bringUpPersist(t, notify, false)
 }
 
-// 自动重连的退避区间：一轮候选全挂后等一会儿再刷新节点列表重来，
-// 别把死节点列表打爆，也别让恢复拖太久。
-const (
-	reconnectBackoffMin = 5 * time.Second
-	reconnectBackoffMax = 60 * time.Second
-)
-
 // bringUpPersist 把一条隧道拉起来。
 //
 // persist=false（手动新建）：走一轮候选，全失败就标 failed，让用户能立刻看到并重试。
@@ -131,9 +208,14 @@ const (
 // 一直循环到连上或这条隧道被用户停掉。VPN Gate 死节点多，"当前都不可用"往往只是
 // 这一批候选恰好都挂了，过一会儿就有新节点，不该让出口永久躺死。
 func (m *Manager) bringUpPersist(t *Tunnel, notify bool, persist bool) {
-	backoff := reconnectBackoffMin
+	cfg := connConf()
+	backoff := time.Duration(cfg.BackoffMin) * time.Second
+	ceil := time.Duration(cfg.BackoffMax) * time.Second
+	// 自动重连的目标是"恢复这条出口"，第一轮先试当前节点；
+	// 手动换节点时 t.Node 已经是用户挑的那个，必须打头。
+	prefer := true
 	for {
-		if m.tryCandidates(t, notify) {
+		if m.tryCandidates(t, notify, prefer) {
 			return
 		}
 		// 隧道已被用户停掉或从管理器移除，别再重试
@@ -141,15 +223,17 @@ func (m *Manager) bringUpPersist(t *Tunnel, notify bool, persist bool) {
 			if persist {
 				return
 			}
-			t.Status = "failed"
+			t.setStatus("failed", "")
 			if serr := m.saveState(); serr != nil {
 				log.Printf("保存状态失败: %v", serr)
 			}
 			return
 		}
 
-		t.Status = "starting"
-		t.Err = fmt.Sprintf("暂无可用节点，%.0f 秒后重试", backoff.Seconds())
+		// 一整轮都没连上，说明当前这个节点（以及这批候选）不行了：
+		// 下一轮别再拿它打头，否则会反复在同一批死节点上空转。
+		prefer = false
+		t.setStatus("starting", fmt.Sprintf("暂无可用节点，%.0f 秒后重试", backoff.Seconds()))
 		log.Printf("隧道 %d 一轮候选均失败，%.0f 秒后刷新节点重试", t.Slot, backoff.Seconds())
 		time.Sleep(backoff)
 		if !m.tunnelActive(t) {
@@ -158,20 +242,21 @@ func (m *Manager) bringUpPersist(t *Tunnel, notify bool, persist bool) {
 		if _, err := m.RefreshNodes(); err != nil {
 			log.Printf("重试前刷新节点列表失败: %v", err)
 		}
-		if backoff < reconnectBackoffMax {
+		if backoff < ceil {
 			backoff *= 2
-			if backoff > reconnectBackoffMax {
-				backoff = reconnectBackoffMax
+			if backoff > ceil {
+				backoff = ceil
 			}
 		}
 	}
 }
 
 // tryCandidates 走一轮候选节点，成功返回 true。失败不改 Status（留给调用方决定）。
-func (m *Manager) tryCandidates(t *Tunnel, notify bool) bool {
+// preferCurrent 为真时把隧道当前绑定的节点排在最前（见 candidatesFor）。
+func (m *Manager) tryCandidates(t *Tunnel, notify bool, preferCurrent bool) bool {
 	// VPN Gate 是志愿者节点，列表里有相当比例已下线或满员（AUTH_FAILED），
 	// 连不上就顺着候选列表换下一个，不必让用户手动试。
-	candidates := m.candidatesFor(t)
+	candidates := m.candidatesFor(t, preferCurrent)
 	for i, node := range candidates {
 		if !m.tunnelActive(t) {
 			return false
@@ -180,16 +265,18 @@ func (m *Manager) tryCandidates(t *Tunnel, notify bool) bool {
 		if i > 0 && m.nodeInUse(node.HostName, t.Slot) {
 			continue
 		}
-		t.Node = node
-		t.Status = "starting"
+		t.setNode(node)
 		if i > 0 {
-			t.Err = fmt.Sprintf("已换到第 %d 个候选节点", i+1)
+			t.setStatus("starting", fmt.Sprintf("已换到第 %d 个候选节点", i+1))
+		} else {
+			t.setStatus("starting", "")
 		}
 
-		err := m.tryNode(t)
+		ip, err := m.tryNode(t)
 		if err == nil {
-			t.Status = "up"
-			t.Err = ""
+			// 状态、出口 IP、计时器一次写完：分开赋值会让界面轮询读到
+			// status=up 却 exit_ip 还空着的中间态，进而把这条出口显示成异常。
+			t.setUp(ip)
 			if serr := m.saveState(); serr != nil {
 				log.Printf("保存状态失败: %v", serr)
 			}
@@ -207,7 +294,7 @@ func (m *Manager) tryCandidates(t *Tunnel, notify bool) bool {
 // 用指针比对：Stop 会从 map 里删除并把 Status 置 stopped，
 // 重连循环据此退出，避免对着一条已经不存在的隧道空转。
 func (m *Manager) tunnelActive(t *Tunnel) bool {
-	if t.Status == "stopped" {
+	if t.status() == "stopped" {
 		return false
 	}
 	m.mu.RLock()
@@ -216,35 +303,36 @@ func (m *Manager) tunnelActive(t *Tunnel) bool {
 	return ok && cur == t
 }
 
-// tryNode 尝试用当前节点把隧道拉起来。
-func (m *Manager) tryNode(t *Tunnel) error {
+// tryNode 尝试用当前节点把隧道拉起来，成功时返回出口 IP。
+func (m *Manager) tryNode(t *Tunnel) (string, error) {
 	if err := t.setupNetns(); err != nil {
-		return err
+		return "", err
 	}
 	if err := t.startOpenVPN(m.workDir); err != nil {
-		return err
+		return "", err
 	}
-	if t.listener == nil {
+	if t.getListener() == nil {
 		if err := t.serve(); err != nil {
-			return err
+			return "", err
 		}
 	}
 	ip, err := t.probeExitIP()
 	if err != nil {
-		return err
+		return "", err
 	}
-	t.ExitIP = ip
-	return nil
+	return ip, nil
 }
 
 // candidatesFor 以这条隧道当前的节点打头，后面跟上同地区的其他节点作为备选。
 //
-// 打头的一定是 t.Node：自动重连的目标是把这条出口恢复原样，先试原节点。
+// preferCurrent 时打头的一定是 t.Node：自动重连的第一轮、以及用户手动换节点之后，
+// 目标都是"就用这一个"。反之在一整轮都失败之后要把当前节点排到最后——
+// 它刚把这一轮带崩，再让它打头就是反复撞同一块石头。
 // 备选会避开用户手动换掉过的节点——那些是他明确不想要的 IP，
 // 让重连悄悄换回去等于撤销了他的操作。
-func (m *Manager) candidatesFor(t *Tunnel) []Node {
-	const maxTries = 6
-	first := t.Node
+func (m *Manager) candidatesFor(t *Tunnel, preferCurrent bool) []Node {
+	maxTries := connConf().MaxTries
+	first := t.node()
 	avoid := t.swapAvoid()
 
 	m.mu.RLock()
@@ -252,7 +340,7 @@ func (m *Manager) candidatesFor(t *Tunnel) []Node {
 
 	used := map[string]bool{first.HostName: true}
 	for _, other := range m.tunnels {
-		used[other.Node.HostName] = true
+		used[other.host()] = true
 	}
 
 	// 地区决定了备选范围，缺失时先从当前列表补一次，
@@ -267,7 +355,10 @@ func (m *Manager) candidatesFor(t *Tunnel) []Node {
 		}
 	}
 
-	out := []Node{first}
+	var out []Node
+	if preferCurrent {
+		out = append(out, first)
+	}
 	for _, n := range m.nodePoolLocked() {
 		if len(out) >= maxTries {
 			break
@@ -280,6 +371,14 @@ func (m *Manager) candidatesFor(t *Tunnel) []Node {
 			continue
 		}
 		out = append(out, n)
+	}
+	// 不优先当前节点时把它垫到最后：刚把一整轮带崩的那个节点不该再占第一个
+	// 握手预算，但同地区只剩它时还得让它有机会上场。
+	if !preferCurrent && len(out) < maxTries {
+		out = append(out, first)
+	}
+	if len(out) == 0 {
+		out = append(out, first)
 	}
 	return out
 }
@@ -319,7 +418,7 @@ func (m *Manager) Swap(slot int) error {
 	if !ok {
 		return fmt.Errorf("槽位 %d 没有运行中的隧道", slot)
 	}
-	if t.Status == "starting" {
+	if t.status() == "starting" {
 		return fmt.Errorf("这个出口正在连接中，稍等一下")
 	}
 
@@ -327,8 +426,8 @@ func (m *Manager) Swap(slot int) error {
 	if err != nil {
 		return err
 	}
-	oldHost := t.Node.HostName
-	t.Node = node
+	oldHost := t.host()
+	t.setNode(node)
 	m.reconnect(t, oldHost)
 	return nil
 }
@@ -340,17 +439,17 @@ func (m *Manager) Swap(slot int) error {
 // 于是下次点换节点又从它开始试一遍，白等一轮握手超时。
 func (m *Manager) pickSwapTarget(t *Tunnel) (Node, error) {
 	avoid := t.swapAvoid()
-	picks, err := m.pickNodes(t.Node.CountryCode, 1, avoid)
+	picks, err := m.pickNodes(t.node().CountryCode, 1, avoid)
 	if err != nil && len(avoid) > 1 {
 		// 这个地区的节点都换过一轮了。清掉历史重新开始，
 		// 总比告诉用户"没得换了"好——转一圈之后原来那些节点未必还是当初的状态。
 		t.forgetSwaps()
-		picks, err = m.pickNodes(t.Node.CountryCode, 1, t.swapAvoid())
+		picks, err = m.pickNodes(t.node().CountryCode, 1, t.swapAvoid())
 	}
 	if err != nil {
 		return Node{}, err
 	}
-	t.rememberSwap(t.Node.HostName)
+	t.rememberSwap(t.host())
 	t.rememberSwap(picks[0].HostName)
 	return picks[0], nil
 }
@@ -400,7 +499,11 @@ func (m *Manager) SetCred(slot int, cred SocksCred) (SocksCred, error) {
 // 自建模式恢复时每条隧道 up 都会重建配置，本就自洽，这里跳过免得多重启一次 Xray。
 func (m *Manager) ReconcileOutbounds() {
 	p, err := openPanel()
-	if err != nil || p.Kind() != "3x-ui" {
+	if err != nil {
+		log.Printf("启动对账面板出站跳过（后端不可用）: %v", err)
+		return
+	}
+	if p.Kind() != "3x-ui" {
 		return
 	}
 
@@ -414,10 +517,10 @@ func (m *Manager) ReconcileOutbounds() {
 		var up *Tunnel
 		settled := true
 		for _, t := range tunnels {
-			if t.Status == "up" && up == nil {
+			if t.status() == "up" && up == nil {
 				up = t
 			}
-			if t.Status == "starting" {
+			if t.status() == "starting" {
 				settled = false
 			}
 		}
@@ -464,29 +567,30 @@ func (m *Manager) nodeInUse(host string, exceptSlot int) bool {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	for slot, t := range m.tunnels {
-		if slot != exceptSlot && t.Node.HostName == host {
+		if slot != exceptSlot && t.host() == host {
 			return true
 		}
 	}
 	return false
 }
 
-// rebind 在隧道换节点后，把原先指向旧节点的 3x-ui 入站改绑到新节点。
-// 面板不可用时静默跳过，健康检查本身不应因此失败。
+// rebind 在隧道换节点后，把原先指向旧节点的入站改绑到新节点。
+//
+// 后端不可用要把错误报给调用方：reconnect 靠"这一步成功"才清掉 prevHost 标记，
+// 悄悄吞掉错误会让入站永久指着旧节点，而界面上看着一切正常。
 func (m *Manager) rebind(oldHost string, t *Tunnel) error {
 	x, err := openPanel()
 	if err != nil {
-		return nil
+		return fmt.Errorf("节点链接后端不可用: %w", err)
 	}
 	return x.Rebind(oldHost, t, m.Tunnels())
 }
 
-// resync 在节点没换但重连过之后，把 3x-ui 的出站配置刷新一遍。
-// 面板不可用时静默跳过，健康检查本身不应因此失败。
+// resync 在节点没换但重连过之后，把后端的出站配置刷新一遍。
 func (m *Manager) resync(t *Tunnel) error {
 	x, err := openPanel()
 	if err != nil {
-		return nil
+		return fmt.Errorf("节点链接后端不可用: %w", err)
 	}
 	return x.ResyncOutbound(t, m.Tunnels())
 }
@@ -499,6 +603,7 @@ func (m *Manager) resync(t *Tunnel) error {
 func (m *Manager) notifyPanel() {
 	p, err := openPanel()
 	if err != nil {
+		log.Printf("同步节点链接后端失败: %v", err)
 		return
 	}
 	if err := p.OnTunnelsChanged(m.Tunnels()); err != nil {

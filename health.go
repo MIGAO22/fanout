@@ -1,45 +1,184 @@
 package main
 
 import (
+	"fmt"
 	"log"
+	"math/rand"
+	"net"
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
-const (
-	healthInterval = 10 * time.Second
-	healthFailures = 2 // 连续失败几次才判定掉线，避免网络抖动误杀
-	healthTimeout  = 6 * time.Second
-)
+// ipOracles 是查出口 IP 的公共服务，按顺序试，第一个给出合法 IPv4 的作数。
+//
+// 只认 api.ipify.org 是有代价的：它自己抽风一次，这一轮所有正常隧道都会被
+// 判成掉线，跟着触发一批毫无必要的重连。
+// 都用 http 而不是 https：探测走的是隧道本身，TLS 握手会让每次探测多一个
+// 来回，而健康检查是按秒算的。
+//
+// 顺序刻意保持固定：建立隧道时记录基准出口 IP 用的也是这条链，
+// 两边从同一个源开始，才不会因为"不同目标走了不同出口路由"而误判。
+var ipOracles = []string{
+	"http://api.ipify.org",
+	"http://ipv4.icanhazip.com",
+	"http://4.ident.me",
+	"http://ifconfig.me/ip",
+	"http://ipecho.net/plain",
+}
+
+// probeExitIPIn 在指定 netns 里查出口 IPv4。
+// budget 是所有候选源加起来的总预算，单个源的超时不会超过剩下的时间。
+func probeExitIPIn(ns string, budget time.Duration) (string, error) {
+	if budget < 2*time.Second {
+		budget = 2 * time.Second
+	}
+	deadline := time.Now().Add(budget)
+	reason := "没有可用探测源"
+	for _, u := range ipOracles {
+		left := time.Until(deadline)
+		if left <= 0 {
+			reason = "探测超时"
+			break
+		}
+		secs := int(left.Seconds())
+		if secs > 15 {
+			secs = 15 // curl --max-time 给太大没意义，母机上还会攒一堆挂死的进程
+		}
+		out, err := cmdOutput(exec.Command("ip", "netns", "exec", ns,
+			"curl", "-s", "--max-time", strconv.Itoa(secs), u))
+		if err != nil {
+			reason = err.Error()
+			continue
+		}
+		ip := strings.TrimSpace(string(out))
+		// 必须是 IPv4：出口 IP 后面要拿去和基准值逐字比对，
+		// 收到 IPv6 或一段 HTML 错误页都算这个源没给答案
+		if p := net.ParseIP(ip); p != nil && p.To4() != nil {
+			return ip, nil
+		}
+		reason = "返回不是 IPv4: " + strconv.Quote(ip)
+	}
+	return "", fmt.Errorf("查询出口 IP 失败: %s", reason)
+}
 
 // WatchHealth 周期检查每条隧道是否还能出网，掉线的自动换节点重连。
 // VPN Gate 是志愿者节点，运行中掉线很常见。
+//
+// 间隔每轮都重读设置，因此界面改了参数下一轮就生效；
+// connWake 让改完立刻进入下一轮，不必等满一个旧间隔。
 func (m *Manager) WatchHealth() {
 	fails := map[int]int{}
+	for {
+		interval := time.Duration(connConf().HealthInterval) * time.Second
+		select {
+		case <-time.After(interval):
+		case <-connWake:
+		}
+		m.healthSweep(fails)
+	}
+}
 
-	for range time.Tick(healthInterval) {
-		for _, t := range m.Tunnels() {
-			if t.Status != "up" {
-				continue
-			}
-			if m.tunnelHealthy(t) {
-				fails[t.Slot] = 0
-				continue
-			}
+// healthSweep 跑一轮全量探测并处理判掉线的隧道。
+//
+// 原来是一串串行 for：每条 up 的隧道都要现开一个 curl 子进程，
+// 20 条出口 × 6 秒超时就是 120 秒，而外层 time.Tick 每 10 秒触发一次且
+// 不排队——Tick 的通道容量只有 1，绝大多数轮次被直接丢弃，
+// 真正确认一条隧道死了平均要四分钟。现在并行探测，一轮就是几秒。
+func (m *Manager) healthSweep(fails map[int]int) {
+	cfg := connConf()
+	tunnels := m.Tunnels()
 
-			fails[t.Slot]++
-			if fails[t.Slot] < healthFailures {
-				log.Printf("隧道 %d (%s) 探测失败 %d 次", t.Slot, t.Node.HostName, fails[t.Slot])
-				continue
-			}
-
-			log.Printf("隧道 %d (%s) 已掉线，正在换节点重连", t.Slot, t.Node.HostName)
-			fails[t.Slot] = 0
-			m.reconnect(t, t.Node.HostName)
+	// 隧道被停掉之后它的槽位计数要清掉，否则 fails 这个 map 只增不减，
+	// 而且槽位是复用的：1 号槽位停掉再新建，会继承上一任留下的失败计数。
+	alive := make(map[int]bool, len(tunnels))
+	for _, t := range tunnels {
+		alive[t.Slot] = true
+	}
+	for slot := range fails {
+		if !alive[slot] {
+			delete(fails, slot)
 		}
 	}
+
+	type verdict struct {
+		t   *Tunnel
+		ok  bool
+		why string
+	}
+	ch := make(chan verdict, len(tunnels))
+	var wg sync.WaitGroup
+	// 并发上限：探测本身是子进程 + 走隧道出网，全放开了在 40 条出口时
+	// 会把母机 CPU 和隧道带宽一起打满，反而把好隧道挤掉线。
+	sem := make(chan struct{}, 8)
+	for _, t := range tunnels {
+		if t.status() != "up" {
+			continue
+		}
+		wg.Add(1)
+		go func(t *Tunnel) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			got, err := m.probeTunnel(t)
+			ch <- verdict{t: t, ok: err == nil && got == t.exitIP(), why: tunnelProbeWhy(got, err)}
+		}(t)
+	}
+	go func() { wg.Wait(); close(ch) }()
+
+	var down []*Tunnel
+	for v := range ch {
+		if v.ok {
+			fails[v.t.Slot] = 0
+			continue
+		}
+		fails[v.t.Slot]++
+		if fails[v.t.Slot] < cfg.HealthFailures {
+			log.Printf("隧道 %d (%s) 探测失败 %d 次: %s",
+				v.t.Slot, v.t.host(), fails[v.t.Slot], v.why)
+			continue
+		}
+		fails[v.t.Slot] = 0
+		down = append(down, v.t)
+	}
+	if len(down) == 0 {
+		return
+	}
+
+	// 一轮最多重连这么几条。Gate 的机房常常整段一起掉，全放开了重连
+	// 只会一起失败：几十条隧道同时去刷同一份节点列表、抢同一批候选节点，
+	// 反而把还能用的节点也拖死。剩下的下一轮再看，通常那批节点已经恢复。
+	n := cfg.ReconnectLimit
+	if len(down) > n {
+		log.Printf("%d 条出口同时判掉线，本轮只重连 %d 条，其余下一轮再看", len(down), n)
+	}
+	for i, t := range down {
+		if i >= n {
+			break
+		}
+		// 抖开起手时间，别几条隧道同一毫秒去拉节点列表
+		if i > 0 {
+			time.Sleep(time.Duration(200+rand.Intn(800)) * time.Millisecond)
+		}
+		log.Printf("隧道 %d (%s) 已掉线，正在换节点重连", t.Slot, t.host())
+		m.reconnect(t, t.host())
+	}
+}
+
+func tunnelProbeWhy(ip string, err error) string {
+	if err != nil {
+		return err.Error()
+	}
+	return "出口变成 " + ip
+}
+
+// probeTunnel 查一次这条隧道当前的出口 IP。
+// 预算给健康检查超时的两倍：多源轮流试，别因为第一个源抽风就误杀。
+func (m *Manager) probeTunnel(t *Tunnel) (string, error) {
+	budget := time.Duration(connConf().HealthTimeout) * time.Second * 2
+	return probeExitIPIn(t.nsName(), budget)
 }
 
 // tunnelHealthy 判断隧道是否还真的走在 VPN 上。
@@ -48,18 +187,8 @@ func (m *Manager) WatchHealth() {
 // openvpn 死掉后照样能出网，只是出口变回了母机 IP。
 // 所以要比对出口 IP 是否仍是建立隧道时拿到的那个。
 func (m *Manager) tunnelHealthy(t *Tunnel) bool {
-	out, err := cmdOutput(exec.Command("ip", "netns", "exec", t.nsName(),
-		"curl", "-s", "--max-time", strconv.Itoa(int(healthTimeout.Seconds())),
-		"http://api.ipify.org"))
-	if err != nil {
-		return false
-	}
-	got := strings.TrimSpace(string(out))
-	if got == "" {
-		return false
-	}
-	// 出口 IP 变了说明 VPN 已经断开，流量退回了母机
-	return got == t.ExitIP
+	got, err := m.probeTunnel(t)
+	return err == nil && got == t.exitIP()
 }
 
 // reconnect 就地把一条隧道换到别的节点上，保持槽位与端口不变，
@@ -69,9 +198,8 @@ func (m *Manager) tunnelHealthy(t *Tunnel) bool {
 // 改过 t.Node（比如手动换节点），就要把改之前的名字传进来，
 // 否则 rebind 找不到旧绑定，入站会掉成孤儿。
 func (m *Manager) reconnect(t *Tunnel, oldHost string) {
-	t.Status = "starting"
-	t.Err = "正在换节点重连"
-	t.ExitIP = ""
+	t.setStatus("starting", "正在换节点重连")
+	t.setExitIP("")
 
 	// 动手之前先把"原来绑的是谁"落盘。
 	//
@@ -83,22 +211,23 @@ func (m *Manager) reconnect(t *Tunnel, oldHost string) {
 		log.Printf("保存状态失败: %v", err)
 	}
 
-	if t.ovpn != nil && t.ovpn.Process != nil {
-		_ = t.ovpn.Process.Kill()
-		t.ovpn = nil
-	}
-	t.teardownNetns()
-
 	go func() {
+		// 杀进程和拆 netns 都是秒级慢操作。放在这里而不是调用方，
+		// 是因为调用方是健康检查主循环：串行等 20 条隧道的清理，
+		// 一轮 sweep 就全被这几秒吃掉了。
+		t.proc().kill()
+		t.setProc(nil)
+		t.teardownNetns()
+
 		// 通知延后到 rebind/resync 之后：那两步会把入站改绑到新节点，
 		// 提前重建配置会因为入站还指着旧节点名而丢掉路由规则
 		m.bringUpPersist(t, false, true)
-		if t.Status != "up" {
+		if t.status() != "up" {
 			return
 		}
 		// 出站 tag 跟着节点名走，换了节点就要把原来指向它的入站重新绑过去，
 		// 否则面板里的路由会指向一个已经不存在的出站。
-		if t.Node.HostName != oldHost {
+		if t.host() != oldHost {
 			if err := m.rebind(oldHost, t); err != nil {
 				log.Printf("重连后同步 3x-ui 绑定失败: %v", err)
 				return

@@ -97,19 +97,22 @@ func (m *Manager) ExitsOf() ExitsView {
 
 	live := map[string]bool{}
 	for _, t := range tunnels {
-		if t.Status == "up" {
-			live[sanitizeTag(t.Node.HostName)] = true
+		if t.status() == "up" {
+			live[sanitizeTag(t.host())] = true
 		}
 	}
 
 	byHost := map[string]int{}
 	for i, t := range tunnels {
-		byHost[sanitizeTag(t.Node.HostName)] = i
+		// 一次取一份一致性快照：分开读 Status/ExitIP/Node 会撞上重连过程中的
+		// 中间态，界面于是偶尔显示"已连通但没有出口 IP"这种自相矛盾的行。
+		st := t.state()
+		byHost[sanitizeTag(st.Node.HostName)] = i
 		cred := t.credential()
 		view.Exits = append(view.Exits, Exit{
-			Slot: t.Slot, Port: t.Port, Host: t.Node.HostName,
-			Region: t.Node.CountryCode, Country: nodeLabel(t.Node),
-			ExitIP: t.ExitIP, Status: t.Status, Err: t.Err, Since: t.Since,
+			Slot: t.Slot, Port: st.Port, Host: st.Node.HostName,
+			Region: st.Node.CountryCode, Country: nodeLabel(st.Node),
+			ExitIP: st.ExitIP, Status: st.Status, Err: st.Err, Since: st.Since,
 			SocksUser: cred.User, SocksPass: cred.Pass,
 		})
 	}

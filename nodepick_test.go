@@ -234,7 +234,8 @@ func TestSwapHistoryCapped(t *testing.T) {
 	}
 }
 
-// 自动重连仍以当前节点打头（目标是恢复），但备选要避开用户手动换掉的。
+// 自动重连第一轮仍以当前节点打头（目标是恢复），但备选要避开用户手动换掉的；
+// 一整轮都失败之后当前节点要退到最后，别反复撞同一块石头。
 func TestCandidatesForKeepsCurrentFirstAndAvoidsSwapped(t *testing.T) {
 	withResidentialOnly(t, boolPtr(true))
 	m := mgrWith(pool)
@@ -242,7 +243,7 @@ func TestCandidatesForKeepsCurrentFirstAndAvoidsSwapped(t *testing.T) {
 	m.tunnels[1] = tn
 	tn.rememberSwap("jp1") // jp1 是用户换掉的
 
-	got := m.candidatesFor(tn)
+	got := m.candidatesFor(tn, true)
 	if len(got) == 0 || got[0].HostName != "jp2" {
 		t.Fatalf("首位必须是当前节点，实际 %+v", got)
 	}
@@ -250,6 +251,17 @@ func TestCandidatesForKeepsCurrentFirstAndAvoidsSwapped(t *testing.T) {
 		if n.HostName == "jp1" {
 			t.Fatal("备选里不该有用户换掉的 jp1")
 		}
+	}
+
+	again := m.candidatesFor(tn, false)
+	if len(again) == 0 {
+		t.Fatal("不优先当前节点时也该给出候选")
+	}
+	if again[0].HostName == "jp2" {
+		t.Fatal("刚把一轮带崩的节点不该再排在最前")
+	}
+	if again[len(again)-1].HostName != "jp2" {
+		t.Fatalf("当前节点应垫在最后，留个兜底机会，实际 %+v", again)
 	}
 }
 

@@ -47,8 +47,12 @@ func (n *Native) Describe() string {
 	return fmt.Sprintf("fanout 自建 Xray（%s）", n.proc.bin)
 }
 
-// apply 重新生成配置并重启 Xray，然后落盘。
+// apply 重新生成配置并让 Xray 重载，然后落盘。
 // 调用方必须已持有 n.mu。
+//
+// 落盘是同步的，重载走合并窗口：批量改入站时配置一次写对一次，
+// Xray 只在最后重载一次，否则每改一条就把已连上的客户端踢一遍。
+// 重载闭包只碰 n.proc（它自带锁），不回头取 n.mu，否则定时器会死锁。
 func (n *Native) apply(tunnels []*Tunnel) error {
 	cfg := buildXrayConfig(n.store.sorted(), tunnels)
 	path, err := writeXrayConfig(n.dir, cfg)
@@ -58,15 +62,17 @@ func (n *Native) apply(tunnels []*Tunnel) error {
 	if err := verifyXrayConfig(n.proc.bin, path); err != nil {
 		return err
 	}
-	// 没有入站时不必留着进程占资源
-	if len(cfg["inbounds"].([]any)) == 0 {
-		n.proc.stop()
-		return n.store.save(n.dir)
-	}
-	if err := n.proc.restart(path); err != nil {
+	if err := n.store.save(n.dir); err != nil {
 		return err
 	}
-	return n.store.save(n.dir)
+	// 没有入站时不必留着进程占资源
+	if len(cfg["inbounds"].([]any)) == 0 {
+		return deferRestart("自建 Xray", func() error {
+			n.proc.stop()
+			return nil
+		})
+	}
+	return deferRestart("自建 Xray", func() error { return n.proc.restart(path) })
 }
 
 // OnTunnelsChanged 在隧道集合变化后重建配置。自建模式下出站直接由隧道列表
@@ -81,6 +87,10 @@ func (n *Native) OnTunnelsChanged(tunnels []*Tunnel) error {
 func (n *Native) Close() {
 	n.mu.Lock()
 	defer n.mu.Unlock()
+	// 先撤掉还在排队的重载：切到 3x-ui 之后这个定时器若触发，
+	// 会另起一个 Xray 和面板的抢入站端口。取锁后再撤，
+	// 才不会漏掉并发 apply 刚登记的那一次。
+	cancelRestart("自建 Xray")
 	n.proc.stop()
 }
 
@@ -153,7 +163,7 @@ func (n *Native) Bind(inboundTag string, hostname string, tunnels []*Tunnel) err
 	var target *Tunnel
 	if hostname != "" {
 		for _, t := range tunnels {
-			if t.Node.HostName == hostname {
+			if t.host() == hostname {
 				target = t
 				break
 			}
@@ -161,8 +171,8 @@ func (n *Native) Bind(inboundTag string, hostname string, tunnels []*Tunnel) err
 		if target == nil {
 			return fmt.Errorf("节点 %s 没有运行中的隧道", hostname)
 		}
-		if target.Status != "up" {
-			return fmt.Errorf("节点 %s 的隧道还没连通（当前 %s）", hostname, target.Status)
+		if target.status() != "up" {
+			return fmt.Errorf("节点 %s 的隧道还没连通（当前 %s）", hostname, target.status())
 		}
 	}
 
@@ -180,7 +190,7 @@ func (n *Native) Bind(inboundTag string, hostname string, tunnels []*Tunnel) err
 	if target == nil {
 		found.BoundTo = ""
 	} else {
-		found.BoundTo = sanitizeTag(target.Node.HostName)
+		found.BoundTo = sanitizeTag(target.host())
 	}
 	return n.apply(tunnels)
 }
@@ -190,7 +200,7 @@ func (n *Native) Rebind(oldHost string, target *Tunnel, tunnels []*Tunnel) error
 	defer n.mu.Unlock()
 
 	oldTag := sanitizeTag(oldHost)
-	newTag := sanitizeTag(target.Node.HostName)
+	newTag := sanitizeTag(target.host())
 	newLabel := exitLabel(target)
 	for _, ib := range n.store.Inbounds {
 		if ib.BoundTo != oldTag {
@@ -223,7 +233,7 @@ func (n *Native) CloneToTunnels(templateID int, hosts []string, tunnels []*Tunne
 
 	byHost := map[string]*Tunnel{}
 	for _, t := range tunnels {
-		byHost[t.Node.HostName] = t
+		byHost[t.host()] = t
 	}
 
 	used := n.store.usedPorts()
@@ -235,7 +245,7 @@ func (n *Native) CloneToTunnels(templateID int, hosts []string, tunnels []*Tunne
 	created := []int{}
 	for _, host := range hosts {
 		t := byHost[host]
-		if t == nil || t.Status != "up" {
+		if t == nil || t.status() != "up" {
 			continue
 		}
 		port, err := freeRandomPort(used)
@@ -262,7 +272,7 @@ func (n *Native) CloneToTunnels(templateID int, hosts []string, tunnels []*Tunne
 			Remark:   remark,
 			Enable:   true,
 			Clients:  append([]nativeClient(nil), tpl.Clients...),
-			BoundTo:  sanitizeTag(t.Node.HostName),
+			BoundTo:  sanitizeTag(t.host()),
 		}
 		n.store.NextID++
 		n.store.Inbounds = append(n.store.Inbounds, clone)
@@ -498,10 +508,15 @@ func (n *Native) CreateInbound(spec NewInboundSpec, tunnels []*Tunnel) (*Created
 	n.store.Inbounds = append(n.store.Inbounds, ib)
 
 	if err := n.apply(tunnels); err != nil {
-		// 起不来就别把坏入站留在库里
+		return nil, err
+	}
+	// 新建这一条要当场确认 Xray 起得来：端口被外部进程占了的话
+	// 合并窗口会把它报成"已受理"，列表里就留下一条永远连不上的入站。
+	if err := flushRestartNow("自建 Xray"); err != nil {
 		n.store.Inbounds = n.store.Inbounds[:len(n.store.Inbounds)-1]
 		n.store.NextID--
 		_ = n.apply(tunnels)
+		_ = flushRestartNow("自建 Xray")
 		return nil, err
 	}
 	return &CreatedInbound{

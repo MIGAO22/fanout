@@ -78,6 +78,11 @@ func closePanel() {
 	panelState.mu.Lock()
 	p := panelState.current
 	panelState.mu.Unlock()
+	// 先把排队的重载做掉：接管面板时配置已经写进面板库，
+	// 不重载就退出会让面板一直跑旧配置，而界面显示的是新状态。
+	if pendingRestart() {
+		_ = flushRestart("退出前收尾")
+	}
 	if p != nil {
 		p.Close()
 	}

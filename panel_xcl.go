@@ -92,10 +92,13 @@ func (x *XCL) saveCfg(cfg map[string]any) error {
 	if err := os.Rename(tmp, x.cfgPath); err != nil {
 		return fmt.Errorf("替换配置失败: %w", err)
 	}
-	if x.restart == nil {
-		return x.restartXray()
+	fn := x.restart
+	if fn == nil {
+		fn = x.restartXray
 	}
-	return x.restart()
+	// 合并重启：systemctl restart 会把整个 Xray 换一遍进程，已连上的客户端全断。
+	// 配置已经原子落盘，重启只需要在最后发生一次。
+	return deferRestart("xray-cf-lite", fn)
 }
 
 func (x *XCL) restartXray() error {
@@ -105,7 +108,7 @@ func (x *XCL) restartXray() error {
 	} else {
 		cmd = exec.Command("rc-service", x.svcName, "restart")
 	}
-	if out, err := cmd.CombinedOutput(); err != nil {
+	if out, err := cmdCombined(cmd); err != nil {
 		return fmt.Errorf("重启 %s 失败: %s", x.svcName, trimOutput(out))
 	}
 	return nil
@@ -213,7 +216,7 @@ func (x *XCL) syncOutbounds(cfg map[string]any, tunnels []*Tunnel) {
 		}
 	}
 	for _, t := range tunnels {
-		if t.Status != "up" {
+		if t.status() != "up" {
 			continue
 		}
 		kept = append(kept, map[string]any{
@@ -232,7 +235,7 @@ func (x *XCL) Bind(inboundTag string, hostname string, tunnels []*Tunnel) error 
 	var target *Tunnel
 	if hostname != "" {
 		for _, t := range tunnels {
-			if t.Node.HostName == hostname {
+			if t.host() == hostname {
 				target = t
 				break
 			}
@@ -240,15 +243,15 @@ func (x *XCL) Bind(inboundTag string, hostname string, tunnels []*Tunnel) error 
 		if target == nil {
 			return fmt.Errorf("节点 %s 没有运行中的隧道", hostname)
 		}
-		if target.Status != "up" {
-			return fmt.Errorf("节点 %s 的隧道还没连通（当前 %s）", hostname, target.Status)
+		if target.status() != "up" {
+			return fmt.Errorf("节点 %s 的隧道还没连通（当前 %s）", hostname, target.status())
 		}
 	}
 
 	live := map[string]bool{}
 	for _, t := range tunnels {
-		if t.Status == "up" {
-			live[sanitizeTag(t.Node.HostName)] = true
+		if t.status() == "up" {
+			live[sanitizeTag(t.host())] = true
 		}
 	}
 	current, err := x.Inbounds(live)
@@ -325,7 +328,7 @@ func (x *XCL) Rebind(oldHost string, target *Tunnel, tunnels []*Tunnel) error {
 	moved := 0
 	for tag, host := range bound {
 		if host == oldHost {
-			if err := x.Bind(tag, target.Node.HostName, tunnels); err != nil {
+			if err := x.Bind(tag, target.host(), tunnels); err != nil {
 				return err
 			}
 			moved++
