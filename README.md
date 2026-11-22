@@ -112,7 +112,7 @@ Xray 到 `/var/lib/fanout/bin/`，装了则跳过，入站交给面板管。
 > 才生效：`f` → `3) 重启`（或 `f restart`）。`install.sh` 现在重装会显式
 > `systemctl restart`——以前用 `enable --now`，对已运行的单元是空操作，
 > 于是新二进制在磁盘上、老进程还在服务老界面。
-> 想确认手上是哪一份：`fanout -version`，本仓库显示 `v1.4.2`，上游原版是 `v1.3.1`。
+> 想确认手上是哪一份：`fanout -version`，本仓库显示 `v1.4.3`，上游原版是 `v1.3.1`。
 
 > **发新版本。** 推一个 `v*` tag 就会触发 release workflow 出 amd64 / arm64
 > 两个包和 checksums；不打 tag 就没有 Release，`releases/latest/download/...`
@@ -265,7 +265,7 @@ REALITY 的密钥对和 shortId 自动生成；TLS 不填证书就生成自签�
 
 ```
   状态      运行中
-  版本      fanout v1.4.2
+  版本      fanout v1.4.3
   开机自启  enabled
 
   管理地址  http://1.2.3.4:8899/gwPuWHvaNr/
@@ -293,7 +293,7 @@ f uninstall  # 卸载（服务、二进制、netns 和 /var/lib/fanout 全删）
 > **界面还是旧的？** 十有八九是老进程还在跑。二进制是单文件、界面用 `go:embed`
 > 打在里面的，所以换二进制必须重启服务才生效：`f` → `3) 重启`。
 > `install.sh` 现在重装会显式 `systemctl restart`，不再出现「装完没变化」。
-> 分清手上是哪一份：`fanout -version`，本仓库构建的显示 `v1.4.2` 及以上，
+> 分清手上是哪一份：`fanout -version`，本仓库构建的显示 `v1.4.3` 及以上，
 > 上游原版显示 `v1.3.1`。
 
 隧道状态存在 `/var/lib/fanout/state.json`，重启后自动恢复，端口保持不变。
