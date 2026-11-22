@@ -32,13 +32,34 @@ jobs:
 
       # 依赖 netns / root 的用例自己会 t.Skip，所以非 root 的 runner 上这套是跑得通的。
       - name: 测试
-        run: go test -timeout 300s ./...
+        run: go test -timeout 300s ./... 2>&1 | tee "$RUNNER_TEMP/test.log"
+
+      # Actions 的日志下载要鉴权，二开的时候助手读不到，红在哪一行只能瞎猜。
+      # step summary 是公开字段，失败时把输出抄进去，一眼就能看到。
+      - name: 把失败输出贴进 summary
+        if: failure()
+        run: |
+          {
+            echo '```'
+            tail -c 60000 "$RUNNER_TEMP/test.log"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
       # 先只报不拦：数据竞争一旦当硬门槛，CI 会长期红，反而没人看。
       # 清完一轮之后再把它挪上去。
       - name: 数据竞争（暂不阻断）
+        id: race
         continue-on-error: true
-        run: go test -race -timeout 600s ./...
+        run: go test -race -timeout 600s ./... 2>&1 | tee "$RUNNER_TEMP/race.log"
+
+      - name: 把竞争报告贴进 summary
+        if: always() && steps.race.outcome == 'failure'
+        run: |
+          {
+            echo '```'
+            tail -c 60000 "$RUNNER_TEMP/race.log"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
   cross:
     # 发布走的是 amd64 / arm64 两个包，任一架构编不过就是发不出版。
