@@ -96,6 +96,13 @@ Xray 到 `/var/lib/fanout/bin/`，装了则跳过，入站交给面板管。
 > 之后 `REPO=MIGAO22/fanout bash <(curl -fsSL https://raw.githubusercontent.com/MIGAO22/fanout/main/install.sh)`
 > 就能拉到这里构建的版本。不打 tag 的话请走上面包源码安装。
 
+> **自更新指向哪个仓库。** `f update` 和设置里的「更新」卡片默认查上游
+> `byJoey/fanout`，直接把上游二进制换上来会静默覆盖掉本仓库的界面改动。
+> release workflow 构建时已经用 `-X main.updateRepo=$GITHUB_REPOSITORY`
+> 把自己指到自己的仓库；自己 `go build` 的话，要么加同样的 ldflags，
+> 要么用环境变量兜住：`FANOUT_UPDATE_REPO=MIGAO22/fanout`。
+> 想保持和上游一致、不介意丢掉这些改动，就别设这两个值。
+
 **Alpine** 默认不带 bash，先装一下：
 
 ```bash

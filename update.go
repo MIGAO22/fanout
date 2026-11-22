@@ -19,7 +19,20 @@ import (
 	"time"
 )
 
-const updateRepo = "byJoey/fanout"
+// updateRepo 是检查更新和自更新的目标仓库。
+//
+// 默认指向上游。衍生版本必须在构建时用 -X main.updateRepo=自己的仓库 覆盖掉，
+// 否则「更新」会把重写过的界面静默换回上游的二进制——版本号和代码都对不上，
+// 用户却看不出发生了什么。
+var updateRepo = "byJoey/fanout"
+
+// updateRepoName 优先用环境变量，方便源码安装的人不改代码也能指到自己仓库。
+func updateRepoName() string {
+	if v := strings.TrimSpace(os.Getenv("FANOUT_UPDATE_REPO")); v != "" {
+		return v
+	}
+	return updateRepo
+}
 
 // releaseInfo 是 GitHub Releases API 里我们关心的字段。
 type releaseInfo struct {
@@ -56,7 +69,7 @@ func assetArch() string {
 
 // fetchLatestRelease 拉取最新 release 元数据。
 func fetchLatestRelease() (*releaseInfo, error) {
-	url := fmt.Sprintf("https://api.github.com/repos/%s/releases/latest", updateRepo)
+	url := fmt.Sprintf("https://api.github.com/repos/%s/releases/latest", updateRepoName())
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
