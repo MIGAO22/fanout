@@ -42,7 +42,7 @@ func checkRealityDest(dest, serverName string) error {
 // 不同版本的输出措辞不一样：新版是 "Password (PublicKey):"，
 // 老版是 "Public key:"，所以两种都认。
 func realityKeys(bin string) (priv, pub string, err error) {
-	out, err := exec.Command(bin, "x25519").Output()
+	out, err := cmdOutput(exec.Command(bin, "x25519"))
 	if err != nil {
 		return "", "", fmt.Errorf("生成 REALITY 密钥失败: %w", err)
 	}
@@ -89,7 +89,7 @@ func selfSignedCert(dir, serverName string) (certFile, keyFile string, err error
 		"-subj", "/CN="+serverName,
 		"-addext", "subjectAltName=DNS:"+serverName,
 	)
-	if out, err := cmd.CombinedOutput(); err != nil {
+	if out, err := cmdCombined(cmd); err != nil {
 		return "", "", fmt.Errorf("生成自签证书失败: %s", trimOutput(out))
 	}
 	return certFile, keyFile, nil
@@ -100,7 +100,7 @@ func selfSignedCert(dir, serverName string) (certFile, keyFile string, err error
 // Xray 26.x 移除了 allowInsecure，自签证书要靠 pinnedPeerCertSha256
 // 让客户端固定信任这一张，所以生成分享链接时必须带上。
 func certFingerprint(certFile string) (string, error) {
-	der, err := exec.Command("openssl", "x509", "-in", certFile, "-outform", "der").Output()
+	der, err := cmdOutput(exec.Command("openssl", "x509", "-in", certFile, "-outform", "der"))
 	if err != nil {
 		return "", fmt.Errorf("读取证书失败: %w", err)
 	}
