@@ -199,6 +199,35 @@ function fmtGB(b){
   return (g >= 10 ? g.toFixed(0) : g.toFixed(1)) + 'G';
 }
 
+// 速率按 1024 进制缩写，跟内存/磁盘那几颗胶囊同一套口径，
+// 免得页面上「1G 内存」和「1G 带宽」的 G 不是一个意思。
+function fmtRate(bps){
+  const k = (bps || 0) / 1024;
+  if(k < 1024) return Math.round(k) + 'K/s';
+  const m = k / 1024;
+  return (m >= 10 ? m.toFixed(0) : m.toFixed(1)) + 'M/s';
+}
+
+// 胶囊上只放缩写，鼠标悬停给精确的 字节/秒 与 Mbps：
+// 带宽是按 10 进制卖的，光看 M/s 判断不了是不是快到套餐上限了。
+function fmtRateTip(bps){
+  const mbps = (bps || 0) * 8 / 1e6;
+  return Math.round(bps || 0) + ' 字节/秒 ≈ ' + (mbps >= 1 ? mbps.toFixed(1) : mbps.toFixed(3)) + ' Mbps';
+}
+
+function ratePill(k, bps, pct, ready, iface, link, dir){
+  const head = k + ' ' + fmtRateTip(bps);
+  const what = dir === 'up'
+    ? '这台机器发出去的字节差分（含 openvpn 封装后的开销，所以它会比出口的实际代理流量大）'
+    : '这台机器收到的字节差分（同上，是网卡上的量，不是解密后的代理流量）';
+  const scale = link
+    ? '绿条按 ' + iface + ' 报的链路速率 ' + link + ' Mbps 折算'
+    : iface + ' 不报链路速率（虚拟网卡常见），绿条不画，只给数值';
+  return {k, pct: ready ? pct : 0, v: ready ? fmtRate(bps) : '—',
+    tip: ready ? head + '\n看的是 ' + iface + '，两次刷新之间' + what + '\n' + scale
+               : '刚开始采样，还没有前一个计数可减\n' + scale};
+}
+
 // 每个胶囊只写"怎么算的"，数字本身一律来自后端：
 // 前端不参与任何估算，否则页面和 SSH 里看到的对不上，比不显示更糟。
 function statDefs(s){
@@ -222,19 +251,21 @@ function statDefs(s){
           + ' 所在分区（fanout 的状态、配置、日志写在这里），口径同 df：'
           + '\n百分比扣掉了 root 预留块，所以它到 100% 就是真的写不进去了'
         : '读不到磁盘占用（statfs 失败），不是这块盘真的空的'},
-    {k:'负载', pct:s.load_pct, v:s.load1.toFixed(2), opt:true,
+    {k:'负载', pct:s.load_pct, v:s.load1.toFixed(2),
      tip:'1 / 5 / 15 分钟负载 = ' + s.load1.toFixed(2) + ' / ' + s.load5.toFixed(2)
         + ' / ' + s.load15.toFixed(2) + '\n绿条按 ' + s.cores
         + ' 核归一，100% 表示可运行任务刚好排满 CPU'},
-    {k:'TCP', pct:s.tcp_pct, v:String(s.tcp), opt:true,
+    {k:'TCP', pct:s.tcp_pct, v:String(s.tcp),
      tip:'在用 TCP socket ' + s.tcp + ' 个（含 TIME_WAIT）\n'
         + 'IPv4 ' + (s.tcp - (s.tcp6 || 0)) + ' + IPv6 ' + (s.tcp6 || 0) + '，两张表加起来才是本机总数\n'
         + '刻度是临时端口区间宽度' + (cap ? ' ' + cap + ' 个' : '（读不到）')
         + '，只用来比较多少，不是硬上限'},
-    {k:'UDP', pct:s.udp_pct, v:String(s.udp), opt:true,
+    {k:'UDP', pct:s.udp_pct, v:String(s.udp),
      tip:'在用 UDP socket ' + s.udp + ' 个\nQUIC、DNS 这类流量都算在这里\n'
         + 'IPv4 ' + (s.udp - (s.udp6 || 0)) + ' + IPv6 ' + (s.udp6 || 0)
         + '：内核把两张表分开记，绑 [::] 的双栈监听只出现在 IPv6 那份里'},
+    ratePill('上行', s.up_bps, s.up_pct, s.net_ready, s.net_if || '默认路由网卡', s.link_mbps, 'up'),
+    ratePill('下行', s.down_bps, s.down_pct, s.net_ready, s.net_if || '默认路由网卡', s.link_mbps, 'down'),
   ];
 }
 
@@ -245,7 +276,7 @@ function renderStats(s){
     // title 里的换行要转成实体：HTML 解析器会把属性值里的裸换行折成一个空格，
     // 那样两行说明就糊成一行长文本了。
     const tip = esc(d.tip).replace(/\n/g, '&#10;');
-    return '<span class="stat' + lvl + (d.opt ? ' opt' : '') + '" title="' + tip + '">'
+    return '<span class="stat' + lvl + '" title="' + tip + '">'
       + '<span class="k">' + esc(d.k) + '</span>'
       + '<span class="bar"><i style="width:' + pct.toFixed(1) + '%"></i></span>'
       + '<span class="v">' + esc(d.v) + '</span></span>';
@@ -1720,65 +1751,69 @@ $('#updApply').onclick = async e => {
   }
 };
 
-// 内置客户端：install.sh 当初替 fanout 下载到工作目录的那份 Xray。
-// 脚本里"已存在就跳过"，所以它从装机那天起再没动过，这里给个更新入口。
+// 内置客户端：出口连中间节点用的那两份程序。版本号常驻，
+// "有没有新的"要点一下「检查更新」才问，免得每开一次页就打一次 GitHub 或包管理器。
+let binState = null;   // 最近一次 /api/client/status 原文：弹确认框时要引用里面的命令
+
 async function loadClientBin(){
   try{ paintClientBin(await api('/api/client/status'), false); }
   catch(err){ $('#cliXrayHint').textContent = '读本机客户端失败: ' + err.message; }
 }
 
-// checked 表示这份状态带 GitHub 的比对结果；没比对时不能显示"已是最新"，
-// 那是把"还没查过"说成"查过且没问题"。
+// 卡片底部那行小字：传空串就是收起，界面只在有话要说时多占一行。
+function clientNote(msg){
+  const n = $('#cliOvpnNote');
+  if(!n) return;
+  n.textContent = msg || '';
+  n.hidden = !msg;
+}
+
+// checked 表示这份状态带比对结果；没比对时不能显示"已是最新"，
+// 那是把"还没查过"说成"查过且没问题"。openvpn 比的是本机仓库里的版本，
+// 不是社区最新版——Debian 稳定版常年停在 2.5.x，照上游比会天天误报。
 function paintClientBin(c, checked){
+  binState = c;
   $('#cliXray').textContent = c.current || '未知';
   $('#cliOvpn').textContent = c.openvpn || '未安装';
   $('#cliApply').hidden = true;
+  $('#cliOvpnApply').hidden = true;
   $('#cliCheck').disabled = false;
-  // 查询失败时 latest 是空的，这时不能报"已是最新"——那是把"没查到"说成"没问题"
   $('#cliXrayLatest').textContent =
-    (checked && c.latest) ? (c.has_update ? ' → 有新版本 ' + c.latest : ' · 已是最新') : '';
-  const where = c.path ? c.path + '。' : '';
+    (checked && c.latest) ? (c.has_update ? ' → ' + c.latest : ' · 已是最新') : '';
+  $('#cliOvpnLatest').textContent =
+    (checked && c.openvpn_latest) ? (c.openvpn_has_update ? ' → ' + c.openvpn_latest : ' · 已是仓库最新') : '';
   $('#cliXrayHint').textContent = c.updatable
-    ? where + '这份是装机时从 Xray-core 下的最新版，之后无论重装多少次 fanout 都不会碰它，版本号停在装机那天。'
-    : where + (c.reason || '这台机器上没有可由 fanout 替换的 Xray。');
-  if(c.updatable && c.has_update){
+    ? 'Xray 走官方发布，openvpn 走系统包管理器。'
+    : (c.reason || '这台机器上没有可由 fanout 替换的 Xray。');
+  if(checked && c.updatable && c.has_update && c.latest){
     $('#cliApplyVer').textContent = c.latest;
     $('#cliApply').hidden = false;
   }
-  paintOpenVPN(c);
+  if(checked && c.openvpn_updatable && c.openvpn_has_update && c.openvpn_latest){
+    $('#cliOvpnApplyVer').textContent = c.openvpn_latest;
+    $('#cliOvpnApply').hidden = false;
+  }
+  // 这行只在真出问题时装满：认不出家族、没有对应的包管理器、执行失败
+  clientNote(checked && !c.openvpn_updatable ? c.openvpn_reason : '');
   if(c.check_error) toast('问最新版失败: ' + c.check_error, 'bad');
 }
 
-// openvpn 这半边不由 fanout 决定新旧，由这台机器的包管理器决定，
-// 所以不给"有新版"的判断，只把将要执行的命令摊开给人看再点下去。
-function paintOpenVPN(c){
-  $('#cliOvpnFamily').textContent = c.openvpn_family ? '（' + c.openvpn_family + ' 系的包管理器）' : '';
-  const btn = $('#cliOvpnApply'), note = $('#cliOvpnNote');
-  btn.hidden = !c.openvpn_updatable;
-  btn.disabled = false;
-  if(c.openvpn_updatable){
-    note.hidden = false;
-    note.textContent = '点下去会执行：' + c.openvpn_cmd;
-  } else if(c.openvpn_reason){
-    note.hidden = false;
-    note.textContent = c.openvpn_reason;
-  } else {
-    note.hidden = true;
-  }
-}
-
-// 检查内置 Xray 更新：这一步才会打 GitHub 的 API
+// 检查更新：只有这一步会打 GitHub 的 API、叫一次本机的包管理器
 $('#cliCheck').onclick = async e => {
   const b = e.currentTarget;
   b.disabled = true;
   $('#cliXrayLatest').textContent = ' 查询中…';
+  clientNote('');
   try{
     const c = await api('/api/client/status?check=1');
     paintClientBin(c, true);
-    if(c.has_update) toast('发现新版 Xray ' + c.latest, 'info');
-    else if(!c.check_error) toast(c.updatable ? 'Xray 已经是最新版' : '这份 Xray 不由 fanout 管，无需在这里更新', 'ok');
+    if(c.has_update) toast('Xray 有新版本 ' + c.latest, 'info');
+    else if(!c.check_error) toast(c.updatable ? 'Xray 已是最新版' : '这份 Xray 不由 fanout 管', 'ok');
+    if(c.openvpn_has_update) toast('仓库里的 openvpn 是 ' + c.openvpn_latest, 'info');
+    else if(c.openvpn_latest) toast('openvpn 已是仓库最新（' + c.openvpn_latest + '）', 'ok');
   }catch(err){
     $('#cliXrayLatest').textContent = '';
+    clientNote('查询失败: ' + err.message);
     toast(err.message, 'bad');
   }
   b.disabled = false;
@@ -1802,10 +1837,10 @@ $('#cliApply').onclick = async e => {
   loadClientBin();
 };
 
-// 升级 openvpn：命令由本机发行版决定，卡上已经摊开，这里再确认一次。
+// 升级 openvpn：命令由本机发行版决定，确认框里把原文摊开再点。
 // 耗时看镜像源，几十秒到几分钟都算正常。
 $('#cliOvpnApply').onclick = async e => {
-  const cmd = $('#cliOvpnNote').textContent.replace(/^点下去会执行：/, '');
+  const cmd = (binState && binState.openvpn_cmd) || '（没读到命令，请先「检查更新」）';
   if(!confirm('用系统的包管理器升级 openvpn？\n\n' + cmd +
       '\n\n已在跑的隧道不会中断（它们挂在旧进程上），新建出口或换节点之后才用新版。')) return;
   const b = e.currentTarget;
@@ -1815,9 +1850,10 @@ $('#cliOvpnApply').onclick = async e => {
   try{
     const r = await api('/api/client/openvpn/apply', {method:'POST'});
     toast(r.message || '已执行', 'ok');
-    $('#cliOvpnNote').textContent = r.message || '已执行';
+    clientNote(r.message || '已执行');
   }catch(err){
     toast(err.message, 'bad');
+    clientNote('执行失败：' + err.message);
   }
   b.innerHTML = label;
   loadClientBin();

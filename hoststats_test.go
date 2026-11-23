@@ -6,7 +6,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"runtime"
+	"strings"
 	"testing"
+	"time"
 )
 
 // 这几个解析函数是顶部负载条的全部数据来源。它们只在真机上被间接触发，
@@ -92,24 +94,36 @@ func TestParseMeminfoWithoutAvailable(t *testing.T) {
 }
 
 func TestParseSockstat(t *testing.T) {
+	// 这份是 Ubuntu 22.04 /proc/net/sockstat 的原样抄录：在用数是 "inuse" 一个 token。
+	// 早先这里的夹具写成了 "in use" 两个 token，解析器照着它写，结果真机上一律读不到，
+	// UDP 胶囊永远停在 0，而 TCP 因为还能命中 tw 看着像好的。
 	blob := []byte(`sockets: used 512
-TCP: in use 37 orphaned 0 tw 128
-UDP: in use 9
-UDPLITE: in use 0
-RAW: in use 1
+TCP: inuse 20 orphan 0 tw 128 alloc 150 mem 34
+UDP: inuse 9 memory 4
+UDPLITE: inuse 0
+RAW: inuse 0
+FRAG: inuse 0 memory 0
 `)
 	tcp, udp := parseSockstat(blob)
 	// tw 要算进来：代理机上 TIME_WAIT 常常比已建立连接还多
-	if tcp != 165 {
-		t.Errorf("tcp = %d, 想 165（37 在用 + 128 tw）", tcp)
+	if tcp != 148 {
+		t.Errorf("tcp = %d, 想 148（20 在用 + 128 tw）", tcp)
 	}
 	if udp != 9 {
 		t.Errorf("udp = %d, 想 9", udp)
 	}
 }
 
+func TestParseSockstatLegacySpelling(t *testing.T) {
+	// 老内核印 "in use" 两个 token，这种写法也得继续认，别把修好的 bug 换成新的
+	tcp, udp := parseSockstat([]byte("TCP: in use 37 orphaned 0 tw 128\nUDP: in use 9\n"))
+	if tcp != 165 || udp != 9 {
+		t.Errorf("tcp/udp = %d/%d, 想 165/9", tcp, udp)
+	}
+}
+
 func TestParseSockstatPartial(t *testing.T) {
-	tcp, udp := parseSockstat([]byte("TCP: in use 4\n"))
+	tcp, udp := parseSockstat([]byte("TCP: inuse 4\n"))
 	if tcp != 4 || udp != 0 {
 		t.Errorf("tcp/udp = %d/%d, 想 4/0（缺 tw 与 UDP 行不该炸）", tcp, udp)
 	}
@@ -255,16 +269,16 @@ func TestReadDiskUsageFallsBack(t *testing.T) {
 	}
 }
 
-// 现场反馈：UDP 胶囊一直是 0。原因是内核把 IPv4 和 IPv6 的 socket 分开记在
-// 两张表里，绑 [::] 的双栈监听只会出现在 sockstat6，而原来只读了 IPv4 那份。
-// 这台机器上 IPv4 确实可能一个 UDP socket 都没有，于是数字看着像"坏了"。
+// 现场反馈：UDP 胶囊一直是 0。这里两张表都要覆盖到——IPv4 表里确实可能一个
+// UDP socket 都没有（绑 [::] 的双栈监听只记在 sockstat6），而且两张表的
+// 在用数都印成 "inuse" 一个 token，照着 "in use" 写解析就两边都读不出来。
 func TestParseSockstatIPv6Table(t *testing.T) {
 	// 这份是 /proc/net/sockstat6 的真实形状：行名带 6，而且没有 tw 列
-	blob := []byte(`TCP6: in use 8
-UDP6: in use 6
-UDPLITE6: in use 0
-RAW6: in use 0
-FRAG6: in use 0 memory 0
+	blob := []byte(`TCP6: inuse 8
+UDP6: inuse 6
+UDPLITE6: inuse 0
+RAW6: inuse 0
+FRAG6: inuse 0 memory 0
 `)
 	tcp, udp := parseSockstat(blob)
 	if tcp != 8 {
@@ -277,8 +291,8 @@ FRAG6: in use 0 memory 0
 
 // 两张表要相加才是本机总数：少加任何一张，代理机上都会明显低估。
 func TestParseSockstatBothTablesSum(t *testing.T) {
-	v4 := []byte("TCP: in use 37  orphan 0  tw 128  mem 5\nUDP: in use 2 mem 2\n")
-	v6 := []byte("TCP6: in use 8\nUDP6: in use 6\n")
+	v4 := []byte("TCP: inuse 37  orphan 0  tw 128  mem 5\nUDP: inuse 2 mem 2\n")
+	v6 := []byte("TCP6: inuse 8\nUDP6: inuse 6\n")
 	t4, u4 := parseSockstat(v4)
 	t6, u6 := parseSockstat(v6)
 	if t4+t6 != 173 {
@@ -286,5 +300,137 @@ func TestParseSockstatBothTablesSum(t *testing.T) {
 	}
 	if u4+u6 != 8 {
 		t.Errorf("UDP 相加 = %d, 想 8（IPv4 的 2 加 IPv6 的 6）", u4+u6)
+	}
+}
+
+// 上下行速率的原料是 /proc/net/dev 的累计字节，夹具按真机原样抄：
+// 收在第 1 列，发在第 9 列，名字在冒号左边且带缩进。
+func TestParseNetDev(t *testing.T) {
+	blob := []byte(`Inter-|   Receive                                                |  Transmit
+ face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed
+    lo: 1048576    9012    0    0    0     0          0         0  1048576    9012    0    0    0     0       0          0
+  eth0: 524288000  400000    0    0    0     0          0         0 262144000  300000    0    0    0     0       0          0
+`)
+	got := parseNetDev(blob)
+	if len(got) != 2 {
+		t.Fatalf("读到 %d 块网卡，想 2：%v", len(got), got)
+	}
+	if e := got["eth0"]; e[0] != 524288000 || e[1] != 262144000 {
+		t.Errorf("eth0 收发 = %v, 想 [524288000 262144000]", e)
+	}
+	if e := got["lo"]; e[0] != 1048576 {
+		t.Errorf("lo 收 = %v，名字要去掉缩进", e)
+	}
+}
+
+// 只数默认路由那块卡：把 docker0/veth 一起加起来会把同一段流量算两遍。
+func TestParseDefaultIfaces(t *testing.T) {
+	blob := []byte("Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n" +
+		"eth0\t00000000\t0101A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0\n" +
+		"eth0\t0001A8C0\t00000000\t0001\t0\t0\t100\t00FFFFFF\t0\t0\t0\n" +
+		"wg0\t00000000\tFEA9B60A\t0003\t0\t0\t50\t00000000\t0\t0\t0\n")
+	got := parseDefaultIfaces(blob)
+	if strings.Join(got, ",") != "eth0,wg0" {
+		t.Errorf("默认路由网卡 = %v, 想 [eth0 wg0]（表头与非默认那行都不能混进来）", got)
+	}
+	if len(parseDefaultIfaces([]byte(""))) != 0 {
+		t.Error("空输入应给空列表，让调用方走兜底")
+	}
+}
+
+func TestFallbackIfacesSkipsVirtual(t *testing.T) {
+	devs := map[string][2]uint64{
+		"lo": {}, "eth0": {}, "docker0": {}, "veth1a2b3c": {}, "br-9f8e7d": {}, "tun0": {},
+	}
+	got := strings.Join(fallbackIfaces(devs), ",")
+	if got != "eth0,tun0" {
+		t.Errorf("兜底网卡 = %q, 想 eth0,tun0", got)
+	}
+}
+
+func TestRatePct(t *testing.T) {
+	// 100 MB/s 跑在 1 Gbps 的口上 = 800 Mbps = 80%
+	if p := ratePct(100*1024*1024, 1000); p < 79 || p > 85 {
+		t.Errorf("pct = %v, 想 80 上下", p)
+	}
+	if p := ratePct(12345, 0); p != 0 {
+		t.Errorf("网卡不报速率时应给 0（界面据此不画条），得 %v", p)
+	}
+}
+
+func TestNetRates(t *testing.T) {
+	restore := func() {
+		netSample.mu.Lock()
+		netSample.devs, netSample.has, netSample.ready = nil, false, false
+		netSample.up, netSample.down = 0, 0
+		netSample.mu.Unlock()
+	}
+	defer restore()
+	restore() // 起始状态也要清干净：这组测试依赖"第一次调用没有前值"
+
+	// 第一次没有前值可减：ready=false，界面显示"—"，不能报 0 B/s
+	if up, down, ready := netRates(map[string][2]uint64{"eth0": {100, 40}}, []string{"eth0"}); ready || up != 0 || down != 0 {
+		t.Fatalf("首个窗口 = %v/%v ready=%v, 想 0/0 false", up, down, ready)
+	}
+
+	// 造一个 1 秒前的采样点：收 0→500，发 0→250
+	seed := func(devs map[string][2]uint64, ago time.Duration, ready bool) {
+		netSample.mu.Lock()
+		netSample.devs = devs
+		netSample.at, netSample.has, netSample.ready = time.Now().Add(-ago), true, ready
+		netSample.mu.Unlock()
+	}
+	seed(map[string][2]uint64{"eth0": {0, 0}}, time.Second, true)
+
+	up, down, ready := netRates(map[string][2]uint64{"eth0": {500, 250}}, []string{"eth0"})
+	if !ready {
+		t.Fatal("有前值、窗口够长时应给得出速率")
+	}
+	if up < 200 || up > 300 {
+		t.Errorf("上行（发送）= %v, 想 250 上下", up)
+	}
+	if down < 450 || down > 550 {
+		t.Errorf("下行（接收）= %v, 想 500 上下", down)
+	}
+
+	// 新出现的网卡这一轮不算，否则它的累计总量会被当成一个窗口的增量，画出一根冲顶的假条
+	seed(map[string][2]uint64{"eth0": {0, 0}}, time.Second, true)
+	up, down, _ = netRates(map[string][2]uint64{"eth0": {100, 100}, "wg0": {9e9, 9e9}}, []string{"eth0", "wg0"})
+	if up > 101 || down > 101 {
+		t.Errorf("新网卡被算进来了：up/down = %v/%v", up, down)
+	}
+
+	// 计数器归零（网卡重置）时不能算出负数
+	seed(map[string][2]uint64{"eth0": {1e6, 1e6}}, time.Second, true)
+	up, down, _ = netRates(map[string][2]uint64{"eth0": {10, 10}}, []string{"eth0"})
+	if up < 0 || down < 0 {
+		t.Errorf("计数归零应跳过而不是给负数：%v/%v", up, down)
+	}
+}
+
+// 连着点两次刷新时窗口只有几毫秒，差出来的速率是噪声，要沿用上一次的。
+func TestNetRatesShortWindowKeepsPrevious(t *testing.T) {
+	defer func() {
+		netSample.mu.Lock()
+		netSample.devs, netSample.has, netSample.ready = nil, false, false
+		netSample.up, netSample.down = 0, 0
+		netSample.mu.Unlock()
+	}()
+	netSample.mu.Lock()
+	netSample.devs = map[string][2]uint64{"eth0": {0, 0}}
+	netSample.at, netSample.has, netSample.ready = time.Now(), true, true
+	netSample.up, netSample.down = 111, 222
+	netSample.mu.Unlock()
+
+	up, down, ready := netRates(map[string][2]uint64{"eth0": {1 << 30, 1 << 30}}, []string{"eth0"})
+	if up != 111 || down != 222 || !ready {
+		t.Errorf("窗口太短时应沿用上一次：%v/%v ready=%v, 想 111/222 true", up, down, ready)
+	}
+}
+
+// 胶囊的刻度要有出处：链路速率读不到就别画条。
+func TestLinkMbpsUnreadable(t *testing.T) {
+	if got := linkMbps([]string{"iface-that-does-not-exist-xyz"}); got != 0 {
+		t.Errorf("不存在的网卡应给 0（没有分母），得 %d", got)
 	}
 }

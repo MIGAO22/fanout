@@ -1,6 +1,6 @@
 package main
 
-// 顶部状态条的主机实时读数：CPU、内存、交换、磁盘、负载、TCP/UDP 在用数。
+// 顶部状态条的主机实时读数：CPU、内存、交换、磁盘、负载、TCP/UDP 在用数、网卡上下行速率。
 //
 // 一律读 /proc 而不是问 free/ss/vmstat：这个接口每几秒就要被拉一次，
 // 起子进程既慢又得走一遍 inMainNetns 的 exec 护栏（见 netnsguard.go）。
@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"os"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -64,6 +65,22 @@ type hostStats struct {
 	// 它只是个刻度，不是硬上限（监听套接字并不占这段），
 	// 画出来是为了让"TCP 用了多少"这台代理机上有个可比的参照。
 	SockCap int `json:"sock_cap"`
+
+	// 上下行是默认路由那块网卡的收发字节差分，单位 字节/秒。
+	// 记的是网卡上的量，所以包含 openvpn 封装后的开销——问"这台机器的口跑了多少"
+	// 要看这里，问"代理转了多少"要看各出口自己的计数，两者本来就不该相等。
+	UpBps   float64 `json:"up_bps"`
+	DownBps float64 `json:"down_bps"`
+	UpPct   float64 `json:"up_pct"`
+	DownPct float64 `json:"down_pct"`
+	// NetReady 说这两个数是不是真差分出来的：第一次采样没有前值可减，
+	// 那种情况必须报"还不知道"，不能报 0——0 在带宽上是完全可能的真值。
+	NetReady bool `json:"net_ready"`
+	// NetIf 说清这几个数来自哪块网卡；LinkMbps 是绿条的分母。
+	// 虚拟化平台上 speed 常报 0 或 -1，那种情况绿条画不出来（画成半速是骗人），
+	// 但速率本身是真的。
+	NetIf    string `json:"net_if"`
+	LinkMbps int    `json:"link_mbps"`
 }
 
 // cpuFirstWindow 是首屏没有前值可减时，就地等的一个短窗口。
@@ -221,23 +238,31 @@ func parseLoadavg(blob []byte) (l1, l5, l15 float64, err error) {
 // 一台跑代理的机器上它经常比已建立的连接还多，只看在用数会低估。
 // IPv6 表里内核没印 tw，那份就只是在用数。
 //
-// 内核把这行印成 "TCP: in use 37 orphan 0 tw 128"，数值在关键字后面隔一个词的位置，
-// 所以取数时要往后找到第一个整数，而不是照着关键字取下一格。
+// 真机上这两行长这样（net/ipv4/proc.c 里印的）：
+//
+//	TCP: inuse 14 orphan 0 tw 312 alloc 149 mem 26
+//	UDP: inuse 9 memory 4
+//
+// 在用数是一个 token 的 "inuse"，不是 "in use" 两个 token。这个区别是致命的：
+// 按两个 token 找就一个都找不到，UDP 恒 0，而 TCP 因为 "tw" 还能对上、
+// 显示得像个正常数字，于是看起来"只有 UDP 坏了"。两种写法都认。
 func parseSockstat(blob []byte) (tcp, udp int) {
 	for _, line := range strings.Split(string(blob), "\n") {
 		f := strings.Fields(line)
 		if len(f) < 2 {
 			continue
 		}
-		val := func(keys ...string) int {
-			for i, s := range f {
-				if s != keys[0] {
+		// 内核把这行印成 "TCP: inuse 14 orphan 0 tw 312"，数值在关键字后面隔一个词的位置，
+		// 所以取数时要往后找到第一个整数，而不是照着关键字取下一格。
+		after := func(keys ...string) int {
+			for i := 0; i+len(keys) < len(f); i++ {
+				if f[i] != keys[0] {
 					continue
 				}
-				// keys 是多词关键字（"in use"）时，后面那几个词也要对上
+				// keys 是多词关键字时，后面那几个词也要对上
 				matched := true
 				for k, want := range keys[1:] {
-					if i+1+k >= len(f) || f[i+1+k] != want {
+					if f[i+1+k] != want {
 						matched = false
 						break
 					}
@@ -253,11 +278,19 @@ func parseSockstat(blob []byte) (tcp, udp int) {
 			}
 			return 0
 		}
+		inUse := func() int {
+			for _, alt := range [][]string{{"inuse"}, {"in", "use"}} {
+				if v := after(alt...); v != 0 {
+					return v
+				}
+			}
+			return 0
+		}
 		switch f[0] {
 		case "TCP:", "TCP6:":
-			tcp = val("in", "use") + val("tw")
+			tcp = inUse() + after("tw")
 		case "UDP:", "UDP6:":
-			udp = val("in", "use")
+			udp = inUse()
 		}
 	}
 	return tcp, udp
@@ -275,6 +308,146 @@ func parsePortRange(blob []byte) int {
 		return 0
 	}
 	return hi - lo + 1
+}
+
+// parseNetDev 取 /proc/net/dev 里每块网卡的累计收发字节数（[0]=收，[1]=发）。
+//
+// 表头那行没有冒号，所以按冒号切就够了；收的字节在第 1 列，发的在第 9 列
+// （中间那 7 列是 packets/errs/drop/fifo/frame/compressed/multicast）。
+func parseNetDev(blob []byte) map[string][2]uint64 {
+	out := map[string][2]uint64{}
+	for _, line := range strings.Split(string(blob), "\n") {
+		name, rest, ok := strings.Cut(line, ":")
+		if !ok {
+			continue
+		}
+		f := strings.Fields(rest)
+		if len(f) < 9 {
+			continue
+		}
+		rx, err1 := strconv.ParseUint(f[0], 10, 64)
+		tx, err2 := strconv.ParseUint(f[8], 10, 64)
+		if err1 != nil || err2 != nil {
+			continue
+		}
+		out[strings.TrimSpace(name)] = [2]uint64{rx, tx}
+	}
+	return out
+}
+
+// parseDefaultIfaces 从 /proc/net/route 挑出走默认路由（目的 00000000）的网卡。
+// 只数这几块是因为：把 docker0、veth* 这些也加起来，同一份流量会被算两遍
+// （宿主机和容器之间那一段在两块卡上各记一次）。
+func parseDefaultIfaces(blob []byte) []string {
+	var out []string
+	seen := map[string]bool{}
+	for _, line := range strings.Split(string(blob), "\n") {
+		f := strings.Fields(line)
+		if len(f) < 2 || f[1] != "00000000" || seen[f[0]] {
+			continue
+		}
+		seen[f[0]] = true
+		out = append(out, f[0])
+	}
+	sort.Strings(out)
+	return out
+}
+
+// fallbackIfaces 是给没有默认路由的机器（全走策略路由、或 route 读不到）准备的：
+// 去掉本机回环和一眼看得出的容器/桥接虚口，剩下的当成对外那几块。
+func fallbackIfaces(devs map[string][2]uint64) []string {
+	var out []string
+	for name := range devs {
+		switch {
+		case name == "lo":
+			continue
+		case strings.HasPrefix(name, "veth"), strings.HasPrefix(name, "docker"),
+			strings.HasPrefix(name, "br-"), strings.HasPrefix(name, "virbr"):
+			continue
+		}
+		out = append(out, name)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// linkMbps 把这几块网卡的链路速率加起来。speed 这个 sysfs 文件读不到、
+// 或者报 0/-1（虚拟网卡和不少云主机的 virtio 都这样）时给 0，表示"没有分母"。
+func linkMbps(ifaces []string) int {
+	total := 0
+	for _, n := range ifaces {
+		blob, err := os.ReadFile("/sys/class/net/" + n + "/speed")
+		if err != nil {
+			continue
+		}
+		v, err := strconv.Atoi(strings.TrimSpace(string(blob)))
+		if err != nil || v <= 0 {
+			continue
+		}
+		total += v
+	}
+	return total
+}
+
+// ratePct 把字节/秒换算成链路速率的百分比；没有链路速率时给 0（界面据此不画条）。
+func ratePct(bps float64, mbps int) float64 {
+	if mbps <= 0 {
+		return 0
+	}
+	return clampPct(bps * 8 / (float64(mbps) * 1e6) * 100)
+}
+
+// netSample 存上一次读到的网卡计数：/proc/net/dev 是开机以来的累计值，
+// 独立读一次只能知道总共跑了多少，速率必须是差出来的。
+type netCounters struct {
+	at   time.Time
+	devs map[string][2]uint64
+	has  bool
+	// 窗口太短时沿用这几个值：连着点刷新时几毫秒的差值除出来的峰值是假的
+	up, down float64
+	ready    bool
+}
+
+var netSample = struct {
+	mu sync.Mutex
+	netCounters
+}{}
+
+// netRates 给出距上次调用的收发字节速率（上=发送，下=接收）。
+// 第三个返回值说这个速率是不是真差分出来的：第一次调用没有前值，
+// 界面据此显示"—"而不是显示 0 B/s——空闲机器确实会是 0，两者不能混。
+func netRates(cur map[string][2]uint64, ifaces []string) (up, down float64, ready bool) {
+	netSample.mu.Lock()
+	defer netSample.mu.Unlock()
+
+	now := time.Now()
+	prev, hadPrev := netSample.devs, netSample.has
+	dt := now.Sub(netSample.at).Seconds()
+	netSample.devs, netSample.at, netSample.has = cur, now, true
+
+	if !hadPrev || dt < 0.2 {
+		return netSample.up, netSample.down, netSample.ready
+	}
+	var rx, tx uint64
+	for _, n := range ifaces {
+		c, ok := cur[n]
+		if !ok {
+			continue
+		}
+		p, ok := prev[n]
+		if !ok {
+			// 这块卡是新出现的（刚起隧道、刚插网卡），这一轮先不算它，
+			// 否则会把它的累计总量当成一个窗口的增量，画出一根冲顶的假条。
+			continue
+		}
+		if c[0] < p[0] || c[1] < p[1] {
+			continue // 计数器归零过（网卡重置、模块重载）
+		}
+		rx += c[0] - p[0]
+		tx += c[1] - p[1]
+	}
+	netSample.up, netSample.down, netSample.ready = float64(tx)/dt, float64(rx)/dt, true
+	return netSample.up, netSample.down, true
 }
 
 func clampPct(v float64) float64 {
@@ -402,8 +575,7 @@ func readHostStats() (hostStats, error) {
 		st.TCP, st.UDP = parseSockstat(blob)
 		// IPv4 和 IPv6 是两张独立的表：/proc/net/sockstat 里只有 AF_INET。
 		// 入站一般绑 [::]（双栈），客户端从 IPv6 连进来时那些 socket 全记在
-		// sockstat6 上——只读 IPv4 那份，UDP 胶囊就会一直停在 0。
-		// 没编进 IPv6 的内核没有这个文件，读不到不报错。
+		// sockstat6 上，所以两份要相加。没编进 IPv6 的内核没有这个文件，读不到不报错。
 		if v6, err := os.ReadFile("/proc/net/sockstat6"); err == nil {
 			st.TCP6, st.UDP6 = parseSockstat(v6)
 			st.TCP += st.TCP6
@@ -413,6 +585,23 @@ func readHostStats() (hostStats, error) {
 			st.SockCap = parsePortRange(rb)
 		}
 		st.TCPPct, st.UDPPct = pctOf(int64(st.TCP), int64(st.SockCap)), pctOf(int64(st.UDP), int64(st.SockCap))
+
+		// 上下行速率。sysfs 的 /sys/class/net 和 /proc/net/* 一样是按命名空间分的，
+		// 所以要和上面这几步一起放在母机命名空间里读。
+		if db, err := os.ReadFile("/proc/net/dev"); err == nil {
+			devs := parseNetDev(db)
+			names := []string(nil)
+			if rb, err := os.ReadFile("/proc/net/route"); err == nil {
+				names = parseDefaultIfaces(rb)
+			}
+			if len(names) == 0 {
+				names = fallbackIfaces(devs)
+			}
+			st.NetIf = strings.Join(names, " ")
+			st.UpBps, st.DownBps, st.NetReady = netRates(devs, names)
+			st.LinkMbps = linkMbps(names)
+			st.UpPct, st.DownPct = ratePct(st.UpBps, st.LinkMbps), ratePct(st.DownBps, st.LinkMbps)
+		}
 		return nil
 	}); err != nil {
 		errs = append(errs, err.Error())

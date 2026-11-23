@@ -387,3 +387,103 @@ func TestDataCipherArgs(t *testing.T) {
 		t.Errorf("2.6 应该带 fallback，不然只讲 AES-256-CBC 的老节点连不上：%s", s)
 	}
 }
+
+// 这几个解析函数是「检查更新」里 openvpn 那个版本号的唯一出处，而各家包管理器的
+// 输出形状差得很远。夹具按真机输出抄，改坏了要在这里红，而不是在界面上
+// 显示一个"2.6.11-1"被截断成"openvpn.x86_64"这种荒唐数字。
+func TestParseAptCandidate(t *testing.T) {
+	out := `openvpn:
+  Installed: 2.5.8-2ubuntu2
+  Candidate: 2.6.11-0ubuntu0.1
+  Version table:
+ *** 2.5.8-2ubuntu2 500
+        100 /var/lib/dpkg/status
+`
+	if got := parseAptCandidate(out); got != "2.6.11-0ubuntu0.1" {
+		t.Errorf("Candidate = %q, 想 2.6.11-0ubuntu0.1", got)
+	}
+	if got := parseAptCandidate("openvpn:\n  Installed: (none)\n  Candidate: (none)\n"); got != "" {
+		t.Errorf("索引里没有这个包时应给空，得 %q", got)
+	}
+	if got := parseAptCandidate("N: Unable to locate package openvpn\n"); got != "" {
+		t.Errorf("查无此包时应给空，得 %q", got)
+	}
+}
+
+func TestParseDnfAvailable(t *testing.T) {
+	out := `Last metadata expiration check: 0:12:01 ago on Mon 23 Nov 2026 09:12:01 AM UTC.
+Available Packages
+openvpn.x86_64          1:2.5.8-1.el8          appstream
+`
+	// epoch（"1:"）不是版本的一部分，留着的话界面会显示成 1:2.5.8-1.el8
+	if got := parseDnfAvailable(out); got != "2.5.8-1.el8" {
+		t.Errorf("dnf 行解析 = %q, 想 2.5.8-1.el8", got)
+	}
+	noEpoch := "openvpn-2.4.11-1.el7.x86_64    2.4.11-1.el7    base\n"
+	if got := parseDnfAvailable(noEpoch); got != "2.4.11-1.el7" {
+		t.Errorf("不带 epoch 的行 = %q, 想 2.4.11-1.el7", got)
+	}
+	if got := parseDnfAvailable("Error: No matching Packages to list\n"); got != "" {
+		t.Errorf("查无此包时应给空，得 %q", got)
+	}
+}
+
+func TestParseApkPolicy(t *testing.T) {
+	out := `openvpn-2.6.11-r0:
+  2.6.11-r0:
+    V: https://dl-cdn.alpinelinux.org/alpine/v3.20/main
+    A: x86_64
+`
+	if got := parseApkPolicy(out); got != "2.6.11-r0" {
+		t.Errorf("apk 首行解析 = %q, 想 2.6.11-r0", got)
+	}
+	if got := parseApkPolicy("ERROR: unable to select packages:\n  openvpn (no such package):\n"); got != "" {
+		t.Errorf("查无此包时应给空，得 %q", got)
+	}
+}
+
+func TestParseColonVersion(t *testing.T) {
+	pacman := `Repository      : extra
+Name            : openvpn
+Version         : 2.6.11-1
+Description     : An easy to use, robust, and flexible SSL VPN daemon
+`
+	if got := parseColonVersion(pacman); got != "2.6.11-1" {
+		t.Errorf("pacman 解析 = %q, 想 2.6.11-1", got)
+	}
+	zypper := `Information for package openvpn:
+-------------------------------------
+Repository     : openSUSE-Tumbleweed-Oss
+Name           : openvpn
+Version        : 2.6.11-1.1
+Arch           : x86_64
+`
+	if got := parseColonVersion(zypper); got != "2.6.11-1.1" {
+		t.Errorf("zypper 解析 = %q, 想 2.6.11-1.1", got)
+	}
+	// 只有 Installed Version 这种键时不该乱认成候选版本
+	if got := parseColonVersion("Versioning    : rpm\n"); got != "" {
+		t.Errorf("不该把别的键当成版本，得 %q", got)
+	}
+}
+
+// 界面判断"有没有新版"用的是 versionLess，仓库版本号带发行版后缀也必须比得对：
+// 比错了要么永远提示升级，要么永远说你是最新。
+func TestOpenVPNRepoVersionCompare(t *testing.T) {
+	cases := []struct {
+		cur, latest string
+		want        bool
+	}{
+		{"2.5.8", "2.6.11-0ubuntu0.1", true},
+		{"2.6.11", "2.6.11-0ubuntu0.1", false},
+		{"2.6.11-2ubuntu1", "2.6.11-0ubuntu0.1", false},
+		{"2.4.11", "2.4.12-1.el7", true},
+		{"2.6.9-r0", "2.6.11-r0", true},
+		{"", "2.6.11", true}, // 读不出版本时宁可说"有新版"，让用户去升一次看结果
+	}
+	for _, c := range cases {
+		if got := versionLess(c.cur, c.latest); got != c.want {
+			t.Errorf("versionLess(%q, %q) = %v, 想 %v", c.cur, c.latest, got, c.want)
+		}
+	}
+}
