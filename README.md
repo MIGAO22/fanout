@@ -347,11 +347,11 @@ questing 是 `2.7~rc1`——数字上比 2.6.19 大，实际比本机那份旧�
 装去哪个目录、怎么退），因为这一步比升级包重：它要在机器上装编译器。实际动作是
 
 ```
-下载 https://github.com/OpenVPN/openvpn/releases/download/v2.7.9/openvpn-2.7.9.tar.gz 和它的 .asc
-核对 GitHub 在 release 资产上自己报的 sha256
-用 OpenVPN 官方主钥匙验签名（F554A3687412CFFEBDEFE0A312F5F7B42F2B01E7）
 apt-get update -qq
 apt-get install -y --no-install-recommends build-essential pkg-config libssl-dev libcap-ng-dev liblzo2-dev liblz4-dev gnupg
+下载 https://github.com/OpenVPN/openvpn/releases/download/v2.7.9/openvpn-2.7.9.tar.gz 和它的 .asc
+核对 GitHub 在 release 资产上自己报的 sha256
+用 OpenVPN 官方主钥匙验签名（F554A3687412CFFEBDEFE0A312F5F7B42F2B01E7，gpg 就是上面那列装的）
 ./configure --prefix=/usr/local/fanout-openvpn/2.7.9 --disable-dco --disable-plugin-auth-pam --disable-unit-tests
 make -j<N> && make install
 ```

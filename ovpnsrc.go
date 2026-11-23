@@ -396,12 +396,14 @@ func verifyOpenVPNTarball(tarPath, ascPath string) (string, error) {
 }
 
 // openvpnBuildSteps 是作业步骤的标签，顺序和 runOpenVPNSourceBuild 里的下标一一对应。
+// 「装编译依赖」排在验签前面：gnupg 就是这一列里的包，裸机上没装的话，
+// 先跑验签等于让作业在第 4 步就报"没有 gpg"，而那把装 gpg 的手还在后面。
 var openvpnBuildSteps = []string{
 	"问本机包管理器能装到哪",
+	"装编译依赖",
 	"下载源码包与签名",
 	"核对 GitHub 给的摘要",
 	"用 OpenVPN 官方钥匙验签",
-	"装编译依赖",
 	"解包",
 	"configure",
 	"make 编译",
@@ -410,10 +412,10 @@ var openvpnBuildSteps = []string{
 
 const (
 	bStepRepo = iota
+	bStepDeps
 	bStepDownload
 	bStepDigest
 	bStepSign
-	bStepDeps
 	bStepUnpack
 	bStepConfigure
 	bStepMake
@@ -513,7 +515,25 @@ func runOpenVPNSourceBuild(job *Job, ver, tarURL, ascURL, digest string) {
 	}
 	done(bStepRepo, fmt.Sprintf("%s 家族装得到的最高是 %s，官方 %s 够不到", d.Family, orNothing(d.Target), ver))
 
-	// 2) 下载
+	// 2) 依赖（gnupg 也在这一步，验签要用）
+	job.Set(bStepDeps, "running", "apt-get update && apt-get install 编译依赖")
+	deps := ovpnSrcDeps(d.Family)
+	if len(deps) == 0 {
+		fail(bStepDeps, "%s 家族没有给定的依赖包名表", d.Family)
+		return
+	}
+	if err := runUpgradeSteps(deps); err != nil {
+		fail(bStepDeps, "%v", err)
+		return
+	}
+	// 这一步报的是真装了哪些包，不在这里另抄一份清单——少写一个 lzo 就是白跑十几分钟
+	var pkgs []string
+	if len(deps) > 1 && len(deps[1]) > 4 {
+		pkgs = deps[1][4:]
+	}
+	done(bStepDeps, strings.Join(pkgs, " / "))
+
+	// 3) 下载
 	job.Set(bStepDownload, "running", "")
 	if err := os.MkdirAll(ovpnSrcStateDir, 0755); err != nil {
 		fail(bStepDownload, "%v", err)
@@ -531,7 +551,7 @@ func runOpenVPNSourceBuild(job *Job, ver, tarURL, ascURL, digest string) {
 	}
 	done(bStepDownload, ovpnSrcTarName(ver)+" + .asc")
 
-	// 3) 摘要
+	// 4) 摘要
 	job.Set(bStepDigest, "running", "")
 	got, err := sha256File(tarPath)
 	if err != nil {
@@ -544,7 +564,7 @@ func runOpenVPNSourceBuild(job *Job, ver, tarURL, ascURL, digest string) {
 	}
 	done(bStepDigest, shortDigest(got))
 
-	// 4) 验签
+	// 5) 验签
 	job.Set(bStepSign, "running", "下载官方签名公钥")
 	signer, err := verifyOpenVPNTarball(tarPath, ascPath)
 	if err != nil {
@@ -552,24 +572,6 @@ func runOpenVPNSourceBuild(job *Job, ver, tarURL, ascURL, digest string) {
 		return
 	}
 	done(bStepSign, "主钥匙 "+shortFingerprint(ovpnSrcSigners[0])+" 的子钥匙 "+shortFingerprint(signer))
-
-	// 5) 依赖
-	job.Set(bStepDeps, "running", "apt-get update && apt-get install 编译依赖")
-	deps := ovpnSrcDeps(d.Family)
-	if len(deps) == 0 {
-		fail(bStepDeps, "%s 家族没有给定的依赖包名表", d.Family)
-		return
-	}
-	if err := runUpgradeSteps(deps); err != nil {
-		fail(bStepDeps, "%v", err)
-		return
-	}
-	// 这一步报的是真装了哪些包，不在这里另抄一份清单——少写一个 lzo 就是白跑十几分钟
-	var pkgs []string
-	if len(deps) > 1 && len(deps[1]) > 4 {
-		pkgs = deps[1][4:]
-	}
-	done(bStepDeps, strings.Join(pkgs, " / "))
 
 	// 6) 解包
 	job.Set(bStepUnpack, "running", "")
@@ -673,14 +675,16 @@ func openvpnSrcPlan(ver, family string) string {
 	if !ovpnSrcVersionOK(ver) {
 		return ""
 	}
-	lines := []string{
-		fmt.Sprintf("下载 https://github.com/%s/releases/download/v%s/%s 和签名 %s",
-			openvpnReleaseRepo, ver, ovpnSrcTarName(ver), ovpnSrcTarName(ver)+".asc"),
-		"核对 GitHub 给的 sha256，再用 OpenVPN 官方主钥匙 " + shortFingerprint(ovpnSrcSigners[0]) + " 验签名",
-	}
+	// 顺序就是 runOpenVPNSourceBuild 真跑的顺序：先把 gnupg 装上，才轮得到验签那一步
+	var lines []string
 	for _, s := range ovpnSrcDeps(family) {
 		lines = append(lines, strings.Join(s, " "))
 	}
+	lines = append(lines,
+		fmt.Sprintf("下载 https://github.com/%s/releases/download/v%s/%s 和签名 %s",
+			openvpnReleaseRepo, ver, ovpnSrcTarName(ver), ovpnSrcTarName(ver)+".asc"),
+		"核对 GitHub 给的 sha256，再用 OpenVPN 官方主钥匙 "+shortFingerprint(ovpnSrcSigners[0])+" 验签名",
+	)
 	lines = append(lines,
 		strings.Join(ovpnSrcConfigureArgv(ovpnSrcPrefix(ver)), " "),
 		fmt.Sprintf("make -j%d && make install", ovpnSrcMakeJobs(runtime.NumCPU())),

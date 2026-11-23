@@ -211,6 +211,22 @@ func TestOvpnSrcRecipeMirrorsWorkflow(t *testing.T) {
 	}
 }
 
+func TestOvpnSrcStepOrder(t *testing.T) {
+	// 标签按下标取用（job.Set(bStepX, …)），标签表和常量错位就会把进度显示到别的步骤上
+	if len(openvpnBuildSteps) != int(bStepInstall)+1 {
+		t.Fatalf("标签有 %d 条，常量到 %d，对不上", len(openvpnBuildSteps), bStepInstall)
+	}
+	if bStepDeps > bStepSign {
+		t.Errorf("装依赖（gnupg 在这里）必须排在验签前面，得到 deps=%d sign=%d", bStepDeps, bStepSign)
+	}
+	if openvpnBuildSteps[bStepDeps] != "装编译依赖" {
+		t.Errorf("第 %d 步的标签不对：%s", bStepDeps, openvpnBuildSteps[bStepDeps])
+	}
+	if openvpnBuildSteps[bStepSign] != "用 OpenVPN 官方钥匙验签" {
+		t.Errorf("第 %d 步的标签不对：%s", bStepSign, openvpnBuildSteps[bStepSign])
+	}
+}
+
 func TestOvpnSrcConfigureArgv(t *testing.T) {
 	argv := ovpnSrcConfigureArgv(ovpnSrcPrefix("2.7.9"))
 	joined := strings.Join(argv, " ")
@@ -383,6 +399,13 @@ func TestOvpnSrcPlan(t *testing.T) {
 	}
 	if openvpnSrcPlan("2.7~alpha1", "deb") != "" {
 		t.Error("非法版本号不该生成计划")
+	}
+	// 摊给人看的顺序必须就是真跑的顺序：gnupg 在依赖表里，装依赖就得排在验签前面
+	iDeps := strings.Index(plan, "apt-get update -qq")
+	iDl := strings.Index(plan, "下载 https://github.com")
+	iSign := strings.Index(plan, "验签名")
+	if !(iDeps >= 0 && iDeps < iDl && iDl < iSign) {
+		t.Errorf("计划顺序应是一条直线 装依赖→下载→验签，实际 %d/%d/%d", iDeps, iDl, iSign)
 	}
 	// 非 deb 没有依赖表，就不该编出一份"看起来能跑"的步骤
 	if p := openvpnSrcPlan("2.7.9", "rpm"); strings.Contains(p, "apt-get") {

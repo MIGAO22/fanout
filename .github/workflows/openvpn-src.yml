@@ -40,11 +40,22 @@ jobs:
         id: rel
         env:
           INPUT_VER: ${{ github.event.inputs.version }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
+          # 匿名打 api.github.com 是 60 次/小时且按出口 IP 算，共享 runner 的 IP 会被别人用光
+          # （第三轮之后有一次就是这么红的）。带上本次运行的 token 就有 5000/小时。
+          # 真实程序里没有 token，这一步只是为了让配方跑得动，不改变它验的东西。
           api() {
+            local code out
             for i in 1 2 3 4 5; do
-              if out=$(curl -fsSL --max-time 60 "https://api.github.com/$1"); then printf '%s' "$out"; return 0; fi
+              out=$(mktemp)
+              code=$(curl -sS --max-time 60 -o "$out" -w '%{http_code}' \
+                -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/$1" || echo 000)
+              if [ "$code" = "200" ]; then cat "$out"; rm -f "$out"; return 0; fi
+              echo "第 $i 次拿 $1 → HTTP $code" >&2
+              rm -f "$out"
               sleep 4
             done
             echo "拿不到 $1" >&2; return 1
