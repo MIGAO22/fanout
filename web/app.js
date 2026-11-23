@@ -178,13 +178,91 @@ $('#themeBtn').onclick = () =>
 $('#logoutBtn').onclick = async () => {
   if(!confirm('退出登录？出口和节点链接都在服务端继续跑，只是关掉这个管理页面。')) return;
   // 轮询先停：退出之后每个 tick 都会撞上 401，那会让 api() 把页面整页重载回登录壳，
-  // 在跳转途中多闪一次不说，还可能把退出请求本身打断。
+  // 在跳转途中多闪一次不说，还可能把退出请求本身打断。负载那条小轮询也一样。
   clearTimeout(pollTimer);
+  if(statTimer) clearInterval(statTimer);
   try{ await api('logout', { method: 'POST' }); }catch(e){ /* 会话本来就没了也算退出成功 */ }
   location.href = 'login';
 };
 
+/* ───────────── 顶栏主机负载 ───────────── */
+
+// 独立于 poll() 的一条小轮询：负载数字要的是"现在"，
+// 跟着出口状态一起刷会被拖到 4 秒一次，看着就像卡住了。
+const STAT_MS = 2500;
+let statTimer = null;
+let statBusy = false;
+
+function fmtGB(b){
+  if(!b) return '0';
+  const g = b / 1073741824;
+  return (g >= 10 ? g.toFixed(0) : g.toFixed(1)) + 'G';
+}
+
+// 每个胶囊只写"怎么算的"，数字本身一律来自后端：
+// 前端不参与任何估算，否则页面和 SSH 里看到的对不上，比不显示更糟。
+function statDefs(s){
+  const cap = s.sock_cap || 0;
+  return [
+    {k:'CPU', pct:s.cpu, v:Math.round(s.cpu) + '%',
+     tip:'CPU 占用 ' + s.cpu.toFixed(1) + '%\n两次刷新之间的平均值，全部核心合起来算'},
+    {k:'内存', pct:s.mem_pct, v:fmtGB(s.mem_used) + '/' + fmtGB(s.mem_total),
+     tip:'内存 ' + fmtGB(s.mem_used) + ' / ' + fmtGB(s.mem_total)
+        + '（' + s.mem_pct.toFixed(1) + '%）\n按 MemTotal - MemAvailable 算，cache 可回收不算占用'},
+    {k:'交换', pct:s.swap_pct, v:s.swap_total ? fmtGB(s.swap_used) + '/' + fmtGB(s.swap_total) : '无',
+     off:!s.swap_total,
+     tip:s.swap_total ? '交换分区 ' + fmtGB(s.swap_used) + ' / ' + fmtGB(s.swap_total)
+                      + '（' + s.swap_pct.toFixed(1) + '%）\n开始吃交换通常意味着内存真不够了'
+                      : '这台机器没配交换分区'},
+    {k:'负载', pct:s.load_pct, v:s.load1.toFixed(2), opt:true,
+     tip:'1 / 5 / 15 分钟负载 = ' + s.load1.toFixed(2) + ' / ' + s.load5.toFixed(2)
+        + ' / ' + s.load15.toFixed(2) + '\n绿条按 ' + s.cores
+        + ' 核归一，100% 表示可运行任务刚好排满 CPU'},
+    {k:'TCP', pct:s.tcp_pct, v:String(s.tcp), opt:true,
+     tip:'在用 TCP socket ' + s.tcp + ' 个（含 TIME_WAIT）\n'
+        + '刻度是临时端口区间宽度' + (cap ? ' ' + cap + ' 个' : '（读不到）')
+        + '，只用来比较多少，不是硬上限'},
+    {k:'UDP', pct:s.udp_pct, v:String(s.udp), opt:true,
+     tip:'在用 UDP socket ' + s.udp + ' 个\nQUIC、DNS 这类流量都算在这里'},
+  ];
+}
+
+function renderStats(s){
+  $('#stats').innerHTML = statDefs(s).map(d => {
+    const pct = Math.max(0, Math.min(100, d.pct || 0));
+    const lvl = d.off ? ' off' : (pct >= 90 ? ' over' : (pct >= 75 ? ' hot' : ''));
+    // title 里的换行要转成实体：HTML 解析器会把属性值里的裸换行折成一个空格，
+    // 那样两行说明就糊成一行长文本了。
+    const tip = esc(d.tip).replace(/\n/g, '&#10;');
+    return '<span class="stat' + lvl + (d.opt ? ' opt' : '') + '" title="' + tip + '">'
+      + '<span class="k">' + esc(d.k) + '</span>'
+      + '<span class="bar"><i style="width:' + pct.toFixed(1) + '%"></i></span>'
+      + '<span class="v">' + esc(d.v) + '</span></span>';
+  }).join('');
+}
+
+function statsGone(msg){
+  $('#stats').innerHTML = '<span class="stat off" title="' + esc(msg) + '">'
+    + '<span class="k">负载</span><span class="v">—</span></span>';
+}
+
+async function tickStats(){
+  if(statBusy) return;
+  statBusy = true;
+  try{
+    renderStats(await api('/api/stats'));
+  }catch(e){
+    statsGone(e.message);
+  }finally{
+    // 渲染中途抛异常时也要放行：这个标志卡在 true，顶栏就再也不更新了
+    statBusy = false;
+  }
+}
+tickStats();
+statTimer = setInterval(() => { if(!document.hidden) tickStats(); }, STAT_MS);
+
 /* ───────────── 视图切换 ───────────── */
+
 
 const VIEWS = {
   dashboard:{ el:'#view-dashboard', title:'出口总览', sub:'每条出口 = 一个独立 netns 隧道 = 一个出口 IP' },

@@ -193,6 +193,27 @@ a:hover{text-decoration:underline}
 .topbar h1{font-size:15px;font-weight:650;margin:0;letter-spacing:-.15px;white-space:nowrap}
 .topbar .sub{font-size:12px;color:var(--text-3);white-space:nowrap}
 @media(max-width:640px){.topbar .sub{display:none}}
+
+/* —— 顶栏的主机负载胶囊 ——
+   胶囊里那条绿就是"占了多大比例"，右边数字是原始量：
+   只显示比例看不出 64G 机器上的 40% 和 1G 机器上的 40% 差多少。 */
+.stats{display:flex;align-items:center;gap:var(--sp-2);min-width:0}
+.stat{display:inline-flex;align-items:center;gap:7px;height:26px;padding:0 10px;flex:none;
+  border:1px solid var(--border);border-radius:var(--r-full);background:var(--surface);
+  box-shadow:var(--sh-1);white-space:nowrap}
+.stat .k{font-size:10.5px;font-weight:650;letter-spacing:.04em;color:var(--text-3)}
+.stat .bar{position:relative;width:42px;height:7px;border-radius:var(--r-full);
+  background:var(--surface-3);overflow:hidden}
+.stat .bar i{position:absolute;left:0;top:0;bottom:0;width:0;border-radius:var(--r-full);
+  background:var(--ok);transition:width var(--t),background var(--t)}
+.stat .v{font:600 11.5px/1 var(--mono);color:var(--text-2)}
+/* 阈值上色：绿是常态，黄了该看一眼，红了就是这台机器在打满 */
+.stat.hot .bar i{background:var(--warn)}
+.stat.over .bar i{background:var(--bad)}
+.stat.off{opacity:.5}
+@media(max-width:1240px){.stat.opt{display:none}}
+/* 侧栏收成抽屉后顶栏要腾出汉堡键的位置，负载条让位 */
+@media(max-width:860px){.stats{display:none}}
 .content{padding:var(--sp-6);max-width:1420px;width:100%;margin:0 auto;
   display:flex;flex-direction:column;gap:var(--sp-5)}
 .menu-btn{display:none}
@@ -771,6 +792,7 @@ html[data-theme="dark"] .scr{background:rgba(0,0,0,.62)}
       <div>
         <h1 id="pageTitle">出口总览</h1>
       </div>
+      <div class="stats" id="stats" aria-label="本机负载"></div>
       <div class="spacer"></div>
       <span class="fresh" id="fresh" title="状态刷新"><span class="d"></span><span id="freshTxt">连接中…</span></span>
       <button class="btn" id="refreshBtn" title="立即刷新">
