@@ -542,22 +542,204 @@ func TestReleaseTagNormalizes(t *testing.T) {
 	}
 }
 
-// 官方比包管理器能给到的新时那句解释：不说清就成了"明明有新版却说没有"，
-// 说错了又成了"你能升"结果装出来还是旧号。
-func TestOvpnUpstreamNote(t *testing.T) {
+// 装不到的时候那句解释。target 是发行版仓库和官方源两边取高的结果，
+// 说错了就成了"你能升"而实际装出来还是旧号。
+func TestOvpnGapNote(t *testing.T) {
 	cases := []struct {
-		installed, repo, upstream, want string
+		family, have, target, upstream, want string
 	}{
-		{"2.6.19", "2.6.19-0ubuntu0.24.04.5", "2.7.9",
-			"包管理器最高只到 2.6.19-0ubuntu0.24.04.5，官方 2.7.9 得走 OpenVPN 自己的源（swupdate.openvpn.net）"},
-		{"2.6.14", "2.6.14-0+deb12u2", "2.7.9",
-			"包管理器最高只到 2.6.14-0+deb12u2，官方 2.7.9 得走 OpenVPN 自己的源（swupdate.openvpn.net）"},
-		{"2.6.14", "2.7.9-1", "2.7.9", ""}, // 仓库已经追平官方，没话要说
-		{"2.6.14", "", "2.7.9", ""},        // 仓库号问不到时不猜
+		{"deb", "2.7.0", "2.7.1", "2.7.9",
+			"这台机器上装得到的最高是 2.7.1；官方 2.7.9 的 apt 源里没有适配本机发行版的包"},
+		// 仓库号带发行版后缀（2.6.20-1ubuntu1），那串不是版本号的一部分，别贴进界面
+		{"deb", "2.6.14", "2.6.20-1ubuntu1", "2.7.9",
+			"这台机器上装得到的最高是 2.6.20；官方 2.7.9 的 apt 源里没有适配本机发行版的包"},
+		// 仓库里那个号剥掉后缀就是本机版本 → 等于没有可升的，得说第二句
+		{"deb", "2.6.19", "", "2.7.9",
+			"发行版仓库和 OpenVPN 官方 apt 源里都没有比 2.6.19 更新的包，官方 2.7.9 这台机器装不到"},
+		{"deb", "2.6.14", "2.7.9-1", "2.7.9", ""},    // 装得到的号已追平官方，没话要说
+		{"deb", "2.7.9", "", "2.7.9", ""},            // 本机就是官方最新
+		{"deb", "2.6.14", "2.6.20-1ubuntu1", "", ""}, // 没问到官方号时不编造版本号
+		// rpm/alpine/arch/suse 只问过本机仓库，官方在非 deb 上另有 Copr，
+		// 所以这几家永远不该冒出「只能自己编译」「没有二进制包」这种替官方下的结论
+		{"rpm", "2.6.12", "2.6.19", "2.7.9",
+			"本机源里最高只有 2.6.19；官方 2.7.9 得另接 OpenVPN 的源（RHEL 系在 Copr @OpenVPN/openvpn-release-2.7）"},
+		{"rpm", "2.6.12", "", "2.7.9",
+			"本机源里没有比 2.6.12 更新的 openvpn；官方 2.7.9 得另接 OpenVPN 的源（RHEL 系在 Copr @OpenVPN/openvpn-release-2.7）"},
+		{"arch", "2.6.14", "", "2.7.9",
+			"本机源里没有比 2.6.14 更新的 openvpn；官方 2.7.9 得另接 OpenVPN 的源（RHEL 系在 Copr @OpenVPN/openvpn-release-2.7）"},
 	}
 	for _, c := range cases {
-		if got := ovpnUpstreamNote(c.installed, c.repo, c.upstream); got != c.want {
-			t.Errorf("ovpnUpstreamNote(%q,%q,%q) = %q, 想 %q", c.installed, c.repo, c.upstream, got, c.want)
+		if got := ovpnGapNote(c.family, c.have, c.target, c.upstream); got != c.want {
+			t.Errorf("ovpnGapNote(%q,%q,%q,%q) = %q, 想 %q", c.family, c.have, c.target, c.upstream, got, c.want)
+		}
+	}
+	// 什么可升的都没有时，不能只说"装得到的最高是 2.6.14…"——那已经是本机版本了
+	if got := ovpnGapNote("deb", "2.6.14", "", "2.7.9"); !strings.Contains(got, "这台机器装不到") {
+		t.Errorf("没有可升目标时的说法应当落在「这台机器装不到」，得到 %q", got)
+	}
+	// 取高取到的是本机自己（剥掉后缀同号）时同样不许编出升级空间
+	if got := ovpnGapNote("rpm", "2.6.12", "2.6.12-1.el9", "2.7.9"); !strings.Contains(got, "另接 OpenVPN 的源") {
+		t.Errorf("rpm 只该说本机源里没有，得到 %q", got)
+	}
+}
+
+func TestDebArch(t *testing.T) {
+	for goarch, want := range map[string]string{
+		"amd64": "amd64", "x86_64": "amd64", "arm64": "arm64", "aarch64": "arm64", "386": "i386",
+		"mips64le": "", "riscv64": "", "arm": "",
+	} {
+		if got := debArch(goarch); got != want {
+			t.Errorf("debArch(%q) = %q, 想 %q", goarch, got, want)
+		}
+	}
+}
+
+// codename 要进 URL、也要写进 apt 的配置文件，所以形状必须卡死。
+func TestValidDebCodename(t *testing.T) {
+	ok := []string{"noble", "bookworm", "resolute", "sid", "trixie", "ubuntu_24.04", "jammy-backports"}
+	bad := []string{"", "-noble", ".noble", "NOBLE", "no ble", "../../etc/apt/sources.list", "noble;rm", "a b", strings.Repeat("x", 33)}
+	for _, s := range ok {
+		if !validDebCodename(s) {
+			t.Errorf("%q 该认成合法代号", s)
+		}
+	}
+	for _, s := range bad {
+		if validDebCodename(s) {
+			t.Errorf("%q 不该被当成合法代号", s)
+		}
+	}
+}
+
+func TestDebCodenameFallsBackToUbuntuBase(t *testing.T) {
+	// Mint / Pop!_OS 不写 VERSION_CODENAME，只有 UBUNTU_CODENAME——那正是 apt 基座的代号
+	if got := debCodename(parseOSRelease("ID=linuxmint\nUBUNTU_CODENAME=noble\n")); got != "noble" {
+		t.Errorf("Mint 该退回 UBUNTU_CODENAME，得到 %q", got)
+	}
+	if got := debCodename(parseOSRelease("VERSION_CODENAME=resolute\n")); got != "resolute" {
+		t.Errorf("优先用 VERSION_CODENAME，得到 %q", got)
+	}
+	if got := debCodename(parseOSRelease("ID=debian\n")); got != "" {
+		t.Errorf("两个都没有就该返回空，得到 %q", got)
+	}
+	if got := debCodename(parseOSRelease("VERSION_CODENAME=\"2; wget x|sh\"\n")); got != "" {
+		t.Errorf("非法形状不该被放行，得到 %q", got)
+	}
+}
+
+// 索引里的号必须剥掉发行版后缀才能和本机比；带 ~ 的是 alpha/beta/rc，
+// 一个"升到官方最新"的按钮不该把它们悄悄装上去。
+func TestDebStableVer(t *testing.T) {
+	yes := map[string]string{
+		"2.7.1-resolute1": "2.7.1", "2.6.10-noble0": "2.6.10",
+		"2.6.16-questing0": "2.6.16", "2.7.9": "2.7.9",
+	}
+	no := []string{"2.7~alpha1-bookworm0", "2.7~rc1-questing1", "2.6-beta1-focal0", "1:2.7.1-1", "", "-resolute1", "2.x.1-foo0", "2..1-x"}
+	for in, want := range yes {
+		v, ok := debStableVer(in)
+		if !ok || v != want {
+			t.Errorf("debStableVer(%q) = %q,%v，想 %q,true", in, v, ok, want)
+		}
+	}
+	for _, in := range no {
+		if v, ok := debStableVer(in); ok {
+			t.Errorf("debStableVer(%q) 该判成不可用，得到 %q", in, v)
+		}
+	}
+}
+
+// Packages 索引里 openvpn-systemd-resolved、openvpn-auth-ldap 都在，
+// 按行乱抓会把插件版本当成 openvpn 本体的。
+func TestParseDebPkgVersion(t *testing.T) {
+	blob := "Package: openvpn-auth-ldap\nVersion: 0.0.5-1\n\n" +
+		"Package: openvpn-systemd-resolved\nVersion: 1.3.1-1\n\n" +
+		"Package: openvpn\r\nVersion: 2.7.1-resolute1\r\nDepends: libc6\r\n\r\n" +
+		"Package: openvpn-dco-dkms\nVersion: 0.2-1\n"
+	if got := parseDebPkgVersion(blob, "openvpn"); got != "2.7.1-resolute1" {
+		t.Errorf("该取到 openvpn 自己那条记录，得到 %q", got)
+	}
+	if got := parseDebPkgVersion(blob, "openvpn-systemd-resolved"); got != "1.3.1-1" {
+		t.Errorf("按全名也该能取到，得到 %q", got)
+	}
+	if got := parseDebPkgVersion(blob, "openvpn-nope"); got != "" {
+		t.Errorf("没有的包该返回空，得到 %q", got)
+	}
+}
+
+// 官方源探测用真实索引形状过一遍：resolute 上 release/2.7 有 2.7.1（真能升），
+// noble 上只有 2.7~alpha1 而 Ubuntu 自己已经发 2.6.19（升了反而降级，不给接源）。
+func TestOvpnAptRepoVer(t *testing.T) {
+	index := map[string]string{
+		ovpnAptBase + "/release/2.7/dists/resolute/main/binary-amd64/Packages": "Package: openvpn\nVersion: 2.7.1-resolute1\n",
+		ovpnAptBase + "/stable/dists/resolute/main/binary-amd64/Packages":      "Package: openvpn\nVersion: 2.6.20-resolute0\n",
+		ovpnAptBase + "/release/2.7/dists/noble/main/binary-amd64/Packages":    "Package: openvpn\nVersion: 2.7~alpha1-noble0\n",
+		ovpnAptBase + "/stable/dists/noble/main/binary-amd64/Packages":         "Package: openvpn\nVersion: 2.6.10-noble0\n",
+	}
+	fetch := func(u string) (string, error) {
+		if blob, ok := index[u]; ok {
+			return blob, nil
+		}
+		return "", errors.New("HTTP 404")
+	}
+	if ch, off, why := ovpnAptRepoVer("resolute", "amd64", "2.7.0", fetch); ch != "release/2.7" || off != "2.7.1" || why != "" {
+		t.Errorf("resolute 该挑中 release/2.7 的 2.7.1，得到 %q/%q/%q", ch, off, why)
+	}
+	ch, off, why := ovpnAptRepoVer("noble", "amd64", "2.6.19", fetch)
+	if ch != "" || off != "2.6.10" || !strings.Contains(why, "不比本机新") {
+		t.Errorf("noble 上官方源只有 2.6.10，该报数不给通道，得到 %q/%q/%q", ch, off, why)
+	}
+	if ch, off, why := ovpnAptRepoVer("", "amd64", "2.6.19", fetch); ch != "" || off != "" || why == "" {
+		t.Errorf("没有代号时不该去接源，得到 %q/%q/%q", ch, off, why)
+	}
+	if ch, off, _ := ovpnAptRepoVer("bullseye", "arm64", "2.5.4", fetch); ch != "" || off != "" {
+		t.Errorf("探不到的 codename 该老实说没有，得到 %q/%q", ch, off)
+	}
+	if ch, off, _ := ovpnAptRepoVer("noble", "amd64", "2.6.19", nil); ch != "" || off != "" {
+		t.Errorf("没给 fetch 时不去联网，得到 %q/%q", ch, off)
+	}
+}
+
+// 目标版本从哪边来，决定了要不要往用户机器上写 apt 配置——号一样时必须选发行版仓库。
+func TestOpenvpnPickTarget(t *testing.T) {
+	cases := []struct {
+		have, repo, official, wantT, wantCh string
+	}{
+		{"2.7.0", "2.6.20-resolute0", "2.7.1", "2.7.1", "release/2.7"}, // 官方源更高 → 接源
+		{"2.6.19", "2.6.20-ubuntu1", "2.6.10", "2.6.20-ubuntu1", ""},   // 仓库更高 → 不接源
+		{"2.6.19", "2.7.1-1", "2.7.1", "2.7.1-1", ""},                  // 一样高 → 少留一个第三方源
+		{"2.6.19", "2.6.19-0ubuntu0.24.04.5", "2.6.10", "", ""},        // 两边都不比本机新
+		{"2.7.9", "2.7.9-1", "2.7.9", "", ""},                          // 已经是官方最新，不给按钮
+	}
+	for _, c := range cases {
+		tg, ch := openvpnPickTarget(c.have, c.repo, c.official, c.wantCh)
+		if tg != c.wantT || ch != c.wantCh {
+			t.Errorf("openvpnPickTarget(%q,%q,%q) = %q/%q，想 %q/%q",
+				c.have, c.repo, c.official, tg, ch, c.wantT, c.wantCh)
+		}
+	}
+}
+
+func TestOvpnAptRepoLine(t *testing.T) {
+	got := ovpnAptRepoLine("release/2.7", "amd64", "resolute")
+	want := "deb [arch=amd64 signed-by=" + ovpnAptKeyring + "] " + ovpnAptBase + "/release/2.7 resolute main\n"
+	if got != want {
+		t.Errorf("源该行形状不对：\n got %q\nwant %q", got, want)
+	}
+	// 钉死 signed-by：写进全局信任会把别的源也一起信了
+	if !strings.Contains(got, "signed-by=") || !strings.Contains(got, "arch=amd64") {
+		t.Errorf("必须带 arch 和 signed-by：%q", got)
+	}
+}
+
+// 写进 apt 配置的三个输入都来自机器/网络，任何一个不能是任意字符串。
+func TestInstallOpenvpnAptRepoRejectsJunk(t *testing.T) {
+	for _, c := range []struct{ channel, arch, codename string }{
+		{"release/2.6", "amd64", "resolute"}, // 没在白名单里的通道
+		{"stable", "amd64", "resolute; rm -rf /"},
+		{"stable", "", "resolute"},
+		{"stable", "amd64", ""},
+	} {
+		if err := installOpenvpnAptRepo(c.channel, c.arch, c.codename); err == nil {
+			t.Errorf("installOpenvpnAptRepo(%q,%q,%q) 该拒绝，却写下去了", c.channel, c.arch, c.codename)
 		}
 	}
 }

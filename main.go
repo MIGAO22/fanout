@@ -198,6 +198,7 @@ func main() {
 	mux.HandleFunc("/api/client/status", apiClientStatus)
 	mux.HandleFunc("/api/client/xray/apply", apiClientXrayApply)
 	mux.HandleFunc("/api/client/openvpn/apply", apiClientOpenVPNApply)
+	mux.HandleFunc("/api/client/openvpn/repo", apiClientOpenVPNRepo)
 
 	log.Printf("管理界面: http://<本机IP>%s%s/", webCfg.listenAddrString(), currentBasePath())
 	log.Printf("SOCKS5 端口在 %d-%d 之间随机分配", randPortMin, randPortMax)
@@ -501,6 +502,33 @@ func apiClientOpenVPNApply(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "message": msg})
+}
+
+// apiClientOpenVPNRepo 撤销 OpenVPN 官方 apt 源。
+//
+// 接源这一步「升级」按钮里会自动做，这里只负责撤：既然在用户机器上留下了第三方源
+// 和一把签名钥匙，就得留下等号的撤销动作，而不是只写在 README 里让人自己找文件。
+// 只删 fanout 自己那两份文件，用户照官方 wiki 手动配的东西不在这儿。
+func apiClientOpenVPNRepo(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "用 POST"})
+		return
+	}
+	if r.URL.Query().Get("off") != "1" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "接官方源由「升级 openvpn」完成，这个接口只负责撤销"})
+		return
+	}
+	if !openvpnAptRepoOurs() {
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true,
+			"message": "fanout 名下没有官方源文件（你自己按 wiki 配的那份不归它管，要撤就删你加的那个文件）"})
+		return
+	}
+	if err := removeOpenvpnAptRepo(); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true,
+		"message": "已删掉 fanout 写的官方源和签名钥匙，包索引也刷过一遍；已在跑的隧道不受影响"})
 }
 
 // apiExits 返回主界面需要的一切：出口以及挂在它上面的入站。

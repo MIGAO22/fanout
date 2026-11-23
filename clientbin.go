@@ -3,8 +3,11 @@ package main
 import (
 	"archive/zip"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -69,14 +72,37 @@ func releaseLatestTag(repo string) (string, error) {
 	return t, nil
 }
 
-// ovpnUpstreamNote 只在官方比包管理器能给到的还新时给一句话：这时候「升级 openvpn」
-// 装出来的版本号确实比界面那个官方号旧，不解释清楚就成了新的"明明有新版却说没有"。
-// 仓库号问不到（空）时不猜。
-func ovpnUpstreamNote(installed, repo, upstream string) string {
-	if repo == "" || !versionLess(repo, upstream) {
+// ovpnGapNote 解释「上游已经 2.7.9 了，可这台机器上装不到」这个差。
+// 差的原因必须是查出来的、不是猜的：deb 家族两边都问过了（发行版仓库 + OpenVPN
+// 官方 apt 源），两个都不够才敢说这台机器装不到。rpm/alpine/arch 只问了自己仓库，
+// 官方在非 deb 上另有发布渠道（RHEL 系是 Fedora Copr 的 @OpenVPN/openvpn-release-2.7，
+// 见 community.openvpn.net 的 software repos 页），所以那句只能说"没在本机源里"，
+// 不能替人家宣布没有二进制包。本机已经追平上游时一句都不说——那时候没有差要解释。
+func ovpnGapNote(family, have, target, upstream string) string {
+	if upstream == "" || !versionLess(have, upstream) {
 		return ""
 	}
-	return fmt.Sprintf("包管理器最高只到 %s，官方 %s 得走 OpenVPN 自己的源（swupdate.openvpn.net）", repo, upstream)
+	if target != "" && !versionLess(target, upstream) {
+		return "" // 按钮就能装到官方最新，没有差要解释
+	}
+	if family == "deb" {
+		if target != "" {
+			return fmt.Sprintf("这台机器上装得到的最高是 %s；官方 %s 的 apt 源里没有适配本机发行版的包", plainVersion(target), upstream)
+		}
+		return fmt.Sprintf("发行版仓库和 OpenVPN 官方 apt 源里都没有比 %s 更新的包，官方 %s 这台机器装不到", have, upstream)
+	}
+	if target != "" {
+		return fmt.Sprintf("本机源里最高只有 %s；官方 %s 得另接 OpenVPN 的源（RHEL 系在 Copr @OpenVPN/openvpn-release-2.7）", plainVersion(target), upstream)
+	}
+	return fmt.Sprintf("本机源里没有比 %s 更新的 openvpn；官方 %s 得另接 OpenVPN 的源（RHEL 系在 Copr @OpenVPN/openvpn-release-2.7）", have, upstream)
+}
+
+// plainVersion 去掉 Debian 版本号跟在 - / + 后面的发行版修订（2.6.20-1ubuntu1 → 2.6.20）。
+// 那串是打包者写的，跟"哪个版本"无关，贴进界面只会占地方。
+func plainVersion(v string) string {
+	s, _, _ := strings.Cut(v, "-")
+	s, _, _ = strings.Cut(s, "+")
+	return s
 }
 
 // ClientBinStatus 是界面「内置客户端」这张卡要的全部信息。
@@ -93,21 +119,30 @@ type ClientBinStatus struct {
 
 	// openvpn 有两个"最新版"，得分开给，之前只给前者才闹出三台机器三个"最新版"：
 	//   upstream 是 GitHub 上 OpenVPN/openvpn 的官方 release，跟机器无关，三台问出来同一个号；
-	//   latest 是本机包管理器实际能给到的版本，它决定「升级 openvpn」那颗按钮装到哪。
+	//   target 是这台机器真能装到的最高号——发行版仓库和 OpenVPN 官方 apt 源两边问完取高的，
+	//   「升级 openvpn」装的就是它。之前只问发行版仓库，才会出现官方源明明有 2.7.1、
+	//   界面却指着 2.6.x 说"升不动"。
 	OvpnFamily string `json:"openvpn_family,omitempty"` // deb / rpm / alpine / arch / suse
 	OvpnCmd    string `json:"openvpn_cmd,omitempty"`
 	OvpnUpdate bool   `json:"openvpn_updatable"` // 认得出家族、机器上有对应的包管理器
 	OvpnWhy    string `json:"openvpn_reason,omitempty"`
 	OvpnLatest string `json:"openvpn_latest,omitempty"`
-	OvpnHas    bool   `json:"openvpn_has_update"` // 仓库那份确实比本机新
+	OvpnHas    bool   `json:"openvpn_has_update"` // 有比本机更新的、且装得到
 	// 索引没刷动时仓库版本号只能来自本机那份旧索引，这时"已是最新"是句假话，
 	// 界面必须换个说法（VPS 上几个月不 apt-get update、或者 apt 正被自动更新占用）
 	OvpnStale bool `json:"openvpn_stale,omitempty"`
 
 	OvpnUpstream string `json:"openvpn_upstream,omitempty"` // 官方 release 版本号，已去掉 tag 的 v
 	OvpnBehind   bool   `json:"openvpn_behind_upstream"`    // 本机比官方 release 旧
-	// 官方比仓库能装到的还新时那句解释，界面直接摆出来，不在前端比版本号
+	// 官方 release 比这台机器能装到的还新时那句解释，界面直接摆出来，不在前端比版本号
 	OvpnNote string `json:"openvpn_note,omitempty"`
+
+	OvpnTarget   string `json:"openvpn_target,omitempty"`     // 点升级会装到的号，空=没有可升的
+	OvpnOfficial string `json:"openvpn_official,omitempty"`   // OpenVPN 官方 apt 源在本机发行版上的最高稳定号
+	OvpnFromOff  bool   `json:"openvpn_from_official"`        // target 来自官方源而不是发行版仓库
+	OvpnWired    bool   `json:"openvpn_repo_wired,omitempty"` // 官方源已经在这台机器上配着
+	// 还没配、而升级又必须配时，将要写进 sources.list.d 的那一行；确认框原样摊开给人看
+	OvpnRepoLine string `json:"openvpn_repo_line,omitempty"`
 }
 
 // xrayAssetForArch 把 GOARCH 换成 Xray-core release 的资产名。
@@ -201,15 +236,20 @@ func clientBinStatus(askLatest bool) *ClientBinStatus {
 	} else {
 		st.Reason = err.Error()
 	}
+	var osRel string
 	st.OpenVPN = parseOpenVPNVersion(probeVersion("openvpn", "--version"))
 	if st.OpenVPN == "" {
 		st.OvpnWhy = "本机没有 openvpn，出口隧道起不来；先装一个（apt/apk install openvpn）"
 	} else if blob, err := os.ReadFile(osReleasePath); err != nil {
 		st.OvpnWhy = fmt.Sprintf("读 %s 失败，不知道该怎么升：", osReleasePath) + err.Error()
-	} else if steps, family, err := openvpnUpgradePlan(string(blob), hasCmd); err != nil {
-		st.OvpnWhy = err.Error()
 	} else {
-		st.OvpnFamily, st.OvpnUpdate, st.OvpnCmd = family, true, describeSteps(steps)
+		osRel = string(blob)
+		steps, family, err := openvpnUpgradePlan(osRel, hasCmd)
+		if err != nil {
+			st.OvpnWhy = err.Error()
+		} else {
+			st.OvpnFamily, st.OvpnUpdate, st.OvpnCmd = family, true, describeSteps(steps)
+		}
 	}
 
 	target, why := xrayUpdateTarget(wd, st.Path, st.Backend)
@@ -223,16 +263,19 @@ func clientBinStatus(askLatest bool) *ClientBinStatus {
 	// 先问本机包管理器，再打 GitHub：openvpn 的答案不依赖 GitHub，额度用尽时
 	// 这张卡至少还有一半是活的。
 	if st.OvpnUpdate && st.OpenVPN != "" {
-		ver, why, stale := openvpnRepoLatest(st.OvpnFamily, hasCmd)
-		st.OvpnLatest, st.OvpnStale = ver, stale
-		if ver == "" {
-			st.OvpnWhy = why
-		} else {
-			st.OvpnHas = versionLess(st.OpenVPN, ver)
-			if why != "" {
-				// 版本号有，但那是没刷动的索引给的，界面得换个说法
-				st.OvpnWhy = why
-			}
+		d := decideOpenVPNUpgrade(osRel, st.OpenVPN, hasCmd, fetchDebPackages, true)
+		st.OvpnLatest, st.OvpnStale = d.RepoVer, d.Stale
+		if d.RepoWhy != "" {
+			st.OvpnWhy = d.RepoWhy
+		}
+		st.OvpnOfficial, st.OvpnWired = plainVersion(d.Official), d.Wired
+		st.OvpnTarget, st.OvpnFromOff = plainVersion(d.Target), d.Channel != ""
+		st.OvpnHas = d.Target != ""
+		if d.NeedsWrite {
+			// 升级要先接官方源，确认框就得把这一行和 apt 命令一起摊开
+			st.OvpnRepoLine = ovpnAptRepoLine(d.Channel, d.Arch, d.Codename)
+			st.OvpnCmd = fmt.Sprintf("写入 %s（OpenVPN 官方签名密钥）\n写入 %s：\n  %s\n%s",
+				ovpnAptKeyring, ovpnAptSources, st.OvpnRepoLine, describeSteps(d.Steps))
 		}
 	}
 	// 两份客户端的"最新版"都对接 GitHub 官方 release：Xray 是 XTLS/Xray-core，
@@ -257,7 +300,7 @@ func clientBinStatus(askLatest bool) *ClientBinStatus {
 	} else if st.OpenVPN != "" {
 		st.OvpnUpstream = ov
 		st.OvpnBehind = versionLess(st.OpenVPN, ov)
-		st.OvpnNote = ovpnUpstreamNote(st.OpenVPN, st.OvpnLatest, ov)
+		st.OvpnNote = ovpnGapNote(st.OvpnFamily, st.OpenVPN, st.OvpnTarget, ov)
 	}
 	return st
 }
@@ -827,10 +870,385 @@ func tailLines(s string, n int) string {
 	return strings.TrimSpace(strings.Join(lines, "\n"))
 }
 
-// applyOpenVPNUpdate 用发行版自己的包管理器把 openvpn 升到仓库里的最新版。
+// ───────────── OpenVPN 官方 apt 源（只有 deb 家族有二进制包） ─────────────
 //
-// 不在这里和谁比版本号：什么算最新由仓库说了算，比的是包管理器的事。
-// 升完再读一次版本，前后一致就是"已经是仓库里最新的"，这个结论有依据。
+// OpenVPN 项目自己给 Debian/Ubuntu 发包，仓库形状写在官方 wiki
+// 「Debian / Ubuntu: Using OpenVPN apt repositories」那一节：
+//
+//	deb [arch=amd64 signed-by=<keyring>] https://build.openvpn.net/debian/openvpn/<channel> <codename> main
+//
+// 别把它当"最新版"：这份源比 GitHub release 滞后得很厉害。实测（2026-11）
+// Ubuntu 26.04(resolute) 的 release/2.7 有 2.7.1，可 Ubuntu 24.04(noble) 的 stable
+// 只到 2.6.10 而 Ubuntu 自己发的是 2.6.19，Debian 12(bookworm) 的 stable 更是停在 2.6.0
+// ——不比版本就接上源装，会把后两台机器**降级**。所以这里只把它当另一个候选版本来源问，
+// 问到的号确实比本机高才用它，并且只碰 fanout 自己那两份文件。
+const (
+	ovpnAptBase   = "https://build.openvpn.net/debian/openvpn"
+	ovpnAptKeyURL = "https://swupdate.openvpn.net/repos/repo-public.gpg"
+	// 官方那把签名钥匙的指纹是 30EBF4E73CCE63EEE124DD278E6DA8B4E158C569（2011 年生成，
+	// 2030 年到期）。这里钉的是文件摘要：apt 一旦认了这把钥匙，源里发什么它就装什么，
+	// HTTPS 只证明没被改道、证明不了拿到的就是 OpenVPN 那把，所以先比摘要再交给 apt。
+	ovpnAptKeySHA256 = "1937b44fbdf4cbe0e187d25fda81dff000bfc9a614975cfb8db83e8945ce710d"
+	// 文件名带 fanout 前缀：用户自己照 wiki 手动配过的话两份东西互不影响，
+	// 撤销时也删得动我们写的那两份。
+	ovpnAptKeyring = "/etc/apt/keyrings/fanout-openvpn-repo-public.asc"
+	ovpnAptSources = "/etc/apt/sources.list.d/fanout-openvpn.list"
+	// 扫 sources 时用它判断"这台机器上已经有人配过官方源了"
+	ovpnAptMarker = "build.openvpn.net/debian/openvpn"
+)
+
+// ovpnAptChannels：release/2.7 是 2.7 线的发布通道，stable 只收稳定版。
+// 两条都问、取更高的稳定号——老 codename 上 release/2.7 只有 alpha/rc，
+// 新 codename 上 stable 还停在 2.6.x，只认一条都会漏。
+var ovpnAptChannels = []string{"release/2.7", "stable"}
+
+// debArch 把 GOARCH 换成 Debian 的架构名，官方源没建的一律返回空。
+func debArch(goarch string) string {
+	switch goarch {
+	case "amd64", "x86_64":
+		return "amd64"
+	case "arm64", "aarch64":
+		return "arm64"
+	case "386", "i386", "i686":
+		return "i386"
+	}
+	return ""
+}
+
+// validDebCodename 这个值会进 URL、也会写进 apt 的配置文件，只放行 /etc/os-release
+// 里正常会出现的形状（noble、bookworm、sid 这类），别把外面的字符串原样拼进去。
+func validDebCodename(s string) bool {
+	if s == "" || len(s) > 32 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		r := s[i]
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9', r == '_', r == '.':
+		case r == '-' && i > 0:
+		default:
+			return false
+		}
+	}
+	return s[0] != '-' && s[0] != '.'
+}
+
+// debCodename 取发行版代号。VERSION_CODENAME 是正主，衍生版（Mint、Pop!_OS）
+// 常常只写 UBUNTU_CODENAME——那恰好就是它们 apt 基座该用的代号。
+func debCodename(kv map[string]string) string {
+	for _, k := range []string{"VERSION_CODENAME", "UBUNTU_CODENAME"} {
+		if v := strings.ToLower(strings.TrimSpace(kv[k])); validDebCodename(v) {
+			return v
+		}
+	}
+	return ""
+}
+
+// debStableVer 把索引里的 Version（"2.7.1-resolute1"）换成能跟本机比的上游号。
+// Debian 的修订号在**最后一个**连字符后面，所以只能从那儿切：这个源上有
+// "2.6-beta1-focal0" 这种写法，从第一个切会把 "-beta1" 剪掉、把一个测试版
+// 读成稳定版 2.6。带 ~ 的（"2.7~alpha1-bookworm0"）和带 epoch 的不认——
+// 这些都该由人决定要不要装，不该由一个"升到官方最新"的按钮悄悄装上机器。
+func debStableVer(v string) (string, bool) {
+	up := v
+	if i := strings.LastIndexByte(v, '-'); i >= 0 {
+		up = v[:i]
+	}
+	if up == "" || strings.ContainsAny(up, "~:") {
+		return "", false
+	}
+	for _, seg := range strings.Split(up, ".") {
+		if seg == "" {
+			return "", false
+		}
+		for i := 0; i < len(seg); i++ {
+			if seg[i] < '0' || seg[i] > '9' {
+				return "", false
+			}
+		}
+	}
+	return up, true
+}
+
+// parseDebPkgVersion 从 apt 的 Packages 索引里取指定包那条记录的 Version。
+// 记录之间空行分隔，必须整段认 Package 名：同一份索引里还有
+// openvpn-systemd-resolved、openvpn-auth-ldap，按行找会抓到插件的版本。
+func parseDebPkgVersion(blob, pkg string) string {
+	for _, blk := range strings.Split(strings.ReplaceAll(blob, "\r\n", "\n"), "\n\n") {
+		name, ver := "", ""
+		for _, line := range strings.Split(blk, "\n") {
+			switch {
+			case strings.HasPrefix(line, "Package:"):
+				name = strings.TrimSpace(line[len("Package:"):])
+			case strings.HasPrefix(line, "Version:"):
+				ver = strings.TrimSpace(line[len("Version:"):])
+			}
+		}
+		if name == pkg {
+			return ver
+		}
+	}
+	return ""
+}
+
+// fetchDebPackages 拉一份 apt 索引。Go 的默认 transport 自带 Accept-Encoding
+// 并自动解压，所以直接读明文 Packages 就行（这个源上约 80 KB）。
+func fetchDebPackages(url string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("User-Agent", "fanout-clientbin")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+	blob, err := io.ReadAll(io.LimitReader(resp.Body, 24<<20))
+	if err != nil {
+		return "", err
+	}
+	if len(blob) == 0 {
+		return "", fmt.Errorf("索引是空的")
+	}
+	return string(blob), nil
+}
+
+// ovpnAptRepoVer 问 OpenVPN 官方源：本机这个 codename/arch 上最高能给到哪个稳定号。
+//
+// official 只要问到了就带回来（界面要说清"官方源在这里只到 2.6.10"这种话），
+// channel 只在它确实比本机新时才给——没东西可升却让用户去接一个第三方源是最坏的默认。
+func ovpnAptRepoVer(codename, arch, have string, fetch func(string) (string, error)) (channel, official, why string) {
+	switch {
+	case fetch == nil:
+		return "", "", ""
+	case !validDebCodename(codename):
+		return "", "", "/etc/os-release 里没有能用的发行版代号，不去接第三方源"
+	case arch == "":
+		return "", "", "OpenVPN 官方源没有本机这个 CPU 架构的构建"
+	}
+	for _, ch := range ovpnAptChannels {
+		blob, err := fetch(ovpnAptBase + "/" + ch + "/dists/" + codename + "/main/binary-" + arch + "/Packages")
+		if err != nil {
+			continue // 这条通道没有这个 codename（404）是常态，不算失败
+		}
+		v, ok := debStableVer(parseDebPkgVersion(blob, "openvpn"))
+		if !ok || v == "" {
+			continue
+		}
+		if official == "" || versionLess(official, v) {
+			official, channel = v, ch
+		}
+	}
+	switch {
+	case official == "":
+		return "", "", fmt.Sprintf("OpenVPN 官方源没有 %s/%s 的稳定版构建", codename, arch)
+	case !versionLess(have, official):
+		// 号照报，但不给通道：为了一个更低的版本去人家机器上写第三方源，
+		// 装下去还是降级
+		return "", official, fmt.Sprintf("OpenVPN 官方源在 %s 上最高只到 %s，不比本机新", codename, official)
+	}
+	return channel, official, ""
+}
+
+// openvpnPickTarget 在「发行版仓库」和「OpenVPN 官方源」两个号里挑最高的那个，
+// 并说清它来自哪边（channel 非空表示要先接官方源）。两个都不比本机新时返回空：
+// 宁可不给按钮，也不会给人一条把 openvpn 降级的命令。
+// 号一样时选发行版仓库——同样的结果，不必在机器上多留一个第三方源。
+func openvpnPickTarget(have, repoVer, official, officialCh string) (target, channel string) {
+	better := func(v string) bool { return v != "" && versionLess(have, v) }
+	if better(official) && (!better(repoVer) || versionLess(repoVer, official)) {
+		return official, officialCh
+	}
+	if better(repoVer) {
+		return repoVer, ""
+	}
+	return "", ""
+}
+
+// ovpnAptRepoLine 是要写进 sources.list.d 的那一行，形状照官方 wiki。
+// arch 和 signed-by 都钉死：不钉 arch 会在混装机器上白拉一堆索引，
+// 不钉 signed-by 就等于把钥匙塞进全局信任，别人机器的其它源也跟着受影响。
+func ovpnAptRepoLine(channel, arch, codename string) string {
+	return fmt.Sprintf("deb [arch=%s signed-by=%s] %s/%s %s main\n", arch, ovpnAptKeyring, ovpnAptBase, channel, codename)
+}
+
+// openvpnAptRepoWired 看官方源是否已经配在这台机器上，谁配的都算。
+// 已经配过还再写一份，apt 会重复拉同一份索引并警告，那是白添乱。
+func openvpnAptRepoWired() bool {
+	files := []string{ovpnAptSources, "/etc/apt/sources.list"}
+	if more, err := filepath.Glob("/etc/apt/sources.list.d/*.list"); err == nil {
+		files = append(files, more...)
+	}
+	for _, p := range files {
+		if blob, err := os.ReadFile(p); err == nil && strings.Contains(string(blob), ovpnAptMarker) {
+			return true
+		}
+	}
+	return false
+}
+
+// openvpnAptRepoHasChannel 看 fanout 那份文件里是不是已经写着这个通道的行。
+// 已经写过还再写一遍，等于把用户可能手工调过的那行覆盖掉。
+func openvpnAptRepoHasChannel(channel, codename string) bool {
+	blob, err := os.ReadFile(ovpnAptSources)
+	if err != nil {
+		return false
+	}
+	return strings.Contains(string(blob), ovpnAptBase+"/"+channel+" "+codename+" main")
+}
+
+// openvpnAptRepoOurs 只看 fanout 自己写的那份 sources 文件在不在——撤销只能撤自己写的。
+func openvpnAptRepoOurs() bool {
+	blob, err := os.ReadFile(ovpnAptSources)
+	return err == nil && strings.Contains(string(blob), ovpnAptMarker)
+}
+
+// installOpenvpnAptRepo 把官方源写进机器；调用方接着跑 apt-get update 才生效。
+func installOpenvpnAptRepo(channel, arch, codename string) error {
+	switch {
+	case !validDebAptChannel(channel):
+		return fmt.Errorf("未知的 OpenVPN 官方源通道 %q", channel)
+	case !validDebCodename(codename):
+		return fmt.Errorf("发行版代号 %q 不像话，拒绝写进 apt 配置", codename)
+	case arch == "":
+		return fmt.Errorf("没有对应的 Debian 架构名，拒绝写进 apt 配置")
+	}
+	dir := filepath.Dir(ovpnAptKeyring)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("建 %s 失败: %w", dir, err)
+	}
+	// 密钥先落到同目录的临时文件：同目录 Rename 才是原子的，而且校验不过时
+	// 那份正在被 apt 用的钥匙压根没被动过。
+	tmp, err := os.CreateTemp(dir, ".fanout-openvpn-key-*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmp.Name())
+	tmp.Close()
+	if err := downloadFile(ovpnAptKeyURL, tmp.Name()); err != nil {
+		return fmt.Errorf("下载 OpenVPN 官方源签名密钥失败: %w", err)
+	}
+	sum, err := fileSHA256(tmp.Name())
+	if err != nil {
+		return err
+	}
+	if sum != ovpnAptKeySHA256 {
+		return fmt.Errorf("官方源密钥的摘要对不上（期望 %s…，实际 %s…）：官方换过钥匙的话请升级 fanout，也可以按官方 wiki 手动配置",
+			ovpnAptKeySHA256[:12], shortDigest(sum))
+	}
+	if err := os.Chmod(tmp.Name(), 0o644); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp.Name(), ovpnAptKeyring); err != nil {
+		return fmt.Errorf("写入 %s 失败: %w", ovpnAptKeyring, err)
+	}
+	return os.WriteFile(ovpnAptSources, []byte(ovpnAptRepoLine(channel, arch, codename)), 0o644)
+}
+
+// shortDigest 取哈希前 12 位用于报错——整串贴进界面没人看得下去。
+func shortDigest(s string) string {
+	if len(s) < 12 {
+		return s
+	}
+	return s[:12]
+}
+
+// removeOpenvpnAptRepo 撤销：只删 fanout 自己写的那两份文件，别人按 wiki 配的不动。
+// 删完再刷一次索引，否则 apt 缓存里还留着这个源的包，看着像没撤干净。
+func removeOpenvpnAptRepo() error {
+	for _, p := range []string{ovpnAptSources, ovpnAptKeyring} {
+		if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("删 %s 失败: %w", p, err)
+		}
+	}
+	if !hasCmd("apt-get") {
+		return nil
+	}
+	_, err := runRefresh([]string{"apt-get", "update", "-qq"})
+	return err
+}
+
+func validDebAptChannel(ch string) bool {
+	for _, c := range ovpnAptChannels {
+		if c == ch {
+			return true
+		}
+	}
+	return false
+}
+
+func fileSHA256(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// openvpnDecision 是这张卡和「升级」按钮共用的唯一决策点：目标版本、要不要接官方源、
+// 跑哪几条命令，一次算清，两边读同一份结果。之前状态和执行各算各的，
+// 界面说的号和按钮真装上去的号可以不是同一个。
+type openvpnDecision struct {
+	Family      string
+	Steps       [][]string
+	RepoVer     string // 发行版仓库里的 openvpn 版本
+	RepoWhy     string
+	Stale       bool
+	Codename    string
+	Arch        string
+	Official    string // OpenVPN 官方源能给到的最高稳定号（可能不比本机新，界面要说这个数）
+	OfficialWhy string
+	Channel     string // 非空表示目标版本来自官方源
+	NeedsWrite  bool   // 需要接源、且这台机器上还没写着这一行
+	Target      string
+	Wired       bool
+	Why         string // 认不出家族/机器上没有对应的包管理器
+}
+
+func decideOpenVPNUpgrade(osRel, have string, hasCmd func(string) bool, fetch func(string) (string, error), ask bool) openvpnDecision {
+	steps, family, err := openvpnUpgradePlan(osRel, hasCmd)
+	d := openvpnDecision{Family: family, Steps: steps}
+	if err != nil {
+		d.Why = err.Error()
+		return d
+	}
+	if !ask {
+		return d
+	}
+	d.RepoVer, d.RepoWhy, d.Stale = openvpnRepoLatest(family, hasCmd)
+	if family == "deb" {
+		kv := parseOSRelease(osRel)
+		d.Codename, d.Arch = debCodename(kv), debArch(runtime.GOARCH)
+		ch, off, why := ovpnAptRepoVer(d.Codename, d.Arch, have, fetch)
+		d.Official, d.OfficialWhy, d.Channel = off, why, ch
+		d.Wired = openvpnAptRepoWired()
+	}
+	d.Target, d.Channel = openvpnPickTarget(have, d.RepoVer, d.Official, d.Channel)
+	// 别人（或上一次点按钮）已经把这一行写进去了就别再写一遍：
+	// 覆盖用户手工调过的 apt 配置是这里最不该干的事
+	d.NeedsWrite = d.Channel != "" && !openvpnAptRepoHasChannel(d.Channel, d.Codename)
+	return d
+}
+
+// applyOpenVPNUpdate 把 openvpn 升到本机装得到的最高版本。
+//
+// 「最高」是发行版仓库和 OpenVPN 官方 apt 源两边问完取高的：只看发行版仓库时，
+// Ubuntu 26.04 上官方明明发了 2.7.1，界面却只能报仓库里的 2.6.20，那还是
+// "明明有新版却说没有"。目标确实比本机新才会动接源那一步，其余情况一条 apt
+// 命令就够，不往机器上多留文件。
+//
+// 升完再读一次版本，前后一致就是"已经是本机能装到的最新版"，这个结论有依据。
 func applyOpenVPNUpdate() (string, error) {
 	openvpnApplyMu.Lock()
 	defer openvpnApplyMu.Unlock()
@@ -843,11 +1261,20 @@ func applyOpenVPNUpdate() (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("读 %s 失败: %w", osReleasePath, err)
 	}
-	steps, _, err := openvpnUpgradePlan(string(blob), hasCmd)
-	if err != nil {
-		return "", err
+	osRel := string(blob)
+	d := decideOpenVPNUpgrade(osRel, before, hasCmd, fetchDebPackages, true)
+	if d.Why != "" {
+		return "", fmt.Errorf("%s", d.Why)
 	}
-	if err := runUpgradeSteps(steps); err != nil {
+	wired := ""
+	if d.NeedsWrite {
+		if err := installOpenvpnAptRepo(d.Channel, d.Arch, d.Codename); err != nil {
+			return "", err
+		}
+		wired = fmt.Sprintf("（已接上 OpenVPN 官方源 %s，最高 %s；不想要就删掉 %s 和 %s 再 apt-get update）",
+			d.Channel, d.Official, ovpnAptSources, ovpnAptKeyring)
+	}
+	if err := runUpgradeSteps(d.Steps); err != nil {
 		return "", err
 	}
 	after := parseOpenVPNVersion(probeVersion("openvpn", "--version"))
@@ -855,9 +1282,13 @@ func applyOpenVPNUpdate() (string, error) {
 	case after == "":
 		return "", fmt.Errorf("升级后 openvpn 跑不起来了（升级前是 %s），请检查包管理器的输出", before)
 	case after == before:
-		return fmt.Sprintf("openvpn 已是仓库里的最新版 %s，没有变化。已在跑的隧道本来就用着它，不用管。", before), nil
+		return fmt.Sprintf("openvpn 已是本机装得到的最新版 %s，没有变化%s。已在跑的隧道本来就用着它，不用管。", before, wired), nil
+	case d.Target != "" && versionLess(after, d.Target):
+		// 包管理器升了一截却没到问到的那个号（依赖不满足、索引还没生效都可能），
+		// 这时候说"已升到目标版本"就是假话，按失败报出来并把当前版本写清
+		return "", fmt.Errorf("openvpn 只升到 %s（升级前 %s，预期 %s），包管理器的输出里有原因", after, before, d.Target)
 	default:
-		return fmt.Sprintf("openvpn 已从 %s 升到 %s。已在跑的隧道仍挂在旧进程上（进程不会被包管理器动到），"+
-			"新建出口、换节点或重启服务之后自然切到新版。", before, after), nil
+		return fmt.Sprintf("openvpn 已从 %s 升到 %s%s。已在跑的隧道仍挂在旧进程上（进程不会被包管理器动到），"+
+			"新建出口、换节点或重启服务之后自然切到新版。", before, after, wired), nil
 	}
 }

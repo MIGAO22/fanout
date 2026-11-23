@@ -28,8 +28,9 @@
   绿条是占用比例，右边是原始量，超过 75% 转黄、90% 转红（口径见下面「使用 → 顶栏负载」）。
   这一排单独占一行、装不下就横滑，手机上也能看到——之前窄屏是整排藏起来的。
 - 「设置与连接」里有一张「内置客户端」：卡上只留两份客户端的当前版本，点「检查更新」才报最新版号
-  （两份都问 GitHub 官方 release，openvpn 另外问一次本机包管理器），两份都能就地升级——Xray 由 fanout 换二进制，
-  openvpn 走系统包且只点它一个包（口径见下面「使用 → 内置客户端（Xray 与 openvpn）」）。
+  （两份都问 GitHub 官方 release，openvpn 另外问一次本机包管理器和 OpenVPN 官方 apt 源），两份都能就地升级——
+  Xray 由 fanout 换二进制，openvpn 走系统包且只点它一个包，本机仓库不够新时才会接一次官方源，
+  接了还给一键撤销（口径见下面「使用 → 内置客户端（Xray 与 openvpn）」）。
 - 顶部一行 KPI：在线出口（带完成度圆环）、可用节点、覆盖地区、母机 IP、节点链接。
 - 批量开出口时下面跟着作业卡片，每条目标的状态单独显示，不用刷整页。
 - 出口列表支持卡片 / 表格两种密度，可按「已连通 / 连接中 / 失败」筛，能搜 IP、国家、节点名。
@@ -126,7 +127,7 @@ Xray 到 `/var/lib/fanout/bin/`，装了则跳过，入站交给面板管。
 > 才生效：`f` → `3) 重启`（或 `f restart`）。`install.sh` 现在重装会显式
 > `systemctl restart`——以前用 `enable --now`，对已运行的单元是空操作，
 > 于是新二进制在磁盘上、老进程还在服务老界面。
-> 想确认手上是哪一份：`fanout -version`，本仓库显示 `v2.0.2`，上游原版是 `v1.3.1`。
+> 想确认手上是哪一份：`fanout -version`，本仓库显示 `v2.0.3`，上游原版是 `v1.3.1`。
 
 > **发新版本。** 推一个 `v*` tag 就会触发 release workflow 出 amd64 / arm64
 > 两个包和 checksums；不打 tag 就没有 Release，`releases/latest/download/...`
@@ -264,21 +265,54 @@ release（`XTLS/Xray-core`、`OpenVPN/openvpn`），tag 的 `v` 前缀会去掉�
 openvpn 版本、个个都叫最新"——那个号本来就不该被叫作"最新版"。现在三台问出来是同一个：
 `openvpn 2.6.14 · 上游 2.7.9`，追平了才说 `· 已是上游最新`。
 
-官方 release 只发源码包（`openvpn-2.7.9.tar.gz` 加一个 `.asc`），没有能直接装到机器上的二进制，
-所以「升级 openvpn」装的是**本机包管理器能给到的那个号**，按钮上写的就是它。问法仍然是先刷一次索引
+官方 release 只发源码包（`openvpn-2.7.9.tar.gz` 加一个 `.asc`），装不到机器上，所以按钮上那个号是**问出来的**：
+发行版仓库和 OpenVPN 官方 apt 源各问一次，两边取更高的那个，而且必须**严格比本机新**——
+一样高或者更旧就不给按钮，否则一次"升级"其实是往回降。问法仍然是先刷一次索引
 再读（`apt-get update -qq` / `dnf --refresh list` / `apk update` / `pacman -Sy` / `zypper refresh`，
 然后 `apt-cache policy` / `dnf list` / `apk policy` / `pacman -Si` / `zypper info`）——
 `apt-cache policy` 看的是磁盘上那份本地索引，几个月不跑 `apt-get update` 时 Candidate 永远等于已装版本。
 刷索引最常见的失败是撞锁（`Could not get lock /var/lib/apt/lists/lock ... held by process N`，
 自动更新正占着 apt），这种等一下就会自己好，所以撞锁会隔几秒再试一次；还不行就照实写"索引没刷新，
-仓库版本号可能偏旧"，不假装查到了。官方比仓库能给到的还新时，卡片下面一行写清这个差
-（`包管理器最高只到 2.6.14-0+deb12u2，官方 2.7.9 得走 OpenVPN 自己的源`）——不写就成了新的"明明有新版却说没有"。
-真按下去之前，确认框里会把**打算在你机器上执行的命令原样摊开**。家族是读
+仓库版本号可能偏旧"，不假装查到了。装得到的最高号追不平官方时，卡片下面一行写清这个差
+（`这台机器上装得到的最高是 2.7.1；官方 2.7.9 的 apt 源里没有适配本机发行版的包`）——
+不写就成了新的"明明有新版却说没有"。
+
+**OpenVPN 官方的二进制仓库只在 deb 上**。形状是（OpenVPN 项目自己的 wiki 页 "OpenVPN software repos"）：
+
+```
+deb [arch=amd64|arm64 signed-by=/etc/apt/keyrings/fanout-openvpn-repo-public.asc] \
+    https://build.openvpn.net/debian/openvpn/<channel> <codename> main
+```
+
+channel 只碰 `release/2.7` 和 `stable`（`testing` 里是 alpha/beta/RC，不算"升级到最新版"）。
+fanout 直接读它的 `Packages` 索引比版本，判到确实比本机新才写这台机器：两份文件——
+`/etc/apt/keyrings/fanout-openvpn-repo-public.asc`（签名公钥）和
+`/etc/apt/sources.list.d/fanout-openvpn.list`（那一行源），然后照常走包管理器。落盘前后都有闸：
+
+- 公钥从 `https://swupdate.openvpn.net/repos/repo-public.gpg` 下来，先核 sha256
+  （`1937b44f…45ce710d`，指纹 `30EB F4E7 3CCE 63EE E124 DD27 8E6D A8B4 E158 C569`）；
+  对不上就报错退出，已有的钥匙一个字都不动——不能把一份没核对过的钥匙放进 `/etc/apt/keyrings`。
+- `signed-by` 只指向这把钥匙，不给它全局信任，机器上其它源的验签不受影响。
+- codename / channel / arch 全部白名单校验通过才写文件；写是 `os.WriteFile` 和同目录
+  `rename`，不经过 shell。
+- 这个源比想象中旧，实测：noble 只到 `2.6.10`、bookworm `2.6.0`、jammy `2.5.7`，
+  全都低于 Ubuntu 自己仓库里的 `2.6.19`；resolute 才有 `2.7.1`。所以"接官方源"永远是
+  结果比本机新才发生，Debian sid 这类问不到稳定版构建的也只报数不接源。
+- 接了就给一条等号的原路退回：卡片上出现「撤销官方源」，删掉 fanout 写的那两份文件并刷一次索引；
+  已装好的 openvpn 不动，正在跑的隧道不受影响。留一个第三方 apt 源意味着之后系统包升级会跟着它走，
+  这句话写在确认框里，也写在按钮旁边——不只塞在 README 里让人自己找。
+
+非 deb 家族 fanout 只问本机仓库，不会替官方宣布"没有二进制包"：RHEL 系其实有官方的
+Fedora Copr（`@OpenVPN/openvpn-release-2.7`，`dnf copr enable` 那条路），fanout 不替你启用它，
+但卡片上会把这句说出来，免得把"我的源里没有"讲成"官方没有"。
+
+真按下去之前，确认框里会把**打算在你机器上执行的命令原样摊开**（要接源时连那行 deb 一起）。
+家族是读
 `/etc/os-release` 的 `ID` / `ID_LIKE` 认家族，再按家族挑工具：
 
 | 家族 | 会执行的命令 |
 | --- | --- |
-| deb（Debian / Ubuntu） | `apt-get update -qq`，然后 `apt-get install -y --only-upgrade openvpn` |
+| deb（Debian / Ubuntu） | `apt-get update -qq`，然后 `apt-get install -y --only-upgrade openvpn`；本机仓库不够新时，前面多两步把 OpenVPN 官方 apt 源写进去 |
 | rpm（RHEL / CentOS / Rocky / Amazon Linux…） | 有 `dnf` 用 `dnf -y upgrade openvpn`，否则 `yum -y update openvpn` |
 | Alpine | `apk update --no-cache`，然后 `apk add --no-cache --upgrade openvpn` |
 | Arch | `pacman -Sy --noconfirm openvpn` |
@@ -411,7 +445,7 @@ REALITY 的密钥对和 shortId 自动生成；TLS 不填证书就生成自签�
 
 ```
   状态      运行中
-  版本      fanout v2.0.2
+  版本      fanout v2.0.3
   开机自启  enabled
 
   管理地址  http://1.2.3.4:8899/gwPuWHvaNr/

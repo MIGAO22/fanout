@@ -1777,6 +1777,7 @@ function paintClientBin(c, checked){
   $('#cliOvpn').textContent = c.openvpn || '未安装';
   $('#cliApply').hidden = true;
   $('#cliOvpnApply').hidden = true;
+  $('#cliOvpnRepoOff').hidden = true;
   $('#cliCheck').disabled = false;
   // "已是最新"只有在 fanout 真能替换这份二进制时才轮得到它说：接管模式下
   // has_update 恒为 false（后端压根不动它），照原样显示就成了三台版本不同的机器
@@ -1796,10 +1797,17 @@ function paintClientBin(c, checked){
     $('#cliApplyVer').textContent = c.latest;
     $('#cliApply').hidden = false;
   }
-  if(checked && c.openvpn_updatable && c.openvpn_has_update && c.openvpn_latest){
-    $('#cliOvpnApplyVer').textContent = c.openvpn_latest;
+  // 按钮装的是 openvpn_target：发行版仓库和 OpenVPN 官方 apt 源两边问完取最高的那个号。
+  // 只问发行版仓库时，Ubuntu 26.04 上官方明明发了 2.7.1，界面却只能报仓库里的 2.6.20，
+  // 还是"明明有新版却说升不到"。反过来官方源更旧（noble 只到 2.6.10）时它不会被选中，
+  // 免得一次"升级"把人降到旧版。
+  if(checked && c.openvpn_updatable && c.openvpn_has_update && c.openvpn_target){
+    $('#cliOvpnApplyVer').textContent = c.openvpn_target;
     $('#cliOvpnApply').hidden = false;
   }
+  // 接了官方源就得给一条等号的原路退回，不能只写在 README 里让人自己找文件
+  const undo = $('#cliOvpnRepoOff');
+  if(undo) undo.hidden = !(checked && c.openvpn_repo_wired);
   // 这行只在有话非说不可时装满：认不出家族、没有包管理器、索引没刷动，
   // 或者官方已经 2.7.9 而 apt 最高只给到 2.6.x——后者不说就成了"明明有新版却说没有"
   clientNote(checked ? (c.openvpn_reason || c.openvpn_note) : '');
@@ -1820,6 +1828,7 @@ $('#cliCheck').onclick = async e => {
     else if(c.latest) toast('Xray 已是最新版', 'ok');
     if(c.openvpn_upstream) toast(c.openvpn_behind_upstream
       ? 'openvpn 官方最新 ' + c.openvpn_upstream + '，本机 ' + (c.openvpn || '未知')
+        + (c.openvpn_target ? '，能升到 ' + c.openvpn_target : '')
       : 'openvpn 已是官方最新（' + c.openvpn_upstream + '）', c.openvpn_behind_upstream ? 'info' : 'ok');
   }catch(err){
     $('#cliXrayLatest').textContent = '';
@@ -1850,8 +1859,15 @@ $('#cliApply').onclick = async e => {
 // 升级 openvpn：命令由本机发行版决定，确认框里把原文摊开再点。
 // 耗时看镜像源，几十秒到几分钟都算正常。
 $('#cliOvpnApply').onclick = async e => {
-  const cmd = (binState && binState.openvpn_cmd) || '（没读到命令，请先「检查更新」）';
-  if(!confirm('用系统的包管理器升级 openvpn？\n\n' + cmd +
+  const d = binState || {};
+  const cmd = d.openvpn_cmd || '（没读到命令，请先「检查更新」）';
+  // 需要接官方源时，将要写进机器的那一行必须先在确认框里摊开：这等于在别人的
+  // 机器上留下一个第三方 apt 源，不是能被顺手点掉的复选框
+  const repo = d.openvpn_repo_line
+    ? '\n\n这一步还会在机器上新接一个 OpenVPN 官方 apt 源（只为装 openvpn 这一个包），'
+      + '之后系统的包升级会跟着它走；不想留着点「撤销官方源」。'
+    : '';
+  if(!confirm('把 openvpn 升到 ' + (d.openvpn_target || '最新版') + '？\n\n' + cmd + repo +
       '\n\n已在跑的隧道不会中断（它们挂在旧进程上），新建出口或换节点之后才用新版。')) return;
   const b = e.currentTarget;
   const label = b.innerHTML;
@@ -1864,6 +1880,24 @@ $('#cliOvpnApply').onclick = async e => {
   }catch(err){
     toast(err.message, 'bad');
     clientNote('执行失败：' + err.message);
+  }
+  b.innerHTML = label;
+  loadClientBin();
+};
+
+// 撤销官方源：删掉 fanout 写的那两份 apt 文件并刷一次索引。已装的 openvpn 不动，
+// 免得有人以为撤销会把客户端卸掉。
+$('#cliOvpnRepoOff').onclick = async e => {
+  if(!confirm('删掉 fanout 写入的 OpenVPN 官方源和签名密钥，并刷新一次包索引？\n\n已装好的 openvpn 不会被动到，正在跑的隧道也不受影响。')) return;
+  const b = e.currentTarget;
+  const label = b.innerHTML;
+  b.disabled = true;
+  try{
+    const r = await api('/api/client/openvpn/repo?off=1', {method:'POST'});
+    toast(r.message || '已撤销', 'ok');
+    clientNote(r.message || '已撤销');
+  }catch(err){
+    toast(err.message, 'bad');
   }
   b.innerHTML = label;
   loadClientBin();
