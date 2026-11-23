@@ -115,7 +115,7 @@ Xray 到 `/var/lib/fanout/bin/`，装了则跳过，入站交给面板管。
 > 才生效：`f` → `3) 重启`（或 `f restart`）。`install.sh` 现在重装会显式
 > `systemctl restart`——以前用 `enable --now`，对已运行的单元是空操作，
 > 于是新二进制在磁盘上、老进程还在服务老界面。
-> 想确认手上是哪一份：`fanout -version`，本仓库显示 `v1.5.3`，上游原版是 `v1.3.1`。
+> 想确认手上是哪一份：`fanout -version`，本仓库显示 `v1.5.4`，上游原版是 `v1.3.1`。
 
 > **发新版本。** 推一个 `v*` tag 就会触发 release workflow 出 amd64 / arm64
 > 两个包和 checksums；不打 tag 就没有 Release，`releases/latest/download/...`
@@ -180,8 +180,8 @@ Operation not permitted 的话，这台机器用不了，跟发行版无关。
 | 交换 | 同上，`SwapTotal - SwapFree` | 没配交换分区时胶囊置灰、显示「无」 |
 | 存储 | `statfs` 取**工作目录（默认 `/var/lib/fanout`）所在的分区**，取不到才退回 `/` | 已用 = `blocks - bfree`，百分比分母剔掉 root 预留块，口径和 `df -h` 的 `Use%` 一致；悬停会写明统计的是哪个挂载点 |
 | 负载 | `/proc/loadavg` 的 1 分钟值 | 按核心数归一，100% = 可运行任务刚好排满 CPU；悬停看 1/5/15 三个值 |
-| TCP | `/proc/net/sockstat` 的在用数 **+ `tw`** | 刻度取临时端口区间宽度，只用来比较多少，不是硬上限 |
-| UDP | 同上的 UDP 在用数 | QUIC、DNS 这类流量都算在这里 |
+| TCP | `/proc/net/sockstat` + `sockstat6` 的在用数，**再加 `tw`** | 刻度取临时端口区间宽度，只用来比较多少，不是硬上限 |
+| UDP | 同上两张表的 UDP 在用数 | QUIC、DNS 这类流量都算在这里 |
 
 两条设计上的说明：
 
@@ -191,6 +191,10 @@ Operation not permitted 的话，这台机器用不了，跟发行版无关。
 - **TCP 里的 `TIME_WAIT` 算进来了**。出口多、客户端连接短的时候，
   `tw` 会比已建立连接多一个数量级——它占的正是临时端口，也就是这台机器
   往外连新目标时最先耗尽的东西。
+- **IPv4 与 IPv6 是两张独立的表**，`/proc/net/sockstat` 里只有 AF_INET，
+  绑 `[::]` 的双栈监听只出现在 `/proc/net/sockstat6`。两个都读、加起来才是本机总数：
+  只读 IPv4 那份的话，客户端全从 IPv6 进来的机器会把 UDP 显示成一个不动的 0。
+  悬停能看到拆分。
 
 超过 75% 的胶囊转黄、90% 转红。窗口不够宽时（≤1240 px）先收起负载 / TCP / UDP 三个，
 ≤860 px 整排让位给侧栏抽屉。
@@ -322,7 +326,7 @@ REALITY 的密钥对和 shortId 自动生成；TLS 不填证书就生成自签�
 
 ```
   状态      运行中
-  版本      fanout v1.5.3
+  版本      fanout v1.5.4
   开机自启  enabled
 
   管理地址  http://1.2.3.4:8899/gwPuWHvaNr/
@@ -350,7 +354,7 @@ f uninstall  # 卸载（服务、二进制、netns 和 /var/lib/fanout 全删）
 > **界面还是旧的？** 十有八九是老进程还在跑。二进制是单文件、界面用 `go:embed`
 > 打在里面的，所以换二进制必须重启服务才生效：`f` → `3) 重启`。
 > `install.sh` 现在重装会显式 `systemctl restart`，不再出现「装完没变化」。
-> 分清手上是哪一份：`fanout -version`，本仓库构建的显示 `v1.5.3` 及以上，
+> 分清手上是哪一份：`fanout -version`，本仓库构建的显示 `v1.5.4` 及以上，
 > 上游原版显示 `v1.3.1`。
 
 隧道状态存在 `/var/lib/fanout/state.json`，重启后自动恢复，端口保持不变。

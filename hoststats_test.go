@@ -254,3 +254,37 @@ func TestReadDiskUsageFallsBack(t *testing.T) {
 		t.Error("一个挂载点都不给时应报错，别让胶囊显示 0/0")
 	}
 }
+
+// 现场反馈：UDP 胶囊一直是 0。原因是内核把 IPv4 和 IPv6 的 socket 分开记在
+// 两张表里，绑 [::] 的双栈监听只会出现在 sockstat6，而原来只读了 IPv4 那份。
+// 这台机器上 IPv4 确实可能一个 UDP socket 都没有，于是数字看着像"坏了"。
+func TestParseSockstatIPv6Table(t *testing.T) {
+	// 这份是 /proc/net/sockstat6 的真实形状：行名带 6，而且没有 tw 列
+	blob := []byte(`TCP6: in use 8
+UDP6: in use 6
+UDPLITE6: in use 0
+RAW6: in use 0
+FRAG6: in use 0 memory 0
+`)
+	tcp, udp := parseSockstat(blob)
+	if tcp != 8 {
+		t.Errorf("tcp = %d, 想 8（TCP6 行）", tcp)
+	}
+	if udp != 6 {
+		t.Errorf("udp = %d, 想 6（UDP6 行，IPv4 表里没有的那份）", udp)
+	}
+}
+
+// 两张表要相加才是本机总数：少加任何一张，代理机上都会明显低估。
+func TestParseSockstatBothTablesSum(t *testing.T) {
+	v4 := []byte("TCP: in use 37  orphan 0  tw 128  mem 5\nUDP: in use 2 mem 2\n")
+	v6 := []byte("TCP6: in use 8\nUDP6: in use 6\n")
+	t4, u4 := parseSockstat(v4)
+	t6, u6 := parseSockstat(v6)
+	if t4+t6 != 173 {
+		t.Errorf("TCP 相加 = %d, 想 173（37 在用 + 128 tw + 8 IPv6）", t4+t6)
+	}
+	if u4+u6 != 8 {
+		t.Errorf("UDP 相加 = %d, 想 8（IPv4 的 2 加 IPv6 的 6）", u4+u6)
+	}
+}

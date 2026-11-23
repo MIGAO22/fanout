@@ -228,10 +228,13 @@ function statDefs(s){
         + ' 核归一，100% 表示可运行任务刚好排满 CPU'},
     {k:'TCP', pct:s.tcp_pct, v:String(s.tcp), opt:true,
      tip:'在用 TCP socket ' + s.tcp + ' 个（含 TIME_WAIT）\n'
+        + 'IPv4 ' + (s.tcp - (s.tcp6 || 0)) + ' + IPv6 ' + (s.tcp6 || 0) + '，两张表加起来才是本机总数\n'
         + '刻度是临时端口区间宽度' + (cap ? ' ' + cap + ' 个' : '（读不到）')
         + '，只用来比较多少，不是硬上限'},
     {k:'UDP', pct:s.udp_pct, v:String(s.udp), opt:true,
-     tip:'在用 UDP socket ' + s.udp + ' 个\nQUIC、DNS 这类流量都算在这里'},
+     tip:'在用 UDP socket ' + s.udp + ' 个\nQUIC、DNS 这类流量都算在这里\n'
+        + 'IPv4 ' + (s.udp - (s.udp6 || 0)) + ' + IPv6 ' + (s.udp6 || 0)
+        + '：内核把两张表分开记，绑 [::] 的双栈监听只出现在 IPv6 那份里'},
   ];
 }
 

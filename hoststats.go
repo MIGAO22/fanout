@@ -52,10 +52,14 @@ type hostStats struct {
 	// 直接拿 load1 当百分比的话，多核机器会画成爆表。
 	LoadPct float64 `json:"load_pct"`
 
-	TCP    int     `json:"tcp"` // 在用 TCP socket，含 TIME_WAIT
+	TCP    int     `json:"tcp"` // 在用 TCP socket，含 TIME_WAIT，IPv4 + IPv6 合计
 	TCPPct float64 `json:"tcp_pct"`
 	UDP    int     `json:"udp"`
 	UDPPct float64 `json:"udp_pct"`
+	// TCP6 / UDP6 是其中来自 IPv6 那张表的部分。分开回给界面是因为：
+	// 只看到一个合计的话，"UDP 怎么是 0" 和 "IPv4 真的一个都没有" 分不清。
+	TCP6 int `json:"tcp6"`
+	UDP6 int `json:"udp6"`
 	// SockCap 是这两个百分比共同的分母：本机临时端口区间的宽度。
 	// 它只是个刻度，不是硬上限（监听套接字并不占这段），
 	// 画出来是为了让"TCP 用了多少"这台代理机上有个可比的参照。
@@ -208,11 +212,16 @@ func parseLoadavg(blob []byte) (l1, l5, l15 float64, err error) {
 	return
 }
 
-// parseSockstat 取 TCP 与 UDP 的在用套接字数。
+// parseSockstat 取 TCP 与 UDP 的在用套接字数。入参是 /proc/net/sockstat
+// 或 /proc/net/sockstat6 都行：两张表的行名前缀一样、只是 IPv6 那份带个 6，
+// 而内核把它们分开记（绑 [::] 的双栈监听只出现在 IPv6 表里），
+// 所以调用方要把两份加起来看。
+//
 // TCP 把 tw 一起算上：TIME_WAIT 同样占着端口和内核对象，
 // 一台跑代理的机器上它经常比已建立的连接还多，只看在用数会低估。
+// IPv6 表里内核没印 tw，那份就只是在用数。
 //
-// 内核把这行印成 "TCP: in use 37 orphaned 0 tw 128"，数值在关键字后面隔一个词的位置，
+// 内核把这行印成 "TCP: in use 37 orphan 0 tw 128"，数值在关键字后面隔一个词的位置，
 // 所以取数时要往后找到第一个整数，而不是照着关键字取下一格。
 func parseSockstat(blob []byte) (tcp, udp int) {
 	for _, line := range strings.Split(string(blob), "\n") {
@@ -245,9 +254,9 @@ func parseSockstat(blob []byte) (tcp, udp int) {
 			return 0
 		}
 		switch f[0] {
-		case "TCP:":
+		case "TCP:", "TCP6:":
 			tcp = val("in", "use") + val("tw")
-		case "UDP:":
+		case "UDP:", "UDP6:":
 			udp = val("in", "use")
 		}
 	}
@@ -391,6 +400,15 @@ func readHostStats() (hostStats, error) {
 			return fmt.Errorf("读 /proc/net/sockstat 失败: %w", err)
 		}
 		st.TCP, st.UDP = parseSockstat(blob)
+		// IPv4 和 IPv6 是两张独立的表：/proc/net/sockstat 里只有 AF_INET。
+		// 入站一般绑 [::]（双栈），客户端从 IPv6 连进来时那些 socket 全记在
+		// sockstat6 上——只读 IPv4 那份，UDP 胶囊就会一直停在 0。
+		// 没编进 IPv6 的内核没有这个文件，读不到不报错。
+		if v6, err := os.ReadFile("/proc/net/sockstat6"); err == nil {
+			st.TCP6, st.UDP6 = parseSockstat(v6)
+			st.TCP += st.TCP6
+			st.UDP += st.UDP6
+		}
 		if rb, err := os.ReadFile("/proc/sys/net/ipv4/ip_local_port_range"); err == nil {
 			st.SockCap = parsePortRange(rb)
 		}
