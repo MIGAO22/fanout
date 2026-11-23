@@ -101,8 +101,10 @@ func TestRestoreStateReadsPrevHost(t *testing.T) {
 	if got := tn.prevHostOf(); got != "vpn-old" {
 		t.Fatalf("没读回换节点标记，实际 %q", got)
 	}
-	// 收尾：别让后台的 bringUpPersist 继续折腾
-	tn.Status = "stopped"
+	// 收尾：别让后台的 bringUpPersist 继续折腾。必须走 setStatus——
+	// restoreState 给每条隧道都起了一个 goroutine，它正持着 t.mu 读状态，
+	// 直接写 tn.Status 就是绕开那把锁和它抢同一个字段，-race 当场报。
+	tn.setStatus("stopped", "")
 }
 
 // 老版本的状态文件里没有这个字段，读出来该是空的，不能误触发改绑。
@@ -122,7 +124,8 @@ func TestRestoreStateOldFormatHasNoPrevHost(t *testing.T) {
 	if got := tn.prevHostOf(); got != "" {
 		t.Fatalf("老格式不该带标记，实际 %q", got)
 	}
-	tn.Status = "stopped"
+	// 同上一个用例：收尾走 setter，别和后台的 bringUpPersist 抢同一个字段
+	tn.setStatus("stopped", "")
 }
 
 func containsStr(s, sub string) bool {

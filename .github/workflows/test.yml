@@ -30,9 +30,17 @@ jobs:
       - name: 编译
         run: go build ./...
 
-      # 依赖 netns / root 的用例自己会 t.Skip，所以非 root 的 runner 上这套是跑得通的。
+      # 依赖 netns / root 的用例自己会 t.Skip（切不动命名空间就整条跳过），
+      # 所以非 root 的 runner 上这套是跑得通的。
+      #
+      # set -o pipefail 不能省：GitHub 用的是 bash -e，它只看流水线里最后一条命令，
+      # 而这里最后一条是 tee——永远成功。没有 pipefail 时 go test 报 FAIL 作业照样绿，
+      # 连下面那个「失败时贴日志」的 if: failure() 都不会触发。
+      # 这个门就这么连续放过过三次真失败的用例，而交叉编译抓不到任何运行期缺陷。
       - name: 测试
-        run: go test -timeout 300s ./... 2>&1 | tee "$RUNNER_TEMP/test.log"
+        run: |
+          set -o pipefail
+          go test -timeout 300s ./... 2>&1 | tee "$RUNNER_TEMP/test.log"
 
       # Actions 的日志下载要鉴权，二开的时候助手读不到，红在哪一行只能瞎猜。
       # step summary 是公开字段，失败时把输出抄进去，一眼就能看到。
@@ -45,12 +53,14 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
-      # 先只报不拦：数据竞争一旦当硬门槛，CI 会长期红，反而没人看。
-      # 清完一轮之后再把它挪上去。
-      - name: 数据竞争（暂不阻断）
+      # 改成硬门槛了：原先「先只报不拦」，是因为竞态还没清。现在拦得住了——
+      # 报出来的两处都在测试自己手里（直接写 tn.Status，绕开了 bringUpPersist
+      # 那把锁），已经改成走 setter；生产代码里对 Tunnel 字段的读写都在锁上。
+      - name: 数据竞争
         id: race
-        continue-on-error: true
-        run: go test -race -timeout 600s ./... 2>&1 | tee "$RUNNER_TEMP/race.log"
+        run: |
+          set -o pipefail
+          go test -race -timeout 600s ./... 2>&1 | tee "$RUNNER_TEMP/race.log"
 
       - name: 把竞争报告贴进 summary
         if: always() && steps.race.outcome == 'failure'

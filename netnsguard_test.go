@@ -10,14 +10,28 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+// requireNetnsSwitch 保证这套用例真的能在线程之间切命名空间，切不动就整条跳过。
+//
+// 判据必须现探一次，两个看似合理的替代都不准：
+// initMainNetns 只是 open 一个 fd，非 root 也照样成功，真正需要 CAP_SYS_ADMIN 的是
+// 后面那次 setns（CI 上就是它 EPERM）；只看 euid 也不行，有的 runner 以 root 跑却
+// 把 CAP_SYS_ADMIN 掉了。留成 FAIL 的话门就永久红，反而没人看，所以按 skip 处理。
+func requireNetnsSwitch(t *testing.T) {
+	t.Helper()
+	if err := initMainNetns(); err != nil {
+		t.Skipf("读不到母机网络命名空间，跳过: %v", err)
+	}
+	if err := inMainNetns(func() error { return nil }); err != nil {
+		t.Skipf("环境不允许把线程切回母机命名空间，跳过: %v", err)
+	}
+}
+
 // inMainNetns 里跑的东西必须落在母机的网络命名空间。
 //
 // 注意读的是 /proc/thread-self 而不是 /proc/self：命名空间是**线程级**的，
 // 读进程级的那个看不出线程有没有被切走——这正是当初没发现问题的原因。
 func TestInMainNetnsRunsInMainNamespace(t *testing.T) {
-	if err := initMainNetns(); err != nil {
-		t.Skipf("拿不到网络命名空间，跳过: %v", err)
-	}
+	requireNetnsSwitch(t)
 	want, err := os.Readlink("/proc/self/ns/net")
 	if err != nil {
 		t.Skipf("读不了命名空间，跳过: %v", err)
@@ -49,9 +63,9 @@ func TestInMainNetnsRunsInMainNamespace(t *testing.T) {
 // 那次失败本身就是这个 bug 的现场复现。
 func TestInMainNetnsRecoversFromForeignNamespace(t *testing.T) {
 	if os.Getenv("FANOUT_NETNS_CHILD") != "1" {
-		if os.Geteuid() != 0 {
-			t.Skip("要 root 才能建命名空间")
-		}
+		// 母进程先探一次：切不动就别再 spawn 子进程了——子进程里是 Unshare+Setns，
+		// 一样切不动，只会以"子进程里的用例失败"红掉，而那只是环境限制。
+		requireNetnsSwitch(t)
 		cmd := exec.Command(os.Args[0],
 			"-test.run=^TestInMainNetnsRecoversFromForeignNamespace$", "-test.v")
 		cmd.Env = append(os.Environ(), "FANOUT_NETNS_CHILD=1")
@@ -130,9 +144,7 @@ func TestInMainNetnsFallsBackWhenUninitialized(t *testing.T) {
 
 // 几个包装函数的基本行为：成败、输出都要正确传递。
 func TestCmdHelpers(t *testing.T) {
-	if err := initMainNetns(); err != nil {
-		t.Skipf("拿不到网络命名空间，跳过: %v", err)
-	}
+	requireNetnsSwitch(t)
 
 	out, err := cmdOutput(exec.Command("echo", "母机"))
 	if err != nil {
@@ -170,9 +182,7 @@ func TestCmdHelpers(t *testing.T) {
 
 // 连续用不能把线程池搞坏：切换失败的线程不回收会拖垮长跑的进程。
 func TestInMainNetnsRepeated(t *testing.T) {
-	if err := initMainNetns(); err != nil {
-		t.Skipf("拿不到网络命名空间，跳过: %v", err)
-	}
+	requireNetnsSwitch(t)
 	want, err := os.Readlink("/proc/self/ns/net")
 	if err != nil {
 		t.Skip(err)
