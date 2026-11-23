@@ -227,6 +227,37 @@ func TestOvpnSrcStepOrder(t *testing.T) {
 	}
 }
 
+// 编好一次之后，官方再出 2.7.10 / 2.8.0 时这条路必须还能走：按钮重新出现、装去新目录、
+// 旧目录被清理。最怕的是版本号进位被当成字符串比（2.7.10 < 2.7.9），那样按钮会永久消失。
+func TestOvpnSrcNextReleaseStillWorks(t *testing.T) {
+	for _, c := range [][2]string{
+		{"2.7.9", "2.7.10"}, {"2.7.10", "2.7.11"}, {"2.7.99", "2.8.0"}, {"2.7.9", "2.8.0"},
+	} {
+		have, next := c[0], c[1]
+		if !ovpnSrcVersionOK(next) {
+			t.Errorf("%s 该被版本号白名单收下", next)
+			continue
+		}
+		if !versionLess(have, next) {
+			t.Errorf("versionLess(%s, %s) 必须是 true，否则按钮再也不出现", have, next)
+		}
+		// apt 仍然够不到、编好的就是上一版 → 该给按钮
+		if !openvpnCanBuildSource("deb", have, "2.6.19", next, have) {
+			t.Errorf("手上是自编译的 %s、官方出了 %s，按钮该再出现", have, next)
+		}
+		// 已经编到这一版了就不该再让点一次（一次是十几分钟）
+		if openvpnCanBuildSource("deb", next, "2.6.19", next, next) {
+			t.Errorf("已经编好 %s，按钮该消失", next)
+		}
+		if ovpnSrcPrefix(have) == ovpnSrcPrefix(next) {
+			t.Errorf("%s 和 %s 的前缀不该相同", have, next)
+		}
+		if openvpnSrcPlan(next, "deb") == "" {
+			t.Errorf("%s 该有摊开的步骤", next)
+		}
+	}
+}
+
 func TestOvpnSrcConfigureArgv(t *testing.T) {
 	argv := ovpnSrcConfigureArgv(ovpnSrcPrefix("2.7.9"))
 	joined := strings.Join(argv, " ")
