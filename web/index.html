@@ -1061,8 +1061,19 @@ html[data-theme="dark"] .scr{background:rgba(0,0,0,.62)}
                 </button>
               </div>
               <div class="divider"></div>
-              <div class="hint">出口那一跳用的是系统 <b>openvpn <span id="cliOvpn">未知</span></b>，装在机器上、跟着发行版的
-                包管理器升级（<code>apt/apk upgrade openvpn</code>），出口机器上不用装任何东西，所以这里不动它。</div>
+              <div class="hint">出口那一跳用的是系统 <b>openvpn <span id="cliOvpn">未知</span></b><span id="cliOvpnFamily"></span>。
+                版本差别真会咬人：数据通道算法的参数 2.5 起才叫 <code>--data-ciphers</code>，2.4 只认
+                <code>--ncp-ciphers</code>，喂错名字 openvpn 会直接退出、一条出口都连不上——fanout 按本机版本挑名字，
+                两边都能连。升级走这台机器自己的包管理器，只点 openvpn 这一个包，不会顺手把整台机器的包都升一遍。
+                出口机器上什么都不用装。</div>
+              <div class="hint" id="cliOvpnNote" hidden></div>
+              <div class="acts">
+                <button class="btn" id="cliOvpnApply" hidden>
+                  <svg viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                    <path d="M7 10l5 5 5-5M12 15V3"/></svg>
+                  升级 openvpn
+                </button>
+              </div>
             </div>
           </section>
         </div>

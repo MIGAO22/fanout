@@ -35,12 +35,18 @@ type ClientBinStatus struct {
 	Backend   string `json:"backend"`    // 当前节点后端：native / 3x-ui / xray-cf-lite
 	Path      string `json:"path"`       // 正在用的 xray 可执行文件
 	Xray      string `json:"current"`    // 本机 xray 版本，读不到为空
-	OpenVPN   string `json:"openvpn"`    // 系统 openvpn 版本，只读展示
+	OpenVPN   string `json:"openvpn"`    // 系统 openvpn 版本
 	Latest    string `json:"latest"`     // Xray-core 最新版（只有点了检查才有）
 	HasUpdate bool   `json:"has_update"` // Latest 比 Xray 新
 	Updatable bool   `json:"updatable"`  // 这份 xray 归 fanout 管、可以就地替换
 	Reason    string `json:"reason,omitempty"`
 	CheckErr  string `json:"check_error,omitempty"` // 问 GitHub 失败的原因，不影响上面的字段
+
+	// openvpn 这半边由发行版的包管理器负责，下面几项是把"要点就跑这几条"摊开给人看
+	OvpnFamily string `json:"openvpn_family,omitempty"` // deb / rpm / alpine / arch / suse
+	OvpnCmd    string `json:"openvpn_cmd,omitempty"`
+	OvpnUpdate bool   `json:"openvpn_updatable"`
+	OvpnWhy    string `json:"openvpn_reason,omitempty"`
 }
 
 // xrayAssetForArch 把 GOARCH 换成 Xray-core release 的资产名。
@@ -135,6 +141,15 @@ func clientBinStatus(askLatest bool) *ClientBinStatus {
 		st.Reason = err.Error()
 	}
 	st.OpenVPN = parseOpenVPNVersion(probeVersion("openvpn", "--version"))
+	if st.OpenVPN == "" {
+		st.OvpnWhy = "本机没有 openvpn，出口隧道起不来；先装一个（apt/apk install openvpn）"
+	} else if blob, err := os.ReadFile(osReleasePath); err != nil {
+		st.OvpnWhy = fmt.Sprintf("读 %s 失败，不知道该怎么升：", osReleasePath) + err.Error()
+	} else if steps, family, err := openvpnUpgradePlan(string(blob), hasCmd); err != nil {
+		st.OvpnWhy = err.Error()
+	} else {
+		st.OvpnFamily, st.OvpnUpdate, st.OvpnCmd = family, true, describeSteps(steps)
+	}
 
 	target, why := xrayUpdateTarget(wd, st.Path, st.Backend)
 	st.Updatable = target != ""
@@ -187,6 +202,10 @@ func extractFromZip(zipPath, member, dst string) error {
 // xrayApplyMu 串行化替换过程：连点两次更新会让第二次把第一次刚换上的
 // 二进制当旧版备份走，中间那一刻 Xray 的落点是不确定的。
 var xrayApplyMu sync.Mutex
+
+// openvpnApplyMu 同理：两个 apt-get 同时跑会撞死在 dpkg 的锁上，
+// 报错还报得像是磁盘坏了。
+var openvpnApplyMu sync.Mutex
 
 // applyXrayUpdate 把内置 Xray 升到 Xray-core 最新版，并让正在跑的自建入站切到新版。
 //
@@ -297,4 +316,190 @@ func orUnknown(s string) string {
 		return "未知版本"
 	}
 	return s
+}
+
+// ───────────── openvpn：母机连出口那一跳用的客户端 ─────────────
+
+// osReleasePath 是发行版身份的唯一可靠来源，各家都有。
+const osReleasePath = "/etc/os-release"
+
+// parseOSRelease 解析 /etc/os-release。这里只用到 ID 和 ID_LIKE，
+// 但按 KEY=VALUE 全收，免得遇到引号、注释、export 前缀就懵。
+func parseOSRelease(blob string) map[string]string {
+	out := map[string]string{}
+	for _, line := range strings.Split(blob, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		line = strings.TrimPrefix(line, "export ")
+		k, v, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		out[strings.TrimSpace(k)] = strings.Trim(v, `"'`)
+	}
+	return out
+}
+
+// distroFamily 按 ID / ID_LIKE 认包管理器家族。ID_LIKE 用来接住衍生版：
+// Ubuntu 底下写 debian，Mint 底下写 ubuntu，Rocky 底下写 rhel fedora。
+func distroFamily(kv map[string]string) string {
+	for _, field := range []string{kv["ID_LIKE"], kv["ID"]} {
+		for _, name := range strings.Fields(field) {
+			switch strings.ToLower(name) {
+			case "debian", "ubuntu":
+				return "deb"
+			case "fedora", "rhel", "centos", "rocky", "almalinux", "amzn", "ol":
+				return "rpm"
+			case "suse", "opensuse-tumbleweed", "opensuse-leap", "sles":
+				return "suse"
+			case "alpine":
+				return "alpine"
+			case "arch", "manjaro", "endeavouros":
+				return "arch"
+			}
+		}
+	}
+	return ""
+}
+
+// openvpnUpgradePlan 把发行版身份换成"该跑哪几条命令"。
+//
+// 刻意不复述"哪个版本算新"的判断：那归发行版的仓库管，我们只负责点名
+// 只升 openvpn 这一个包。用 --only-upgrade / 单包 update 而不是全量升级，
+// 是因为这个按钮没承诺"顺手把整台机器的包都升一遍"——那会连带升内核、
+// 会重启一堆无关服务，出了事没人往这里查。
+func openvpnUpgradePlan(osRelease string, have func(string) bool) (steps [][]string, family string, err error) {
+	kv := parseOSRelease(osRelease)
+	switch distroFamily(kv) {
+	case "deb":
+		if !have("apt-get") {
+			return nil, "deb", fmt.Errorf("认出来是 Debian/Ubuntu 系，但机器上没有 apt-get")
+		}
+		return [][]string{
+			{"apt-get", "update", "-qq"},
+			{"apt-get", "install", "-y", "--only-upgrade", "openvpn"},
+		}, "deb", nil
+	case "rpm":
+		// RHEL 8+ 只有 dnf，CentOS 7 那批只有 yum，参数一致
+		switch {
+		case have("dnf"):
+			return [][]string{{"dnf", "-y", "upgrade", "openvpn"}}, "rpm", nil
+		case have("yum"):
+			return [][]string{{"yum", "-y", "update", "openvpn"}}, "rpm", nil
+		}
+		return nil, "rpm", fmt.Errorf("认出来是 RHEL/CentOS/Fedora 系，但机器上没有 dnf 或 yum")
+	case "alpine":
+		if !have("apk") {
+			return nil, "alpine", fmt.Errorf("认出来是 Alpine，但机器上没有 apk")
+		}
+		return [][]string{
+			{"apk", "update", "--no-cache"},
+			{"apk", "add", "--no-cache", "--upgrade", "openvpn"},
+		}, "alpine", nil
+	case "arch":
+		if !have("pacman") {
+			return nil, "arch", fmt.Errorf("认出来是 Arch 系，但机器上没有 pacman")
+		}
+		return [][]string{{"pacman", "-Sy", "--noconfirm", "openvpn"}}, "arch", nil
+	case "suse":
+		if !have("zypper") {
+			return nil, "suse", fmt.Errorf("认出来是 openSUSE 系，但机器上没有 zypper")
+		}
+		return [][]string{
+			{"zypper", "--non-interactive", "refresh"},
+			{"zypper", "--non-interactive", "update", "openvpn"},
+		}, "suse", nil
+	}
+	return nil, "", fmt.Errorf("认不出这台机器的发行版（%s 里没有已支持的 ID），请手动升级 openvpn", osReleasePath)
+}
+
+// describeSteps 把待执行的命令拼成一行给人看。按钮点下去之前得先知道要点什么。
+func describeSteps(steps [][]string) string {
+	joined := make([]string, 0, len(steps))
+	for _, argv := range steps {
+		joined = append(joined, strings.Join(argv, " "))
+	}
+	return strings.Join(joined, " && ")
+}
+
+// runUpgradeSteps 依次执行包管理器命令。任何一条非零退出就停下，把那几条的
+// 输出尾巴带回去——包管理器失败时原因总在最后几行。
+//
+// 必须在母机命名空间里跑：请求线程有可能已经被某条隧道的 dialer 带进 netns，
+// 在那里面刷镜像源会走 VPN，甚至直接不通（见 netnsguard.go）。
+func runUpgradeSteps(steps [][]string) error {
+	return inMainNetns(func() error {
+		for _, argv := range steps {
+			out, err := runPackageCmd(argv)
+			if err != nil {
+				return fmt.Errorf("%s 失败: %v\n%s", strings.Join(argv, " "), err, tailLines(out, 8))
+			}
+		}
+		return nil
+	})
+}
+
+// runPackageCmd 跑一条包管理器命令。非交互环境变量是关键：Ubuntu 的
+// needrestart 和 dpkg 在无人值守时提问，答案没人给，命令会一直挂到超时。
+func runPackageCmd(argv []string) (string, error) {
+	if len(argv) == 0 {
+		return "", fmt.Errorf("空命令")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
+	cmd.Env = append(os.Environ(),
+		"DEBIAN_FRONTEND=noninteractive",
+		"NEEDRESTART_MODE=a",
+		"APT_LISTCHANGES_FRONTEND=none",
+		"LANG=C",
+	)
+	out, err := cmd.CombinedOutput()
+	return string(out), err
+}
+
+// tailLines 取输出末尾 n 行，用于把包管理器的报错带进界面。
+func tailLines(s string, n int) string {
+	lines := strings.Split(strings.TrimRight(s, "\n"), "\n")
+	if len(lines) > n {
+		lines = lines[len(lines)-n:]
+	}
+	return strings.TrimSpace(strings.Join(lines, "\n"))
+}
+
+// applyOpenVPNUpdate 用发行版自己的包管理器把 openvpn 升到仓库里的最新版。
+//
+// 不在这里和谁比版本号：什么算最新由仓库说了算，比的是包管理器的事。
+// 升完再读一次版本，前后一致就是"已经是仓库里最新的"，这个结论有依据。
+func applyOpenVPNUpdate() (string, error) {
+	openvpnApplyMu.Lock()
+	defer openvpnApplyMu.Unlock()
+
+	before := parseOpenVPNVersion(probeVersion("openvpn", "--version"))
+	if before == "" {
+		return "", fmt.Errorf("本机没有可用的 openvpn，先在系统里装一个（apt/apk install openvpn）再回来点这个按钮")
+	}
+	blob, err := os.ReadFile(osReleasePath)
+	if err != nil {
+		return "", fmt.Errorf("读 %s 失败: %w", osReleasePath, err)
+	}
+	steps, _, err := openvpnUpgradePlan(string(blob), hasCmd)
+	if err != nil {
+		return "", err
+	}
+	if err := runUpgradeSteps(steps); err != nil {
+		return "", err
+	}
+	after := parseOpenVPNVersion(probeVersion("openvpn", "--version"))
+	switch {
+	case after == "":
+		return "", fmt.Errorf("升级后 openvpn 跑不起来了（升级前是 %s），请检查包管理器的输出", before)
+	case after == before:
+		return fmt.Sprintf("openvpn 已是仓库里的最新版 %s，没有变化。已在跑的隧道本来就用着它，不用管。", before), nil
+	default:
+		return fmt.Sprintf("openvpn 已从 %s 升到 %s。已在跑的隧道仍挂在旧进程上（进程不会被包管理器动到），"+
+			"新建出口、换节点或重启服务之后自然切到新版。", before, after), nil
+	}
 }

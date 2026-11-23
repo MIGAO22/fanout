@@ -1745,7 +1745,26 @@ function paintClientBin(c, checked){
     $('#cliApplyVer').textContent = c.latest;
     $('#cliApply').hidden = false;
   }
+  paintOpenVPN(c);
   if(c.check_error) toast('问最新版失败: ' + c.check_error, 'bad');
+}
+
+// openvpn 这半边不由 fanout 决定新旧，由这台机器的包管理器决定，
+// 所以不给"有新版"的判断，只把将要执行的命令摊开给人看再点下去。
+function paintOpenVPN(c){
+  $('#cliOvpnFamily').textContent = c.openvpn_family ? '（' + c.openvpn_family + ' 系的包管理器）' : '';
+  const btn = $('#cliOvpnApply'), note = $('#cliOvpnNote');
+  btn.hidden = !c.openvpn_updatable;
+  btn.disabled = false;
+  if(c.openvpn_updatable){
+    note.hidden = false;
+    note.textContent = '点下去会执行：' + c.openvpn_cmd;
+  } else if(c.openvpn_reason){
+    note.hidden = false;
+    note.textContent = c.openvpn_reason;
+  } else {
+    note.hidden = true;
+  }
 }
 
 // 检查内置 Xray 更新：这一步才会打 GitHub 的 API
@@ -1780,6 +1799,27 @@ $('#cliApply').onclick = async e => {
     toast(err.message, 'bad');
   }
   b.innerHTML = label;   // 文案里的版本号由下面的重读覆盖
+  loadClientBin();
+};
+
+// 升级 openvpn：命令由本机发行版决定，卡上已经摊开，这里再确认一次。
+// 耗时看镜像源，几十秒到几分钟都算正常。
+$('#cliOvpnApply').onclick = async e => {
+  const cmd = $('#cliOvpnNote').textContent.replace(/^点下去会执行：/, '');
+  if(!confirm('用系统的包管理器升级 openvpn？\n\n' + cmd +
+      '\n\n已在跑的隧道不会中断（它们挂在旧进程上），新建出口或换节点之后才用新版。')) return;
+  const b = e.currentTarget;
+  const label = b.innerHTML;
+  b.disabled = true;
+  b.textContent = '包管理器执行中…';
+  try{
+    const r = await api('/api/client/openvpn/apply', {method:'POST'});
+    toast(r.message || '已执行', 'ok');
+    $('#cliOvpnNote').textContent = r.message || '已执行';
+  }catch(err){
+    toast(err.message, 'bad');
+  }
+  b.innerHTML = label;
   loadClientBin();
 };
 

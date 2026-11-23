@@ -197,6 +197,7 @@ func main() {
 	mux.HandleFunc("/api/update/apply", apiUpdateApply)
 	mux.HandleFunc("/api/client/status", apiClientStatus)
 	mux.HandleFunc("/api/client/xray/apply", apiClientXrayApply)
+	mux.HandleFunc("/api/client/openvpn/apply", apiClientOpenVPNApply)
 
 	log.Printf("管理界面: http://<本机IP>%s%s/", webCfg.listenAddrString(), currentBasePath())
 	log.Printf("SOCKS5 端口在 %d-%d 之间随机分配", randPortMin, randPortMax)
@@ -480,6 +481,21 @@ func apiClientXrayApply(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	msg, err := applyXrayUpdate()
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "message": msg})
+}
+
+// apiClientOpenVPNApply 用发行版自己的包管理器把 openvpn 升一级。
+// 耗时取决于镜像源，可能几十秒到几分钟，界面期间把按钮置灰。
+func apiClientOpenVPNApply(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "用 POST"})
+		return
+	}
+	msg, err := applyOpenVPNUpdate()
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return

@@ -398,10 +398,10 @@ func (t *Tunnel) startOpenVPN(dir string) error {
 		"--auth-user-pass", authPath,
 		"--auth-nocache",
 		"--dev", "tun0",
-		"--data-ciphers", "AES-128-CBC:AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305",
 		"--verb", "3",
 		"--log", logPath,
 	}
+	args = append(args, dataCipherArgs(parseOpenVPNVersion(probeVersion("openvpn", "--version")))...)
 	args = append(args, ovpnTuning(budget)...)
 	cmd := exec.Command("ip", append([]string{"netns", "exec", ns, "openvpn"}, args...)...)
 

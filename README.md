@@ -27,7 +27,8 @@
 - 顶栏中间一排实时胶囊：CPU、内存、交换、存储、负载、TCP、UDP，每 2.5 秒自己走，
   绿条是占用比例，右边是原始量，超过 75% 转黄、90% 转红（口径见下面「使用 → 顶栏负载」）。
 - 「设置与连接」里有一张「内置客户端」：Xray 和 openvpn 各装在哪、什么版本一眼看到，
-  自建模式那份 Xray 可以就地升级（口径与风险见下面「使用 → 内置客户端（Xray）」）。
+  两份都能就地升级——Xray 由 fanout 换二进制，openvpn 走本机包管理器且只点它一个包
+  （口径与风险见下面「使用 → 内置客户端（Xray 与 openvpn）」）。
 - 顶部一行 KPI：在线出口（带完成度圆环）、可用节点、覆盖地区、母机 IP、节点链接。
 - 批量开出口时下面跟着作业卡片，每条目标的状态单独显示，不用刷整页。
 - 出口列表支持卡片 / 表格两种密度，可按「已连通 / 连接中 / 失败」筛，能搜 IP、国家、节点名。
@@ -62,6 +63,13 @@
   「Xray 活得好好的、配置校验通过、日志干净，但入站端口在母机上全都看不到」
   事故的同类排查——凡是「在当前命名空间里生效」的命令都必须显式切回去。
   本版本把这条规则补齐到了面板 CLI、服务重启和自更新路径上。
+- **数据通道算法按本机 openvpn 的版本喂参数**。同一件事三个版本段三个名字：2.4 叫
+  `--ncp-ciphers`，2.5 起改名 `--data-ciphers`（外加 `--data-ciphers-fallback`），2.3 及更早
+  两个都没有。喂错名字不是忽略警告，是 `Unrecognized option` 当场退出——原来无条件传
+  `--data-ciphers`，在 Ubuntu 20.04 / Debian 10 / CentOS 7 这些还装着 2.4 的机器上
+  每条出口都起不来。现在先读本机 `openvpn --version`，按版本段挑名字，读不出来就
+  一个都不传、用默认算法表，宁少不多。`fallback` 留 `AES-256-CBC` 是为了那些只讲
+  老算法的 VPN Gate 节点：2.6 的客户端默认协商不出 CBC，不加这条会直接握手失败。
 - 上面这些阈值全部进了「设置与连接」，填错会夹回可用区间，不会把自己调死。
 
 ### 出口组（本版本新增）
@@ -117,7 +125,7 @@ Xray 到 `/var/lib/fanout/bin/`，装了则跳过，入站交给面板管。
 > 才生效：`f` → `3) 重启`（或 `f restart`）。`install.sh` 现在重装会显式
 > `systemctl restart`——以前用 `enable --now`，对已运行的单元是空操作，
 > 于是新二进制在磁盘上、老进程还在服务老界面。
-> 想确认手上是哪一份：`fanout -version`，本仓库显示 `v1.5.5`，上游原版是 `v1.3.1`。
+> 想确认手上是哪一份：`fanout -version`，本仓库显示 `v1.5.6`，上游原版是 `v1.3.1`。
 
 > **发新版本。** 推一个 `v*` tag 就会触发 release workflow 出 amd64 / arm64
 > 两个包和 checksums；不打 tag 就没有 Release，`releases/latest/download/...`
@@ -211,14 +219,14 @@ Operation not permitted 的话，这台机器用不了，跟发行版无关。
 订阅要给客户端直接拉，所以这条地址不要登录，**那串 token 就等于密码**，别发群里。
 泄露了点「换一串口令」，旧地址立刻失效。
 
-### 内置客户端（Xray）
+### 内置客户端（Xray 与 openvpn）
 
 「设置与连接 → 内置客户端」把本机这几份客户端的来历和版本一次列清楚，并且只更新该由它更新的：
 
 | 组件 | 装在哪 | 谁负责升级 |
 | --- | --- | --- |
 | Xray（自建模式） | `/var/lib/fanout/bin/xray` | 这张卡里的「更新到 vX」 |
-| openvpn（母机连出口那一跳） | 系统包 | 发行版的 `apt/apk upgrade openvpn` |
+| openvpn（母机连出口那一跳） | 系统包，`PATH` 里那份 | 这张卡里的「升级 openvpn」，实际执行的就是本机包管理器 |
 | 3x-ui / xray-cf-lite 的 Xray | 各自的目录 | 跟着它们自己的面板或脚本 |
 
 先说清楚容易混的两件事。母机连出口用的**不是** Xray，是系统里的 openvpn，跑在 netns 内；
@@ -240,6 +248,28 @@ Operation not permitted 的话，这台机器用不了，跟发行版无关。
 第 5 步会重启一次 Xray，已连上的节点链接会掉一下再自己重连，所以按钮点下去前有确认框。
 接管模式（3x-ui / xray-cf-lite）下这张卡只显示版本、不给按钮，并说明那份归谁管——
 覆盖别人的运行时，出了问题没人想得起来是这里动的。
+
+openvpn 那半边不跟 GitHub 比版本：它是系统包，新旧由发行版的仓库说了算，比了也没用。
+所以这个按钮的做法是把**打算在你机器上执行的命令原样摊开**，你点头才跑。规则是读
+`/etc/os-release` 的 `ID` / `ID_LIKE` 认家族，再按家族挑工具：
+
+| 家族 | 会执行的命令 |
+| --- | --- |
+| deb（Debian / Ubuntu） | `apt-get update -qq`，然后 `apt-get install -y --only-upgrade openvpn` |
+| rpm（RHEL / CentOS / Rocky / Amazon Linux…） | 有 `dnf` 用 `dnf -y upgrade openvpn`，否则 `yum -y update openvpn` |
+| Alpine | `apk update --no-cache`，然后 `apk add --no-cache --upgrade openvpn` |
+| Arch | `pacman -Sy --noconfirm openvpn` |
+| openSUSE | `zypper --non-interactive refresh`，然后 `zypper --non-interactive update openvpn` |
+| 认不出 | 不给按钮，只说「请手动升级 openvpn」 |
+
+两点是刻意的。一是除刷索引那步，每条命令**都只点 `openvpn` 这一个包**：一个装客户端的按钮
+顺手把整台机器的包升一遍，出的问题没人想得起来是这里动的（这条有单测守着，命令里出现
+`upgrade` 而不含包名就红）。二是升级不会打断已经在跑的隧道——替换二进制只是把目录项换掉，
+旧进程还挂在原来的 inode 上，所以升完立刻生效的是**新建出口、换节点、重启服务**这些新起的
+进程，这句话也写在按钮的确认框和升级完的提示里，免得有人以为隧道会自己重连。
+
+至于 openvpn 的版本为什么要看一眼：2.4 和 2.5 之后连数据通道算法的参数名都不一样，
+喂错名字 openvpn 直接退出、一条出口都连不上，fanout 按本机版本挑名字（见上面「连接层加固」）。
 
 ### 只用家宽
 
@@ -358,7 +388,7 @@ REALITY 的密钥对和 shortId 自动生成；TLS 不填证书就生成自签�
 
 ```
   状态      运行中
-  版本      fanout v1.5.5
+  版本      fanout v1.5.6
   开机自启  enabled
 
   管理地址  http://1.2.3.4:8899/gwPuWHvaNr/

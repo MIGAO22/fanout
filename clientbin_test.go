@@ -172,3 +172,218 @@ func writeZip(t *testing.T, path string, files map[string]string) {
 		t.Fatal(err)
 	}
 }
+
+func TestParseOSRelease(t *testing.T) {
+	kv := parseOSRelease(`# Ubuntu 22.04.4 LTS
+NAME="Ubuntu"
+VERSION_ID="22.04"
+ID=ubuntu
+ID_LIKE=debian
+export HOME_URL="https://www.ubuntu.com/"
+PRETTY_NAME='Ubuntu 22.04.4 LTS'
+JUNK_WITHOUT_EQUALS
+`)
+	if kv["ID"] != "ubuntu" {
+		t.Errorf("不带引号的值也要认出来，得到 %q", kv["ID"])
+	}
+	if kv["ID_LIKE"] != "debian" {
+		t.Errorf("ID_LIKE = %q", kv["ID_LIKE"])
+	}
+	if kv["HOME_URL"] != "https://www.ubuntu.com/" {
+		t.Errorf("export 前缀要跳过，得到 %q", kv["HOME_URL"])
+	}
+	if kv["PRETTY_NAME"] != "Ubuntu 22.04.4 LTS" {
+		t.Errorf("单引号也要剥掉，得到 %q", kv["PRETTY_NAME"])
+	}
+	if _, ok := kv["JUNK_WITHOUT_EQUALS"]; ok {
+		t.Error("没有等号的行不该收进来")
+	}
+}
+
+func TestDistroFamily(t *testing.T) {
+	cases := []struct{ id, like, want string }{
+		{"ubuntu", "debian", "deb"},
+		{"debian", "", "deb"},
+		{"linuxmint", "ubuntu debian", "deb"},
+		{"centos", "rhel fedora", "rpm"},
+		{"rocky", "rhel", "rpm"},
+		{"fedora", "", "rpm"},
+		{"amzn", "", "rpm"},
+		{"alpine", "", "alpine"},
+		{"arch", "arch", "arch"},
+		{"manjaro", "arch", "arch"},
+		{"opensuse-leap", "suse", "suse"},
+		{"sles", "", "suse"},
+		{"openwrt", "", ""},
+		{"", "", ""},
+	}
+	for _, c := range cases {
+		got := distroFamily(map[string]string{"ID": c.id, "ID_LIKE": c.like})
+		if got != c.want {
+			t.Errorf("ID=%q ID_LIKE=%q 应该认成 %q，得到 %q", c.id, c.like, c.want, got)
+		}
+	}
+}
+
+// refreshSteps 是只刷索引、不动任何包的命令，允许里面没有 openvpn。
+var refreshSteps = map[string]bool{
+	"apt-get update -qq":               true,
+	"apk update --no-cache":            true,
+	"zypper --non-interactive refresh": true,
+	"pacman -Sy --noconfirm openvpn":   true, // Arch 的 -Sy 和安装合成一条
+}
+
+// 这个按钮只该升 openvpn 一个包：全量升级会连带升内核、会把无关服务重启一遍，
+// 那不是"升级 openvpn"这个按钮承诺的事。
+func TestOpenVPNUpgradePlanOnlyTouchesOpenVPN(t *testing.T) {
+	plans := map[string]string{
+		"ID=ubuntu\nID_LIKE=debian\n":          "deb",
+		"ID=centos\nID_LIKE=\"rhel fedora\"\n": "rpm",
+		"ID=alpine\n":                          "alpine",
+		"ID=arch\n":                            "arch",
+		"ID=opensuse-leap\nID_LIKE=suse\n":     "suse",
+	}
+	for blob, family := range plans {
+		steps, got, err := openvpnUpgradePlan(blob, allTools)
+		if err != nil {
+			t.Fatalf("%s: %v", blob, err)
+		}
+		if got != family {
+			t.Errorf("家族应该是 %s，得到 %s", family, got)
+		}
+		if len(steps) == 0 {
+			t.Fatalf("%s 的计划是空的", family)
+		}
+		for _, argv := range steps {
+			line := strings.Join(argv, " ")
+			if refreshSteps[line] {
+				continue
+			}
+			if !strings.Contains(line, "openvpn") {
+				t.Errorf("%s 系里出现了没点名 openvpn 的一步：%s", family, line)
+			}
+			for _, a := range argv {
+				if a == "-u" || a == "--asdeps" {
+					t.Errorf("%s 里出现了会影响整台机器的参数：%s", family, line)
+				}
+			}
+		}
+	}
+}
+
+func allTools(string) bool { return true }
+
+func TestOpenVPNUpgradePlanPrefersDnfThenYum(t *testing.T) {
+	rhel8 := "ID=rocky\nID_LIKE=\"rhel centos fedora\"\n"
+	steps, family, err := openvpnUpgradePlan(rhel8, func(n string) bool { return n == "dnf" })
+	if err != nil || family != "rpm" {
+		t.Fatalf("family=%s err=%v", family, err)
+	}
+	if steps[0][0] != "dnf" {
+		t.Errorf("有 dnf 就该用 dnf，得到 %v", steps[0])
+	}
+
+	steps, _, err = openvpnUpgradePlan(rhel8, func(n string) bool { return n == "yum" })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if steps[0][0] != "yum" {
+		t.Errorf("CentOS 7 只有 yum，得到 %v", steps[0])
+	}
+	if strings.Contains(describeSteps(steps), "dnf") {
+		t.Errorf("描述里不该出现没在用的工具：%s", describeSteps(steps))
+	}
+
+	if _, _, err := openvpnUpgradePlan(rhel8, func(string) bool { return false }); err == nil {
+		t.Error("dnf 和 yum 都没有时应该报错，而不是给一条跑不通的命令")
+	}
+}
+
+func TestOpenVPNUpgradePlanRejectsUnknownDistro(t *testing.T) {
+	_, family, err := openvpnUpgradePlan("ID=openwrt\nNAME=\"OpenWrt\"\n", allTools)
+	if err == nil {
+		t.Fatal("认不出发行版时必须报错")
+	}
+	if family != "" {
+		t.Errorf("认不出来就不该有家族，得到 %s", family)
+	}
+	if !strings.Contains(err.Error(), "手动") {
+		t.Errorf("错误里要告诉用户怎么办，得到 %v", err)
+	}
+}
+
+func TestTailLines(t *testing.T) {
+	in := "a\nb\nc\nd\ne\n"
+	if got := tailLines(in, 2); got != "d\ne" {
+		t.Errorf("只要末尾两行，得到 %q", got)
+	}
+	if got := tailLines("只有一行\n", 5); got != "只有一行" {
+		t.Errorf("不足 n 行时原样返回，得到 %q", got)
+	}
+	if got := tailLines("", 3); got != "" {
+		t.Errorf("空输出应该是空，得到 %q", got)
+	}
+}
+
+func TestParseVersionParts(t *testing.T) {
+	cases := []struct {
+		in           string
+		major, minor int
+		ok           bool
+	}{
+		{"2.6.8", 2, 6, true},
+		{"2.4.11", 2, 4, true},
+		{"2.5.8-0ubuntu1", 2, 5, true}, // 发行版后缀要能容忍
+		{"2.6", 2, 6, true},
+		{"3.0.1", 3, 0, true},
+		{"", 0, 0, false},
+		{"2", 0, 0, false},
+		{"v2.6.0", 0, 0, false}, // 版本号里没有 v，出现了就当读不出
+		{"openvpn", 0, 0, false},
+	}
+	for _, c := range cases {
+		maj, min, ok := parseVersionParts(c.in)
+		if ok != c.ok || maj != c.major || min != c.minor {
+			t.Errorf("parseVersionParts(%q) = %d.%d,%v，想 %d.%d,%v", c.in, maj, min, ok, c.major, c.minor, c.ok)
+		}
+	}
+}
+
+// 同一个意思在三个版本段里名字不一样，喂错名字 openvpn 是直接退出而不是警告。
+func TestDataCipherArgs(t *testing.T) {
+	cases := []struct {
+		ver      string
+		wantFlag string
+		wantNil  bool
+	}{
+		{"2.6.8", "--data-ciphers", false},
+		{"2.5.8", "--data-ciphers", false},
+		{"3.1.0", "--data-ciphers", false},
+		{"2.4.11", "--ncp-ciphers", false},
+		{"2.3.20", "", true},
+		{"", "", true},
+		{"junk", "", true},
+	}
+	for _, c := range cases {
+		got := dataCipherArgs(c.ver)
+		if c.wantNil {
+			if len(got) != 0 {
+				t.Errorf("%s 不该给算法参数（默认表更安全），得到 %v", c.ver, got)
+			}
+			continue
+		}
+		if len(got) == 0 || got[0] != c.wantFlag {
+			t.Errorf("%s 应该用 %s，得到 %v", c.ver, c.wantFlag, got)
+		}
+		if !strings.Contains(strings.Join(got, " "), "AES-256-CBC") {
+			t.Errorf("%s 的算法表里要留 AES-256-CBC，Gate 上一大批老节点只讲它：%v", c.ver, got)
+		}
+	}
+	// fallback 只在认得这个参数的版本上给，否则同样是"未识别选项"
+	if s := strings.Join(dataCipherArgs("2.4.11"), " "); strings.Contains(s, "fallback") {
+		t.Errorf("2.4 不认 --data-ciphers-fallback：%s", s)
+	}
+	if s := strings.Join(dataCipherArgs("2.6.8"), " "); !strings.Contains(s, "--data-ciphers-fallback") {
+		t.Errorf("2.6 应该带 fallback，不然只讲 AES-256-CBC 的老节点连不上：%s", s)
+	}
+}
