@@ -54,6 +54,17 @@ type PoolService struct {
 	probing map[string]bool
 	stop    chan struct{}
 	stopOn  sync.Once
+
+	// 自动补位的三本账，都由 mu 护着。
+	// fillDead: 组 ID → 成员主机名 → 从什么时候开始看它不行
+	// fillBad:  补位试过的节点 → 冷却到什么时候
+	// fillNote: 组 ID → 为什么还没补齐（给界面看的原因，不是日志）
+	fillDead map[string]map[string]time.Time
+	fillBad  map[string]time.Time
+	fillNote map[string]string
+	// filling 让补位不叠加：一次补位要等满连接预算，几十秒起步，
+	// 期间到的每一个 tick 都该跳过而不是排起长队。
+	filling bool
 }
 
 // newPoolService 读盘、给每个组起监听，并开始后台测速。
@@ -63,12 +74,15 @@ func newPoolService(dir string, mgr *Manager) (*PoolService, error) {
 		return nil, err
 	}
 	s := &PoolService{
-		dir:     dir,
-		mgr:     mgr,
-		store:   st,
-		run:     map[string]*poolRun{},
-		probing: map[string]bool{},
-		stop:    make(chan struct{}),
+		dir:      dir,
+		mgr:      mgr,
+		store:    st,
+		run:      map[string]*poolRun{},
+		probing:  map[string]bool{},
+		stop:     make(chan struct{}),
+		fillDead: map[string]map[string]time.Time{},
+		fillBad:  map[string]time.Time{},
+		fillNote: map[string]string{},
 	}
 	for _, p := range st.Pools {
 		if err := s.ensureListener(p); err != nil {
@@ -76,6 +90,7 @@ func newPoolService(dir string, mgr *Manager) (*PoolService, error) {
 		}
 	}
 	go s.probeLoop()
+	go s.fillLoop()
 	return s, nil
 }
 
@@ -283,6 +298,7 @@ func (s *PoolService) deletePool(id string) error {
 	err := s.store.save(s.dir)
 	s.mu.Unlock()
 	s.dropListener(id)
+	s.dropFillLedger(id)
 	return err
 }
 

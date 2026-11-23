@@ -144,6 +144,35 @@ func (m *Manager) Tunnels() []*Tunnel {
 	return out
 }
 
+// SlotHeadroom 返回还能再开几条出口。自动补位靠它守水位。
+func (m *Manager) SlotHeadroom() int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	free := m.maxSlots - len(m.tunnels)
+	if free < 0 {
+		return 0
+	}
+	return free
+}
+
+// NodeRegion 按主机名查它属于哪个国家码。
+//
+// 补位要"跟着掉线那个的地区"，可掉线的那条隧道可能已经被停掉删掉了，
+// 这时候只能从节点清单里查。查不到返回空串，调用方按任意地区处理。
+func (m *Manager) NodeRegion(host string) string {
+	if host == "" {
+		return ""
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for _, n := range m.nodes {
+		if n.HostName == host {
+			return n.CountryCode
+		}
+	}
+	return ""
+}
+
 // freeSlot 找一个未占用的槽位。槽位同时决定端口与网段。
 func (m *Manager) freeSlot() (int, error) {
 	for i := 1; i <= m.maxSlots; i++ {

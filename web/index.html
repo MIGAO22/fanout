@@ -1325,6 +1325,15 @@ html[data-theme="dark"] .scr{background:rgba(0,0,0,.62)}
         <div class="pb-list" id="pohosts"></div>
         <div class="hint">勾选的出口组成这个组。某条换了节点，组里会自动跟着改名，绑定不用重做。</div>
       </div>
+
+      <div class="grp">
+        <label class="sw"><input type="checkbox" id="poofill"><span class="track"></span>
+          <span>掉线自动补新出口</span></label>
+        <div class="field" id="posizewrap" style="margin-top:var(--sp-3)"><label>维持可用条数</label>
+          <input class="inp" id="posize" type="number" min="1" max="32" step="1" value="2"></div>
+        <div class="hint" id="pofillhint">开着时组里哪条出口长时间连不上，就自动在同地区挑一条新的顶上，条数维持不变；
+          绑在它上面的节点链接不用重做。槽位余量不足时不补，并在组上写明原因。</div>
+      </div>
     </div>
     <div class="df">
       <div class="hint" id="pook"></div>

@@ -73,6 +73,31 @@ const (
 	// 下一批连接就得重新踩。
 	poolProbeInterval = 20 * time.Second
 	poolProbeStale    = 2 * time.Minute
+
+	// ── 自动补齐（AutoFill）───────────────────────────────
+
+	// poolFillInterval 是补位巡检的节奏。比测速慢一倍是有意的：补位要起
+	// openvpn 进程、占槽位，属于这条链路上最贵的动作，不该跟着 UI 一起急。
+	poolFillInterval = 30 * time.Second
+
+	// poolFillDeadAfter 是"这条成员放弃了吗"的等待门槛。
+	//
+	// fanout 本来就会自动换同区节点重连，VPN Gate 的掉线绝大多数几分钟内自愈。
+	// 一掉就补会和那条路径打架：两条出口同时抢一个地区，补出来的那条
+	// 其实根本不需要。等满这段时间还起不来，才认定这个位置真空了。
+	poolFillDeadAfter = 5 * time.Minute
+
+	// poolFillSlotFloor 是补位必须留下的槽位余量。
+	// 自动补位是唯一会"自己开出口"的路径，不加水位的话某组连崩几轮
+	// 就能把 maxSlots 吃光，用户手动开出口反倒开不了。
+	poolFillSlotFloor = 2
+
+	// poolFillPenalty 是某个节点补位失败的冷却：这段时间内不再拿它当补位候选。
+	// 没有这层，每轮巡检都会从头再撞一遍同一批死节点。
+	poolFillPenalty = 10 * time.Minute
+
+	// poolMaxSize 与成员上限一致：目标数超过成员上限没有意义。
+	poolMaxSize = 32
 )
 
 // probeTarget 是测速用的拨号地址。用 IP 而不是域名：测的是隧道到公网的
@@ -117,6 +142,12 @@ type Pool struct {
 	RRStep int       `json:"rr_step"`
 	Port   int       `json:"port"`
 	Cred   SocksCred `json:"cred"`
+	// AutoFill 打开后，某个成员长时间连不上就自动起一条新出口顶替它。
+	// 关闭时一切照旧：组员只有用户自己动得了。零值是关闭，旧 pools.json 不用迁移。
+	AutoFill bool `json:"auto_fill"`
+	// Size 是要维持的可用成员数。开开关那一刻取当前成员数，之后恒定——
+	// 不然「补回原来的数量」这个目标会随掉线一起缩水，越补越少。
+	Size int `json:"size"`
 }
 
 // identity 是这个组在绑定串与 outboundTag 里的身份。
@@ -163,6 +194,14 @@ func (p *Pool) normalize() {
 		hosts = append(hosts, h)
 	}
 	p.Hosts = hosts
+	if p.Size > poolMaxSize {
+		p.Size = poolMaxSize
+	}
+	if p.AutoFill && p.Size < 1 {
+		// 开开关时把目标数钉成"现在这几个"。不钉的话 Size 是 0，
+		// 判据会变成"一个都不用补"，开关看着像坏了。
+		p.Size = len(p.Hosts)
+	}
 	if strings.TrimSpace(p.Name) == "" {
 		p.Name = "出口组 " + p.ID
 	}
@@ -472,4 +511,65 @@ func targetKey(addr string) string {
 		return h
 	}
 	return addr
+}
+
+// poolGoneHosts 把成员分成"此刻能用"和"该被顶替"两拨。
+//
+// 掉线分两种，等不等要分开看：
+//
+//   - 隧道还在、只是没连上（NS 非空）：等。fanout 自己会换同区节点重连，
+//     刚掉两分钟的出口大概率回得来，这时候补位是白烧一个槽位，
+//     还会和重连抢同一个地区。firstDead 记的就是"从什么时候开始看它不行"。
+//   - 隧道整个没了（NS 为空）：不等。没有任何东西会把它带回来，
+//     再等 5 分钟只是让组白白缺人。启动时恢复的隧道是以 starting 进表的，
+//     不会走到这一支，所以不用担心一起进程就把整组拆了重补。
+//
+// 返回的 gone 保持成员表里的先后次序：补上来的新出口顶替原位，
+// 组的成员顺序不会因一次补位而重排（单一模式的默认首选就是第一个，
+// 重排等于悄悄改了用户的选路起点）。
+func poolGoneHosts(members []poolMember, firstDead map[string]time.Time, after time.Duration, now time.Time) (live int, gone []string) {
+	for _, m := range members {
+		if m.Up {
+			// 活了。记账本清掉，下次再掉要从头等满 after，
+			// 否则一条"掉→回→掉"的隧道第二次掉线时会被立刻判死。
+			delete(firstDead, m.Host)
+			live++
+			continue
+		}
+		if m.NS == "" {
+			gone = append(gone, m.Host)
+			delete(firstDead, m.Host)
+			continue
+		}
+		first, ok := firstDead[m.Host]
+		if !ok {
+			firstDead[m.Host] = now
+			continue
+		}
+		if now.Sub(first) >= after {
+			gone = append(gone, m.Host)
+		}
+	}
+	return live, gone
+}
+
+// poolFillFollow 给每个补位名额指定"跟谁的地区"。
+//
+// 返回的是失效成员的主机名而不是国家码：地区查得到查不到是调用方的事
+// （隧道可能已经被删了，只能回头从节点清单里查），纯函数这里只管配对。
+// 名额多于失效成员时（比如用户把目标数调大了），多出来的那些给空串，
+// 意思是"没有原来的地区可跟，任意地区都行"——再窄化成某个地区就成了凭空猜。
+func poolFillFollow(need int, gone []string) []string {
+	if need <= 0 {
+		return nil
+	}
+	out := make([]string, 0, need)
+	for i := 0; i < need; i++ {
+		if i < len(gone) {
+			out = append(out, gone[i])
+			continue
+		}
+		out = append(out, "")
+	}
+	return out
 }

@@ -27,6 +27,11 @@ func apiPools(m *Manager) http.HandlerFunc {
 			"modes":     modes,
 			"rr_step":   poolDefaultRRStep,
 			"max_hosts": 32,
+			// 补位规则的阈值一并给界面：文案里要写"连续 5 分钟连不上才算死"、
+			// "槽位余量不足 2 个就不补"，硬编码在前端的话改了这边那边不知道。
+			"fill_dead_after_min": int(poolFillDeadAfter.Minutes()),
+			"fill_slot_floor":     poolFillSlotFloor,
+			"fill_max_size":       poolMaxSize,
 		})
 	}
 }
@@ -39,6 +44,10 @@ func apiPoolSave(m *Manager) http.HandlerFunc {
 		Mode   string   `json:"mode"`
 		RRStep int      `json:"rr_step"`
 		Hosts  []string `json:"hosts"`
+		// AutoFill 打开后 Size 就是这个组要维持的可用成员数；关闭时 Size 无意义，
+		// 所以前端关了开关可以不传，这里也不拿旧值去猜用户想维持几条。
+		AutoFill bool `json:"auto_fill"`
+		Size     int  `json:"size"`
 	}
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -62,6 +71,17 @@ func apiPoolSave(m *Manager) http.HandlerFunc {
 		p := &Pool{
 			ID: strings.TrimSpace(in.ID), Name: in.Name, Mode: in.Mode,
 			RRStep: in.RRStep, Hosts: in.Hosts,
+			AutoFill: in.AutoFill, Size: in.Size,
+		}
+		// 目标条数不能比勾选的组员还少：那样保存完组立刻"缺人"，
+		// 补位回路会凭空多出好几条隧道去凑一个用户没要过的规模。
+		// 超过 poolMaxSize 由 normalize 夹住。
+		if p.AutoFill && in.Size > len(p.Hosts) {
+			writeJSON(w, http.StatusBadRequest, map[string]string{
+				"error": fmt.Sprintf("要维持 %d 条可用出口，但只勾了 %d 条组员：目标条数不能超过组内出口数",
+					in.Size, len(p.Hosts)),
+			})
+			return
 		}
 		if err := checkPoolHosts(p, m.Tunnels()); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})

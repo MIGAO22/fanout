@@ -503,16 +503,27 @@ function poolRow(p){
     ? '<div class="errbox"><b>组没在跑</b>本机监听没起来，绑到它的链接会直接失败</div>'
     : (p.up === 0 ? '<div class="errbox"><b>组内没有可用出口</b>连接会失败，不会退回母机直连</div>' : '');
 
+  const fillTag = p.auto_fill
+    ? ' <span class="pt" title="掉线后自动挑新出口顶到这一条上">自动补齐 ' + p.size + ' 条</span>'
+    : '';
+  // 没补齐时后端会写一句原因（槽位水位不够 / 同地区没得挑）。
+  // 只在还缺人的时候显示，补齐了就闭嘴，否则一个正常的组永远挂着灰字。
+  const fillNote = (p.auto_fill && p.fill_note && p.up < p.size)
+    ? '<div class="hint" style="margin:-2px 0 8px">' + esc(p.fill_note) + '</div>'
+    : '';
+
   return '<div class="poolblk">'
     + '<div class="orow">'
     + '<span class="orb ' + st + '" title="' + (p.running ? '监听中' : '未监听') + '"></span>'
     + '<span class="nm">' + esc(p.name)
     +   ' <span class="pt">' + esc(p.mode_label) + '</span>'
-    +   ' <span class="pt">' + p.up + '/' + p.total + ' 可用</span></span>'
+    +   ' <span class="pt">' + p.up + '/' + p.total + ' 可用</span>'
+    +   fillTag + '</span>'
     + '<span class="spacer"></span>'
     + '<span class="none">' + esc(p.mode_desc || '') + '</span>'
     + '</div>'
     + '<div class="chips" style="margin:0 0 8px">' + mem + '</div>'
+    + fillNote
     + '<div class="chips" style="margin:0 0 10px">' + ibs + '</div>'
     + warn
     + '<div class="acts" style="margin-bottom:12px">'
@@ -555,6 +566,9 @@ async function openPool(id){
     + dead.map(h => '<label class="dead"><input type="checkbox" value="' + esc(h) + '">'
         + '<span class="h">' + esc(h) + '</span><span class="n">已失效，保存后从组里移除</span></label>').join('')
     || '<div class="none">还没有可用的出口，先开一条再建组。</div>';
+  // 补位目标条数：已有组沿用它存的值，新建时按勾选条数起头
+  $('#poofill').checked = p ? !!p.auto_fill : false;
+  $('#posize').value = (p && p.size) ? p.size : 0;
   syncPoolSel();
 
   openModal('pooldlg');
@@ -572,6 +586,23 @@ function syncPoolSel(){
   const n = $$('#pohosts input:checked').length;
   $('#pomsel').textContent = '已选 ' + n + ' 条';
   $('#posave').disabled = n === 0;
+  paintPoolFill(n);
+}
+
+// 维持条数的上限就是勾选的组员数：目标比组员还少，保存完组立刻"缺人"，
+// 补位回路会凭空多开几条隧道去凑一个用户没要过的规模（后端同样会拒）。
+// 开关关掉时把输入框整块收起——它是这个开关的参数，留着只会让人以为单独有效。
+function paintPoolFill(n){
+  const on = $('#poofill').checked;
+  $('#posizewrap').hidden = !on;
+  if(!on) return;
+  const size = $('#posize');
+  size.min = 1;
+  size.max = Math.max(1, n);
+  // 空着、0、比勾选数还大，都夹回"就等于勾选数"：
+  // 开着开关最常见的意图就是"我勾几条就要维持几条"。
+  const v = parseInt(size.value, 10);
+  if(!(v >= 1) || v > n) size.value = Math.max(1, n);
 }
 
 $('#pomode').addEventListener('click', e => {
@@ -581,11 +612,15 @@ $('#pomode').addEventListener('click', e => {
   paintPoolMode();
 });
 $('#pohosts').addEventListener('change', syncPoolSel);
+$('#poofill').addEventListener('change', () => paintPoolFill($$('#pohosts input:checked').length));
 
 $('#posave').onclick = async () => {
   const btn = $('#posave');
   const hosts = $$('#pohosts input:checked').map(i => i.value);
   if(!hosts.length) return toast('至少勾选一条出口', 'bad');
+  const autoFill = $('#poofill').checked;
+  const size = parseInt($('#posize').value, 10) || 0;
+  if(autoFill && size > hosts.length) return toast('维持条数不能超过勾选的出口数', 'bad');
   btn.disabled = true;
   try{
     await api('/api/pool/save', {
@@ -594,6 +629,7 @@ $('#posave').onclick = async () => {
       body: JSON.stringify({
         id: poolEdit, name: $('#poname').value.trim(), mode: poolMode,
         rr_step: parseInt($('#postep').value, 10) || 5, hosts,
+        auto_fill: autoFill, size,
       }),
     });
     toast(poolEdit ? '出口组已保存' : '出口组已创建', 'ok');

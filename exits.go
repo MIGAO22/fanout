@@ -60,6 +60,10 @@ type PoolView struct {
 	SocksPass string           `json:"socks_pass"`
 	Members   []PoolMemberView `json:"members"`
 	Inbounds  []ExitInbound    `json:"inbounds"`
+	// AutoFill 开了就有 Size 这个要维持的可用成员数；FillNote 是还没补齐时的原因。
+	AutoFill bool   `json:"auto_fill"`
+	Size     int    `json:"size"`
+	FillNote string `json:"fill_note,omitempty"`
 }
 
 // ExitsView 是主界面需要的全部数据。
@@ -195,12 +199,14 @@ func poolViews(tunnels []*Tunnel) []PoolView {
 	}
 
 	out := make([]PoolView, 0, len(poolsSvc.pools()))
+	notes := poolsSvc.fillNotes()
 	for _, p := range poolsSvc.pools() {
 		pv := PoolView{
 			ID: p.ID, Identity: p.identity(), Name: p.Name, Mode: p.Mode,
 			ModeLabel: poolModeLabels[p.Mode], ModeDesc: poolModeDesc[p.Mode],
 			RRStep: p.RRStep, Port: p.Port,
 			SocksUser: p.Cred.User, SocksPass: p.Cred.Pass,
+			AutoFill: p.AutoFill, Size: p.Size, FillNote: notes[p.ID],
 		}
 		live := map[string]bool{}
 		for _, e := range egressPools() {
