@@ -143,8 +143,10 @@ jobs:
           GOT=$(grep -m1 -oE 'OpenVPN [0-9]+\.[0-9]+\.[0-9]+' /tmp/vers.txt | cut -d' ' -f2)
           echo "跑出来的是 $GOT，预期 $VER"
           [ "$GOT" = "$VER" ] || { echo "版本对不上，登记这一步在程序里也会拒绝"; exit 1; }
-          # 数据通道算法的参数名按 2.5+ 走；程序里 dataCipherArgs 的判据靠它
-          "$PREFIX"/sbin/openvpn --help 2>&1 | grep -q -- '--data-ciphers' \
+          # 数据通道算法的参数名按 2.5+ 走；程序里 dataCipherArgs 的判据靠它。
+          # 先落盘再 grep：openvpn --help 本身以非 0 退出，配 pipefail 直接管道会被它带红。
+          "$PREFIX"/sbin/openvpn --help > /tmp/help.txt 2>&1 || true
+          grep -m1 -- '--data-ciphers' /tmp/help.txt \
             || { echo "这份构建不认识 --data-ciphers，dataCipherArgs 的判据要重看"; exit 1; }
           # 整个前提是"不覆盖系统那份"：apt 装的话它还在原处
           if command -v openvpn > /dev/null; then
