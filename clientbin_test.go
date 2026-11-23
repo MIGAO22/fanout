@@ -2,6 +2,7 @@ package main
 
 import (
 	"archive/zip"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -515,5 +516,92 @@ func TestOpenVPNRepoVersionCompare(t *testing.T) {
 		if got := versionLess(c.cur, c.latest); got != c.want {
 			t.Errorf("versionLess(%q, %q) = %v, 想 %v", c.cur, c.latest, got, c.want)
 		}
+	}
+}
+
+// 官方 release 的 tag 形状各家不一样，而界面拿它跟本机版本并排显示，
+// 报一个 rc 出去就是"让你去升一个预览版"。
+func TestReleaseTagNormalizes(t *testing.T) {
+	ok := map[string]string{
+		"v26.11.9": "26.11.9", // Xray-core 的 tag 带 v，本机 xray version 不带，得归一
+		"v2.7.9":   "2.7.9",
+		"2.7.9":    "2.7.9",
+		" v1.2.3 ": "1.2.3",
+	}
+	for in, want := range ok {
+		got, good := releaseTag(in)
+		if !good || got != want {
+			t.Errorf("releaseTag(%q) = %q,%v, 想 %q,true", in, got, good, want)
+		}
+	}
+	bad := []string{"", "v", "v2.7_rc6", "v2.7.9_rc1", "2.7.9-rc1", "latest", "v2..7", "vx.y.z"}
+	for _, in := range bad {
+		if got, good := releaseTag(in); good {
+			t.Errorf("%q 不该被当成稳定版号，却给了 %q", in, got)
+		}
+	}
+}
+
+// 官方比包管理器能给到的新时那句解释：不说清就成了"明明有新版却说没有"，
+// 说错了又成了"你能升"结果装出来还是旧号。
+func TestOvpnUpstreamNote(t *testing.T) {
+	cases := []struct {
+		installed, repo, upstream, want string
+	}{
+		{"2.6.19", "2.6.19-0ubuntu0.24.04.5", "2.7.9",
+			"包管理器最高只到 2.6.19-0ubuntu0.24.04.5，官方 2.7.9 得走 OpenVPN 自己的源（swupdate.openvpn.net）"},
+		{"2.6.14", "2.6.14-0+deb12u2", "2.7.9",
+			"包管理器最高只到 2.6.14-0+deb12u2，官方 2.7.9 得走 OpenVPN 自己的源（swupdate.openvpn.net）"},
+		{"2.6.14", "2.7.9-1", "2.7.9", ""}, // 仓库已经追平官方，没话要说
+		{"2.6.14", "", "2.7.9", ""},        // 仓库号问不到时不猜
+	}
+	for _, c := range cases {
+		if got := ovpnUpstreamNote(c.installed, c.repo, c.upstream); got != c.want {
+			t.Errorf("ovpnUpstreamNote(%q,%q,%q) = %q, 想 %q", c.installed, c.repo, c.upstream, got, c.want)
+		}
+	}
+}
+
+// 撞锁是刷索引最常见的失败（自动更新正占着 apt），它跟"镜像源连不上"是两回事：
+// 前者等一会儿就有答案，后者等多久都没。判错了措辞就跟着错。
+func TestLooksLocked(t *testing.T) {
+	yes := []string{
+		"exit status 100: E: Could not get lock /var/lib/apt/lists/lock. It is held by process 4150393 (apt-get)",
+		"E: Unable to lock directory /var/lib/apt/lists/",
+		"E: dpkg is lock frontend (failed to get lock)",
+		"waiting for process with pid 123 to finish",
+	}
+	for _, m := range yes {
+		if !looksLocked(errors.New(m)) {
+			t.Errorf("%q 该认成撞锁", m)
+		}
+	}
+	no := []string{
+		"exit status 100: E: Failed to fetch http://deb.debian.org/debian 连接超时",
+		"exit status 1",
+		"context deadline exceeded",
+	}
+	for _, m := range no {
+		if looksLocked(errors.New(m)) {
+			t.Errorf("%q 不该认成撞锁", m)
+		}
+	}
+	if looksLocked(nil) {
+		t.Error("没有错误时不该说撞锁")
+	}
+}
+
+func TestRefreshWhy(t *testing.T) {
+	lock := errors.New("exit status 100: E: Could not get lock /var/lib/apt/lists/lock. It is held by process 4150393 (apt-get)")
+	got := refreshWhy("apt-get", lock)
+	if !strings.Contains(got, "正被别的进程占用") || !strings.Contains(got, "可能偏旧") {
+		t.Errorf("撞锁该说清是别人占着、号可能偏旧，得 %q", got)
+	}
+	if strings.Contains(got, "4150393") {
+		t.Errorf("不该把 apt 的原始 pid 甩到界面上：%q", got)
+	}
+	slow := errors.New("exit status 124: tail: context deadline exceeded")
+	if got := refreshWhy("apt-get", slow); !strings.Contains(got, "context deadline exceeded") {
+		t.Errorf("非锁失败要带上原始原因，得 %q", got)
 	}
 }

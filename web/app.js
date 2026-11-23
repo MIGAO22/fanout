@@ -1784,11 +1784,11 @@ function paintClientBin(c, checked){
   $('#cliXrayLatest').textContent = !checked || !c.latest ? ''
     : !c.updatable ? ' · 上游 ' + c.latest
     : c.has_update ? ' → ' + c.latest : ' · 已是最新';
-  // openvpn 一样：不说空话，把仓库里那个号原样摆出来，用户自己能跟上面对一下。
-  // stale 是索引没刷动，这个号来自旧索引，必须标出来。
-  $('#cliOvpnLatest').textContent = !checked || !c.openvpn_latest ? ''
-    : c.openvpn_has_update ? ' → ' + c.openvpn_latest
-    : ' · ' + (c.openvpn_stale ? '旧索引 ' : '仓库 ') + c.openvpn_latest;
+  // openvpn 的基准是 GitHub 官方 release（OpenVPN/openvpn），跟机器上的发行版无关：
+  // 拿各台自己的仓库号当"最新版"，才会出现三台三个号各自都叫最新。
+  // 仓库能给到哪一号不占胶囊——那是下面那颗升级按钮的事，装出来的就是它。
+  $('#cliOvpnLatest').textContent = !checked || !c.openvpn_upstream ? ''
+    : c.openvpn_behind_upstream ? ' · 上游 ' + c.openvpn_upstream : ' · 已是上游最新';
   $('#cliXrayHint').textContent = c.updatable
     ? 'Xray 走官方发布，openvpn 走系统包管理器。'
     : (c.reason || '这台机器上没有可由 fanout 替换的 Xray。');
@@ -1800,8 +1800,9 @@ function paintClientBin(c, checked){
     $('#cliOvpnApplyVer').textContent = c.openvpn_latest;
     $('#cliOvpnApply').hidden = false;
   }
-  // 这行只在真出问题时装满：认不出家族、没有对应的包管理器、索引没刷动、执行失败
-  clientNote(checked ? c.openvpn_reason : '');
+  // 这行只在有话非说不可时装满：认不出家族、没有包管理器、索引没刷动，
+  // 或者官方已经 2.7.9 而 apt 最高只给到 2.6.x——后者不说就成了"明明有新版却说没有"
+  clientNote(checked ? (c.openvpn_reason || c.openvpn_note) : '');
   if(c.check_error) toast('问最新版失败: ' + c.check_error, 'bad');
 }
 
@@ -1817,9 +1818,9 @@ $('#cliCheck').onclick = async e => {
     if(c.has_update) toast('Xray 有新版本 ' + c.latest, 'info');
     else if(c.latest && !c.updatable) toast('Xray 上游最新是 ' + c.latest + '，但这份不由 fanout 升级', 'ok');
     else if(c.latest) toast('Xray 已是最新版', 'ok');
-    if(c.openvpn_has_update) toast('仓库里的 openvpn 是 ' + c.openvpn_latest, 'info');
-    else if(c.openvpn_latest) toast('仓库里的 openvpn 就是 ' + c.openvpn_latest +
-      (c.openvpn_stale ? '（索引没刷动，这是旧索引里的号）' : ''), 'ok');
+    if(c.openvpn_upstream) toast(c.openvpn_behind_upstream
+      ? 'openvpn 官方最新 ' + c.openvpn_upstream + '，本机 ' + (c.openvpn || '未知')
+      : 'openvpn 已是官方最新（' + c.openvpn_upstream + '）', c.openvpn_behind_upstream ? 'info' : 'ok');
   }catch(err){
     $('#cliXrayLatest').textContent = '';
     clientNote('查询失败: ' + err.message);

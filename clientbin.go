@@ -30,6 +30,55 @@ import (
 // xrayReleaseRepo 是内置 Xray 的取包来源，和 install.sh 保持一致。
 const xrayReleaseRepo = "XTLS/Xray-core"
 
+// openvpn 的官方发布仓库。它只发源码包（openvpn-2.7.9.tar.gz + .asc），没有能直接装到
+// 机器上的二进制，所以这里给的是"上游已经走到哪"这个号；apt/dnf 真能装到的还是下面
+// 那个仓库版本。两个号都摆出来，用户才看得出"我落后可了"和"我能升什么"是两件事。
+const openvpnReleaseRepo = "OpenVPN/openvpn"
+
+// releaseTag 把 GitHub release 的 tag 归一成能跟本机版本并排显示的号：去掉 v 前缀，
+// 并且只认 "26.11.9" 这种纯数字点分号。OpenVPN 的候选版 tag（v2.7_rc6）压根没有 release
+// 对象、/releases/latest 拿不到，但哪天它们改成发 release，这里也不至于把一个 rc 报成稳定版。
+func releaseTag(tag string) (string, bool) {
+	t := strings.TrimPrefix(strings.TrimSpace(tag), "v")
+	if t == "" {
+		return "", false
+	}
+	for _, seg := range strings.Split(t, ".") {
+		if seg == "" {
+			return "", false
+		}
+		for _, r := range seg {
+			if r < '0' || r > '9' {
+				return "", false
+			}
+		}
+	}
+	return t, true
+}
+
+// releaseLatestTag 问某个仓库官方最新 release 的号，回来已经归一化过。
+func releaseLatestTag(repo string) (string, error) {
+	rel, err := fetchReleaseLatest(repo)
+	if err != nil {
+		return "", err
+	}
+	t, ok := releaseTag(rel.TagName)
+	if !ok {
+		return "", fmt.Errorf("%s 的最新版 tag %q 不像稳定版号", repo, rel.TagName)
+	}
+	return t, nil
+}
+
+// ovpnUpstreamNote 只在官方比包管理器能给到的还新时给一句话：这时候「升级 openvpn」
+// 装出来的版本号确实比界面那个官方号旧，不解释清楚就成了新的"明明有新版却说没有"。
+// 仓库号问不到（空）时不猜。
+func ovpnUpstreamNote(installed, repo, upstream string) string {
+	if repo == "" || !versionLess(repo, upstream) {
+		return ""
+	}
+	return fmt.Sprintf("包管理器最高只到 %s，官方 %s 得走 OpenVPN 自己的源（swupdate.openvpn.net）", repo, upstream)
+}
+
 // ClientBinStatus 是界面「内置客户端」这张卡要的全部信息。
 type ClientBinStatus struct {
 	Backend   string `json:"backend"`    // 当前节点后端：native / 3x-ui / xray-cf-lite
@@ -42,8 +91,9 @@ type ClientBinStatus struct {
 	Reason    string `json:"reason,omitempty"`
 	CheckErr  string `json:"check_error,omitempty"` // 问 GitHub 失败的原因，不影响上面的字段
 
-	// openvpn 这半边由发行版的包管理器负责：family/cmd 是"要点就跑这几条"，
-	// latest 是仓库里现在的版本（点了检查更新才有，查之前会先刷一次索引）
+	// openvpn 有两个"最新版"，得分开给，之前只给前者才闹出三台机器三个"最新版"：
+	//   upstream 是 GitHub 上 OpenVPN/openvpn 的官方 release，跟机器无关，三台问出来同一个号；
+	//   latest 是本机包管理器实际能给到的版本，它决定「升级 openvpn」那颗按钮装到哪。
 	OvpnFamily string `json:"openvpn_family,omitempty"` // deb / rpm / alpine / arch / suse
 	OvpnCmd    string `json:"openvpn_cmd,omitempty"`
 	OvpnUpdate bool   `json:"openvpn_updatable"` // 认得出家族、机器上有对应的包管理器
@@ -51,8 +101,13 @@ type ClientBinStatus struct {
 	OvpnLatest string `json:"openvpn_latest,omitempty"`
 	OvpnHas    bool   `json:"openvpn_has_update"` // 仓库那份确实比本机新
 	// 索引没刷动时仓库版本号只能来自本机那份旧索引，这时"已是最新"是句假话，
-	// 界面必须换个说法（VPS 上几个月不 apt-get update 太常见了）
+	// 界面必须换个说法（VPS 上几个月不 apt-get update、或者 apt 正被自动更新占用）
 	OvpnStale bool `json:"openvpn_stale,omitempty"`
+
+	OvpnUpstream string `json:"openvpn_upstream,omitempty"` // 官方 release 版本号，已去掉 tag 的 v
+	OvpnBehind   bool   `json:"openvpn_behind_upstream"`    // 本机比官方 release 旧
+	// 官方比仓库能装到的还新时那句解释，界面直接摆出来，不在前端比版本号
+	OvpnNote string `json:"openvpn_note,omitempty"`
 }
 
 // xrayAssetForArch 把 GOARCH 换成 Xray-core release 的资产名。
@@ -180,16 +235,30 @@ func clientBinStatus(askLatest bool) *ClientBinStatus {
 			}
 		}
 	}
-	rel, err := fetchReleaseLatest(xrayReleaseRepo)
-	if err != nil {
-		st.CheckErr = err.Error()
-		return st
+	// 两份客户端的"最新版"都对接 GitHub 官方 release：Xray 是 XTLS/Xray-core，
+	// openvpn 是 OpenVPN/openvpn。openvpn 这个号跟机器上的发行版无关，三台 VPS 问出来
+	// 是同一个——之前只报各台自己仓库里的号，才会出现"三个不同版本各自都叫最新"。
+	xv, xerr := releaseLatestTag(xrayReleaseRepo)
+	ov, oerr := releaseLatestTag(openvpnReleaseRepo)
+	if xerr != nil {
+		st.CheckErr = xerr.Error()
+	} else {
+		st.Latest = xv
+		// HasUpdate 只在 fanout 真能替换那份二进制时才有意义。接管模式下它恒为 false，
+		// 但 Latest 照样带出去——界面不能因此显示"已是最新"，那是把"轮不到我管"
+		// 说成"你不用升"，三台版本不同的 3x-ui 机器就是这么同时报最新的。
+		st.HasUpdate = st.Updatable && versionLess(st.Xray, xv)
 	}
-	st.Latest = strings.TrimSpace(rel.TagName)
-	// HasUpdate 只在 fanout 真能替换那份二进制时才有意义。接管模式下它恒为 false，
-	// 但 Latest 照样带出去——界面不能因此显示"已是最新"，那是把"轮不到我管"
-	// 说成"你不用升"，三台版本不同的 3x-ui 机器就是这么同时报最新的。
-	st.HasUpdate = st.Updatable && versionLess(st.Xray, st.Latest)
+	if oerr != nil {
+		// 两个仓库各自失败各自说，别让 Xray 那边的失败把 openvpn 的号也吞掉
+		if st.CheckErr == "" {
+			st.CheckErr = oerr.Error()
+		}
+	} else if st.OpenVPN != "" {
+		st.OvpnUpstream = ov
+		st.OvpnBehind = versionLess(st.OpenVPN, ov)
+		st.OvpnNote = ovpnUpstreamNote(st.OpenVPN, st.OvpnLatest, ov)
+	}
 	return st
 }
 
@@ -494,10 +563,10 @@ func openvpnRepoLatest(family string, have func(string) bool) (ver, why string, 
 	}
 
 	if len(refresh) > 0 {
-		if _, err := runRepoQuery(refresh, repoRefreshTO); err != nil {
+		if _, err := runRefresh(refresh); err != nil {
 			// 刷不动也继续问：拿旧索引里的号给出去，但要说清这个号的来历
 			stale = true
-			why = fmt.Sprintf("%s 没能刷新索引（下面这个版本是本机旧索引里的）：%v", refresh[0], err)
+			why = refreshWhy(refresh[0], err)
 		}
 	}
 
@@ -507,6 +576,10 @@ func openvpnRepoLatest(family string, have func(string) bool) (ver, why string, 
 		// 输出尾巴里就有答案，别只回一句"失败了"
 		if stale {
 			return "", why, true
+		}
+		// rpm 家族刷新和查询是一条命令，撞锁就落在这里而不是上面
+		if looksLocked(err) {
+			return "", fmt.Sprintf("%s 正被别的进程占用（自动更新常在跑），仓库版本号问不到", query[0]), false
 		}
 		return "", fmt.Sprintf("%s 没答上来：%v", query[0], err), false
 	}
@@ -541,7 +614,45 @@ func openvpnRepoLatest(family string, have func(string) bool) (ver, why string, 
 const (
 	repoRefreshTO = 45 * time.Second
 	repoQueryTO   = 60 * time.Second
+	// 刷索引撞锁后隔多久再试一次。只试一次，等太久不如让人改点别的地方看。
+	refreshRetryWait = 6 * time.Second
 )
+
+// runRefresh 刷一次包索引。撞锁是这一步最常见的失败：unattended-upgrades 或用户自己
+// 开的 apt 正占着 /var/lib/apt/lists/lock，apt 立刻就会 exit 100 走人。这时等一下再试
+// 一次比直接标 stale 有用——锁一放开就拿到新索引，界面也就不用报"旧索引"。
+func runRefresh(argv []string) (string, error) {
+	out, err := runRepoQuery(argv, repoRefreshTO)
+	if err == nil || !looksLocked(err) {
+		return out, err
+	}
+	time.Sleep(refreshRetryWait)
+	return runRepoQuery(argv, repoRefreshTO)
+}
+
+// looksLocked 判断这条失败是不是"别人正占着包管理器"。几家印法不同，但都带 lock，
+// 而且都顺带说出占着它的那个进程 pid。
+func looksLocked(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := strings.ToLower(err.Error())
+	for _, m := range []string{"could not get lock", "unable to lock", "failed to get lock", "waiting for process"} {
+		if strings.Contains(s, m) {
+			return true
+		}
+	}
+	return false
+}
+
+// refreshWhy 把刷索引的失败翻成一句人话。撞锁不该带上 apt 那一大段原始输出，
+// 那不是这台机器的问题，也不该让用户以为是 fanout 把系统搞坏了。
+func refreshWhy(cmd string, err error) string {
+	if looksLocked(err) {
+		return fmt.Sprintf("%s 正被别的进程占用（自动更新常在跑），索引没刷新，仓库版本号可能偏旧", cmd)
+	}
+	return fmt.Sprintf("%s 没能刷新索引，仓库版本号可能偏旧：%v", cmd, err)
+}
 
 // runRepoQuery 跑一条只读的查询命令。比升级命令的超时短得多：查询卡住说明
 // 镜像源连不上，那种时候让用户看到"查不到"比让请求挂十分钟有用。
