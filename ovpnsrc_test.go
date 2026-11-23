@@ -185,14 +185,16 @@ func TestOvpnSrcDeps(t *testing.T) {
 	}
 }
 
-// 依赖清单在 workflow 配方和 README 里还各有一份给人看的副本。漂移一次的代价是用户在自己
-// VPS 上等十几分钟、configure 才报 "lzo enabled but missing"，所以让单测去比对字面量。
-func TestOvpnSrcDepsMirrorsWorkflow(t *testing.T) {
+// 配方在 workflow 和 README 里还各有一份给人看的副本。漂移一次的代价是用户在自己 VPS 上
+// 等十几分钟、configure 才报 "lzo enabled but missing"，所以让单测去比对字面量。
+func TestOvpnSrcRecipeMirrorsWorkflow(t *testing.T) {
 	steps := ovpnSrcDeps("deb")
 	if len(steps) < 2 || len(steps[1]) <= 4 {
 		t.Fatalf("deb 依赖表形状不对：%v", steps)
 	}
 	want := strings.Join(steps[1][4:], " ")
+	// 两份副本各自写自己的 --prefix（$PREFIX / 具体版本），所以只比开关序列
+	flags := strings.Join(ovpnSrcConfigureArgv("x")[2:], " ")
 	for _, f := range []string{".github/workflows/openvpn-src.yml", "README.md"} {
 		b, err := os.ReadFile(f)
 		if err != nil {
@@ -202,6 +204,9 @@ func TestOvpnSrcDepsMirrorsWorkflow(t *testing.T) {
 		flat := strings.Join(strings.Fields(strings.ReplaceAll(string(b), `\`, " ")), " ")
 		if !strings.Contains(flat, want) {
 			t.Errorf("%s 里的依赖清单和 ovpnSrcDeps 不一致，应为：%s", f, want)
+		}
+		if !strings.Contains(flat, flags) {
+			t.Errorf("%s 里的 configure 开关和 ovpnSrcConfigureArgv 不一致，应为：%s", f, flags)
 		}
 	}
 }
@@ -218,6 +223,14 @@ func TestOvpnSrcConfigureArgv(t *testing.T) {
 	// --disable-dco：不引入内核模块这条路（同时要装 libnl 才行）
 	if !strings.Contains(joined, "--disable-dco") {
 		t.Errorf("必须 --disable-dco：%s", joined)
+	}
+	// --disable-plugin-auth-pam：auth-pam 是服务端插件，fanout 用不到；开着它
+	// configure 会硬要 libpam（CI 实测："libpam required but missing"）
+	if !strings.Contains(joined, "--disable-plugin-auth-pam") {
+		t.Errorf("必须 --disable-plugin-auth-pam：%s", joined)
+	}
+	if !strings.Contains(joined, "--disable-unit-tests") {
+		t.Errorf("必须 --disable-unit-tests：%s", joined)
 	}
 	if strings.ContainsAny(joined, "&|;$`*") {
 		t.Errorf("configure 参数不该有 shell 元字符：%s", joined)

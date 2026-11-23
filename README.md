@@ -352,7 +352,7 @@ questing 是 `2.7~rc1`——数字上比 2.6.19 大，实际比本机那份旧�
 用 OpenVPN 官方主钥匙验签名（F554A3687412CFFEBDEFE0A312F5F7B42F2B01E7）
 apt-get update -qq
 apt-get install -y --no-install-recommends build-essential pkg-config libssl-dev libcap-ng-dev liblzo2-dev liblz4-dev gnupg
-./configure --prefix=/usr/local/fanout-openvpn/2.7.9 --disable-dco --disable-unit-tests
+./configure --prefix=/usr/local/fanout-openvpn/2.7.9 --disable-dco --disable-plugin-auth-pam --disable-unit-tests
 make -j<N> && make install
 ```
 
@@ -372,6 +372,9 @@ make -j<N> && make install
   （`configure.ac` 里它是启用 DCO 时的硬要求）。libcap-ng、lzo、lz4 则必须装——缺任何一个是
   `AC_MSG_ERROR`，configure 当场停，不是警告（`liblzo2-dev` 最初就漏了，是那条 workflow 报的
   "lzo enabled but missing"；runner 上 lz4 看着能过只是因为镜像自带 `liblz4-dev`）。
+- **`--disable-plugin-auth-pam`**：auth-pam 是让**服务端**把连进来的人对本机 PAM 做认证的插件，
+  fanout 只会出站连接，用不上它；开着的话 `configure.ac:1274` 会硬要 libpam，
+  等于为一个用不到的插件多装 `libpam0g-dev`（这也是 workflow 第二轮报出来的）。
 - **只给 deb。** RHEL / Alpine / Arch 的 `pkgconf`、`openssl-devel`、`libcap-ng-devel` 包名各家不同，
   装错一个是白等几分钟，不如让人手动。这条口径和按钮判据写在一起，有单测钉着。
 - **任何一步失败都不登记、删掉那棵树**，隧道继续用系统那份；跑完还会核一次

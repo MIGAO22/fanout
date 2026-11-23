@@ -29,7 +29,7 @@ jobs:
       PREFIX: /usr/local/fanout-openvpn/proof
 
     steps:
-      - name: 装编译依赖（和 ovpnSrcDeps 的 deb 分支一致，TestOvpnSrcDepsMirrorsWorkflow 会核对）
+      - name: 装编译依赖（和 ovpnSrcDeps 一致，TestOvpnSrcRecipeMirrorsWorkflow 会核对）
         run: |
           set -euo pipefail
           sudo apt-get update -qq
@@ -129,7 +129,7 @@ jobs:
           tar -xzf "openvpn-$VER.tar.gz" -C build --no-same-owner
           cd "build/openvpn-$VER"
           {
-            ./configure --prefix="$PREFIX" --disable-dco --disable-unit-tests
+            ./configure --prefix="$PREFIX" --disable-dco --disable-plugin-auth-pam --disable-unit-tests
             make -j3
             sudo make install
           } 2>&1 | tee -a /tmp/last.log

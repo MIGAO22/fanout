@@ -140,8 +140,18 @@ func ovpnSrcAssets(rel *releaseInfo, ver string) (tarURL, ascURL, digest string,
 // 顺带也免掉 libnl-genl-3-dev（configure.ac 里它是启用 DCO 时的硬要求）。
 // --disable-unit-tests 单纯省几分钟。两个选项都对照 2.7.9 tarball 里预生成的
 // configure --help 核过，不存在的选项会让 configure 报 unrecognized。
+// ovpnSrcConfigureArgv 是编 openvpn 的那条 configure。三个开关都是有意按下去的：
+//
+//   - --prefix：只进 /usr/local/fanout-openvpn/<版本>，系统那份不动；
+//   - --disable-dco：DCO 要么靠内核自带的 ovpn 模块、要么装 out-of-tree kmod，
+//     一个装客户端的按钮不该顺手引入内核这条路（也免掉 libnl-genl-3-dev）；
+//   - --disable-plugin-auth-pam：auth-pam 是给**服务端**拿来把连进来的人对本地 PAM
+//     做认证的插件，fanout 只出站连接，用不到；不关它 configure 就硬要 libpam（:1274），
+//     白拖一个 libpam0g-dev 进来。
+//   - --disable-unit-tests：单测不是产物，装它没意义。
 func ovpnSrcConfigureArgv(prefix string) []string {
-	return []string{"./configure", "--prefix=" + prefix, "--disable-dco", "--disable-unit-tests"}
+	return []string{"./configure", "--prefix=" + prefix,
+		"--disable-dco", "--disable-plugin-auth-pam", "--disable-unit-tests"}
 }
 
 // ovpnSrcMakeJobs 给并发度封顶 4：出口机常常是 1-2G 内存的小 VPS，
