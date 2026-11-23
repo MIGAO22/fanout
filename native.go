@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 )
@@ -73,6 +74,27 @@ func (n *Native) apply(tunnels []*Tunnel) error {
 		})
 	}
 	return deferRestart("自建 Xray", func() error { return n.proc.restart(path) })
+}
+
+// swapXray 让刚换上的新二进制立刻生效：拿磁盘上这份配置重新拉起 Xray。
+//
+// 路径没变、只有文件内容换了，所以运行中的旧进程不受影响，停掉再起就是新版。
+// 这次重启会把已连上的入站客户端掐一下——调用前要先跟用户说清楚。
+func (n *Native) swapXray() error {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	cfg := filepath.Join(n.dir, "xray.json")
+	if _, err := os.Stat(cfg); err != nil {
+		return fmt.Errorf("找不到在用的配置 %s: %w", cfg, err)
+	}
+	// 先校验再起：新版不认现有配置时，这里报错，旧进程原样留着
+	if err := verifyXrayConfig(n.proc.bin, cfg); err != nil {
+		return err
+	}
+	// 撤掉还在合并窗口里排队的重载：配置本来就已落盘，留着它只会让 Xray
+	// 过一会儿再断一次连接，而这一步已经替它把重载做完了。
+	cancelRestart("自建 Xray")
+	return callRestart(func() error { return n.proc.restart(cfg) })
 }
 
 // OnTunnelsChanged 在隧道集合变化后重建配置。自建模式下出站直接由隧道列表

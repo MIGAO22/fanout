@@ -1632,6 +1632,7 @@ async function loadSettingsPage(){
   $('#setPath').value = '';
   $('#setPathHint').textContent = '读取中…';
   loadBackendModes();
+  loadClientBin();
   try{
     const s = await api('/api/settings');
     curSettings = s;
@@ -1717,6 +1718,69 @@ $('#updApply').onclick = async e => {
     toast(err.message, 'bad');
     b.disabled = false;
   }
+};
+
+// 内置客户端：install.sh 当初替 fanout 下载到工作目录的那份 Xray。
+// 脚本里"已存在就跳过"，所以它从装机那天起再没动过，这里给个更新入口。
+async function loadClientBin(){
+  try{ paintClientBin(await api('/api/client/status'), false); }
+  catch(err){ $('#cliXrayHint').textContent = '读本机客户端失败: ' + err.message; }
+}
+
+// checked 表示这份状态带 GitHub 的比对结果；没比对时不能显示"已是最新"，
+// 那是把"还没查过"说成"查过且没问题"。
+function paintClientBin(c, checked){
+  $('#cliXray').textContent = c.current || '未知';
+  $('#cliOvpn').textContent = c.openvpn || '未安装';
+  $('#cliApply').hidden = true;
+  $('#cliCheck').disabled = false;
+  // 查询失败时 latest 是空的，这时不能报"已是最新"——那是把"没查到"说成"没问题"
+  $('#cliXrayLatest').textContent =
+    (checked && c.latest) ? (c.has_update ? ' → 有新版本 ' + c.latest : ' · 已是最新') : '';
+  const where = c.path ? c.path + '。' : '';
+  $('#cliXrayHint').textContent = c.updatable
+    ? where + '这份是装机时从 Xray-core 下的最新版，之后无论重装多少次 fanout 都不会碰它，版本号停在装机那天。'
+    : where + (c.reason || '这台机器上没有可由 fanout 替换的 Xray。');
+  if(c.updatable && c.has_update){
+    $('#cliApplyVer').textContent = c.latest;
+    $('#cliApply').hidden = false;
+  }
+  if(c.check_error) toast('问最新版失败: ' + c.check_error, 'bad');
+}
+
+// 检查内置 Xray 更新：这一步才会打 GitHub 的 API
+$('#cliCheck').onclick = async e => {
+  const b = e.currentTarget;
+  b.disabled = true;
+  $('#cliXrayLatest').textContent = ' 查询中…';
+  try{
+    const c = await api('/api/client/status?check=1');
+    paintClientBin(c, true);
+    if(c.has_update) toast('发现新版 Xray ' + c.latest, 'info');
+    else if(!c.check_error) toast(c.updatable ? 'Xray 已经是最新版' : '这份 Xray 不由 fanout 管，无需在这里更新', 'ok');
+  }catch(err){
+    $('#cliXrayLatest').textContent = '';
+    toast(err.message, 'bad');
+  }
+  b.disabled = false;
+};
+
+// 更新内置 Xray：下载、试跑、原子替换、用旧配置重新拉起，全程失败都会退回旧版
+$('#cliApply').onclick = async e => {
+  if(!confirm('更新内置 Xray 到 ' + $('#cliApplyVer').textContent + '？\n入站会重启一次，已连上的节点链接会掉线重连。')) return;
+  const b = e.currentTarget;
+  const label = b.innerHTML;
+  b.disabled = true;
+  b.textContent = '下载并校验中…';
+  try{
+    const r = await api('/api/client/xray/apply', {method:'POST'});
+    toast(r.message || '已更新', 'ok');
+    $('#cliXrayHint').textContent = r.message || '已更新';
+  }catch(err){
+    toast(err.message, 'bad');
+  }
+  b.innerHTML = label;   // 文案里的版本号由下面的重读覆盖
+  loadClientBin();
 };
 
 // 端口/监听地址变了要提示用户之后从新地址进；密码/路径可原地生效

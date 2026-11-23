@@ -1039,6 +1039,32 @@ html[data-theme="dark"] .scr{background:rgba(0,0,0,.62)}
               <div class="share" id="updNotes" hidden style="white-space:pre-wrap;font-family:var(--font);font-size:12px"></div>
             </div>
           </section>
+
+          <section class="set-card">
+            <div class="h">
+              <svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="7" rx="2"/>
+                <rect x="3" y="13" width="18" height="7" rx="2"/><path d="M7 7.5h.01M7 16.5h.01"/></svg>
+              <h3>内置客户端</h3>
+              <span class="sub"><span class="verpill">Xray <b id="cliXray">-</b><span id="cliXrayLatest"></span></span></span>
+            </div>
+            <div class="b">
+              <div class="hint" id="cliXrayHint">读取中…</div>
+              <div class="acts">
+                <button class="btn" id="cliCheck">
+                  <svg viewBox="0 0 24 24"><path d="M21 12a9 9 0 1 1-3-6.7L21 8"/><path d="M21 3v5h-5"/></svg>
+                  检查更新
+                </button>
+                <button class="btn primary" id="cliApply" hidden>
+                  <svg viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                    <path d="M7 10l5 5 5-5M12 15V3"/></svg>
+                  更新到 <span id="cliApplyVer"></span>
+                </button>
+              </div>
+              <div class="divider"></div>
+              <div class="hint">出口那一跳用的是系统 <b>openvpn <span id="cliOvpn">未知</span></b>，装在机器上、跟着发行版的
+                包管理器升级（<code>apt/apk upgrade openvpn</code>），出口机器上不用装任何东西，所以这里不动它。</div>
+            </div>
+          </section>
         </div>
 
         <div style="display:flex;flex-direction:column;gap:var(--sp-4)">

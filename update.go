@@ -69,7 +69,12 @@ func assetArch() string {
 
 // fetchLatestRelease 拉取最新 release 元数据。
 func fetchLatestRelease() (*releaseInfo, error) {
-	url := fmt.Sprintf("https://api.github.com/repos/%s/releases/latest", updateRepoName())
+	return fetchReleaseLatest(updateRepoName())
+}
+
+// fetchReleaseLatest 拉任意仓库的最新 release，内置 Xray 的查版本走这同一套。
+func fetchReleaseLatest(repo string) (*releaseInfo, error) {
+	url := fmt.Sprintf("https://api.github.com/repos/%s/releases/latest", repo)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)

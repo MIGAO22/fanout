@@ -195,6 +195,8 @@ func main() {
 	mux.HandleFunc("/api/settings", apiSettings(auth, srv))
 	mux.HandleFunc("/api/update/check", apiUpdateCheck)
 	mux.HandleFunc("/api/update/apply", apiUpdateApply)
+	mux.HandleFunc("/api/client/status", apiClientStatus)
+	mux.HandleFunc("/api/client/xray/apply", apiClientXrayApply)
 
 	log.Printf("管理界面: http://<本机IP>%s%s/", webCfg.listenAddrString(), currentBasePath())
 	log.Printf("SOCKS5 端口在 %d-%d 之间随机分配", randPortMin, randPortMax)
@@ -462,6 +464,27 @@ func apiUpdateApply(w http.ResponseWriter, r *http.Request) {
 	}
 	// 先把响应发回去，restartSelf 已排在延迟后触发
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "restarting": true, "latest": st.Latest})
+}
+
+// apiClientStatus 回报本机客户端的版本。?check=1 才顺带问 GitHub 最新版，
+// 打开设置页那一下只读本地，免得每次都烧掉一次 API 配额。
+func apiClientStatus(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, clientBinStatus(r.URL.Query().Get("check") == "1"))
+}
+
+// apiClientXrayApply 把内置 Xray 升到最新版。耗时主要是下载，
+// 界面在此期间把按钮置灰即可，不需要作业轮询——这是一次性动作。
+func apiClientXrayApply(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "用 POST"})
+		return
+	}
+	msg, err := applyXrayUpdate()
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "message": msg})
 }
 
 // apiExits 返回主界面需要的一切：出口以及挂在它上面的入站。

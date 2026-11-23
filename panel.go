@@ -200,6 +200,22 @@ func currentPanelMode() string {
 	return ""
 }
 
+// panelWorkDir 返回后端所在的工作目录，即启动参数 -dir。
+func panelWorkDir() string {
+	panelState.mu.Lock()
+	defer panelState.mu.Unlock()
+	return panelState.workDir
+}
+
+// currentNativePanel 只有在自建模式已经开着的时候返回那个实例。
+// 换完 Xray 二进制要由它把进程重新拉起；3x-ui / xray-cf-lite 的 Xray 不归我们管。
+func currentNativePanel() (*Native, bool) {
+	panelState.mu.Lock()
+	defer panelState.mu.Unlock()
+	n, ok := panelState.current.(*Native)
+	return n, ok
+}
+
 // availablePanelModes 探测每种后端在本机是否可用，供界面渲染可选项。
 func availablePanelModes(workDir string) []map[string]any {
 	modes := []map[string]any{}
