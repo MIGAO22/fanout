@@ -28,6 +28,10 @@ func main() {
 	showVersion := flag.Bool("version", false, "显示版本后退出")
 	flag.Parse()
 
+	// 顶栏的存储胶囊统计的是这个目录所在的分区：state.json、openvpn 配置、
+	// 日志都往这里写，满了最先出事的就是它
+	statsDataDir = *workDir
+
 	if *publicIP == "" {
 		*publicIP = os.Getenv("FANOUT_PUBLIC_IP")
 	}

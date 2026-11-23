@@ -1,6 +1,6 @@
 package main
 
-// 顶部状态条的主机实时读数：CPU、内存、交换、负载、TCP/UDP 在用数。
+// 顶部状态条的主机实时读数：CPU、内存、交换、磁盘、负载、TCP/UDP 在用数。
 //
 // 一律读 /proc 而不是问 free/ss/vmstat：这个接口每几秒就要被拉一次，
 // 起子进程既慢又得走一遍 inMainNetns 的 exec 护栏（见 netnsguard.go）。
@@ -36,6 +36,13 @@ type hostStats struct {
 	SwapPct   float64 `json:"swap_pct"`
 	SwapUsed  int64   `json:"swap_used"`
 	SwapTotal int64   `json:"swap_total"`
+
+	DiskPct   float64 `json:"disk_pct"`
+	DiskUsed  int64   `json:"disk_used"`
+	DiskTotal int64   `json:"disk_total"`
+	// DiskMount 是这几个数真正来自哪个挂载点：磁盘占用必须标明是哪一个分区，
+	// 不然 / 很空、/var 很满的机器会让人看不出红色是从哪来的。
+	DiskMount string `json:"disk_mount"`
 
 	Load1  float64 `json:"load1"`
 	Load5  float64 `json:"load5"`
@@ -278,6 +285,64 @@ func pctOf(used, total int64) float64 {
 	return clampPct(100 * float64(used) / float64(total))
 }
 
+// diskStat 把 statfs 的块数换算成已用/总量/百分比，口径跟 df 一致：
+// 已用 = (blocks - bfree) × frsize，而百分比分母是"已用 + 普通用户还拿得到的"
+// （bavail），把 root 预留的那截剔掉。
+//
+// 预留不剔的话，一块格式化时留了 5% 的盘会在实际用到 95% 时才亮，
+// 而那时普通用户早就写不进去东西了——胶囊要的是"还能不能写"。
+func diskStat(blocks, bfree, bavail, frsize int64) (used, total int64, pct float64) {
+	if blocks <= 0 || frsize <= 0 {
+		return 0, 0, 0
+	}
+	// statfs 的这几个计数正常情况是递减的，真读反了就当没有，
+	// 不能让负数流到胶囊上画出一条倒着走的绿条
+	if bfree > blocks {
+		bfree = blocks
+	}
+	if bavail > blocks {
+		bavail = blocks
+	}
+	used = (blocks - bfree) * frsize
+	total = blocks * frsize
+	if room := used + bavail*frsize; room > 0 {
+		pct = clampPct(100 * float64(used) / float64(room))
+	}
+	return used, total, pct
+}
+
+// readDiskUsage 采一次磁盘占用，按给定顺序试挂载点，取第一个 stat 得动的。
+//
+// 先看 fanout 自己的工作目录（state.json、openvpn 配置、日志都写在那儿），
+// 目录还没建出来或跨了挂载点就退回根分区。挂载点名会一并回给界面，
+// 因为"存储 90%"不写是哪个分区的话，没法照着处理。
+func readDiskUsage(paths ...string) (used, total int64, pct float64, mount string, err error) {
+	for _, p := range paths {
+		if p == "" {
+			continue
+		}
+		blocks, bfree, bavail, frsize, serr := statfsBlocks(p)
+		if serr != nil {
+			err = serr
+			continue
+		}
+		u, t, pc := diskStat(blocks, bfree, bavail, frsize)
+		if t <= 0 {
+			// 伪文件系统（tmpfs 之外的 proc/sysfs 之类）会给出 0 块，跳过
+			continue
+		}
+		return u, t, pc, p, nil
+	}
+	if err == nil {
+		err = fmt.Errorf("没有可统计的挂载点")
+	}
+	return 0, 0, 0, "", err
+}
+
+// statsDataDir 是磁盘胶囊优先统计的挂载点所在目录，由 main 在解析完 -dir 之后填。
+// 只在启动时写一次、之后只读，所以不需要锁；留空就退化成只统计根分区。
+var statsDataDir string
+
 // readHostStats 采一次本机负载。
 //
 // CPU 之外任一项读失败都不致命：能读到几项就显示几项，
@@ -300,6 +365,13 @@ func readHostStats() (hostStats, error) {
 		st.MemPct = pctOf(total-avail, total)
 		st.SwapTotal, st.SwapUsed = sTotal*1024, (sTotal-sFree)*1024
 		st.SwapPct = pctOf(sTotal-sFree, sTotal)
+	}
+
+	// 磁盘读的是 fanout 自己写数据的那个分区，读不到才退回根分区
+	if used, total, pc, mnt, derr := readDiskUsage(statsDataDir, "/"); derr != nil {
+		errs = append(errs, derr.Error())
+	} else {
+		st.DiskUsed, st.DiskTotal, st.DiskPct, st.DiskMount = used, total, pc, mnt
 	}
 
 	st.Cores = runtime.NumCPU()

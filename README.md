@@ -24,7 +24,7 @@
 部署仍然只有一个可执行文件，没有额外的静态目录。
 
 - **默认浅色**，另配一套深色主题，右上角随时切。
-- 顶栏中间一排实时胶囊：CPU、内存、交换、负载、TCP、UDP，每 2.5 秒自己走，
+- 顶栏中间一排实时胶囊：CPU、内存、交换、存储、负载、TCP、UDP，每 2.5 秒自己走，
   绿条是占用比例，右边是原始量，超过 75% 转黄、90% 转红（口径见下面「使用 → 顶栏负载」）。
 - 顶部一行 KPI：在线出口（带完成度圆环）、可用节点、覆盖地区、母机 IP、节点链接。
 - 批量开出口时下面跟着作业卡片，每条目标的状态单独显示，不用刷整页。
@@ -115,7 +115,7 @@ Xray 到 `/var/lib/fanout/bin/`，装了则跳过，入站交给面板管。
 > 才生效：`f` → `3) 重启`（或 `f restart`）。`install.sh` 现在重装会显式
 > `systemctl restart`——以前用 `enable --now`，对已运行的单元是空操作，
 > 于是新二进制在磁盘上、老进程还在服务老界面。
-> 想确认手上是哪一份：`fanout -version`，本仓库显示 `v1.5.2`，上游原版是 `v1.3.1`。
+> 想确认手上是哪一份：`fanout -version`，本仓库显示 `v1.5.3`，上游原版是 `v1.3.1`。
 
 > **发新版本。** 推一个 `v*` tag 就会触发 release workflow 出 amd64 / arm64
 > 两个包和 checksums；不打 tag 就没有 Release，`releases/latest/download/...`
@@ -178,6 +178,7 @@ Operation not permitted 的话，这台机器用不了，跟发行版无关。
 | CPU | `/proc/stat` 两次采样的差值，`idle` 含 `iowait` | 这段间隔内的平均占用，全部核心合起来算 |
 | 内存 | `/proc/meminfo` 的 `MemTotal - MemAvailable` | 没有 `MemAvailable` 的老内核退回 `MemFree`，会把 cache 算成占用 |
 | 交换 | 同上，`SwapTotal - SwapFree` | 没配交换分区时胶囊置灰、显示「无」 |
+| 存储 | `statfs` 取**工作目录（默认 `/var/lib/fanout`）所在的分区**，取不到才退回 `/` | 已用 = `blocks - bfree`，百分比分母剔掉 root 预留块，口径和 `df -h` 的 `Use%` 一致；悬停会写明统计的是哪个挂载点 |
 | 负载 | `/proc/loadavg` 的 1 分钟值 | 按核心数归一，100% = 可运行任务刚好排满 CPU；悬停看 1/5/15 三个值 |
 | TCP | `/proc/net/sockstat` 的在用数 **+ `tw`** | 刻度取临时端口区间宽度，只用来比较多少，不是硬上限 |
 | UDP | 同上的 UDP 在用数 | QUIC、DNS 这类流量都算在这里 |
@@ -321,7 +322,7 @@ REALITY 的密钥对和 shortId 自动生成；TLS 不填证书就生成自签�
 
 ```
   状态      运行中
-  版本      fanout v1.5.2
+  版本      fanout v1.5.3
   开机自启  enabled
 
   管理地址  http://1.2.3.4:8899/gwPuWHvaNr/
@@ -349,7 +350,7 @@ f uninstall  # 卸载（服务、二进制、netns 和 /var/lib/fanout 全删）
 > **界面还是旧的？** 十有八九是老进程还在跑。二进制是单文件、界面用 `go:embed`
 > 打在里面的，所以换二进制必须重启服务才生效：`f` → `3) 重启`。
 > `install.sh` 现在重装会显式 `systemctl restart`，不再出现「装完没变化」。
-> 分清手上是哪一份：`fanout -version`，本仓库构建的显示 `v1.5.2` 及以上，
+> 分清手上是哪一份：`fanout -version`，本仓库构建的显示 `v1.5.3` 及以上，
 > 上游原版显示 `v1.3.1`。
 
 隧道状态存在 `/var/lib/fanout/state.json`，重启后自动恢复，端口保持不变。

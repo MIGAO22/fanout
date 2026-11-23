@@ -214,6 +214,14 @@ function statDefs(s){
      tip:s.swap_total ? '交换分区 ' + fmtGB(s.swap_used) + ' / ' + fmtGB(s.swap_total)
                       + '（' + s.swap_pct.toFixed(1) + '%）\n开始吃交换通常意味着内存真不够了'
                       : '这台机器没配交换分区'},
+    {k:'存储', pct:s.disk_pct, v:s.disk_total ? fmtGB(s.disk_used) + '/' + fmtGB(s.disk_total) : '—',
+     off:!s.disk_total,
+     tip:s.disk_total
+        ? '磁盘已用 ' + fmtGB(s.disk_used) + ' / ' + fmtGB(s.disk_total)
+          + '（' + s.disk_pct.toFixed(1) + '%）\n看的是 ' + (s.disk_mount || '/')
+          + ' 所在分区（fanout 的状态、配置、日志写在这里），口径同 df：'
+          + '\n百分比扣掉了 root 预留块，所以它到 100% 就是真的写不进去了'
+        : '读不到磁盘占用（statfs 失败），不是这块盘真的空的'},
     {k:'负载', pct:s.load_pct, v:s.load1.toFixed(2), opt:true,
      tip:'1 / 5 / 15 分钟负载 = ' + s.load1.toFixed(2) + ' / ' + s.load5.toFixed(2)
         + ' / ' + s.load15.toFixed(2) + '\n绿条按 ' + s.cores

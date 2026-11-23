@@ -194,3 +194,63 @@ func TestHostStatsReadsProc(t *testing.T) {
 		t.Errorf("mem_used %d 超过了 mem_total %d", got.MemUsed, got.MemTotal)
 	}
 }
+
+// 磁盘胶囊的口径必须和 SSH 里 df -h 的 Use% 一致，否则用户按页面上的数字
+// 判断"还能不能写"会判错。这两件事要钉住：扣掉 root 预留块、以及读坏了不炸。
+func TestDiskStatMatchesDfSemantics(t *testing.T) {
+	const frsize = int64(4096)
+	// df -h 会看到的一块 100G 盘：已用 60G，空闲 40G，其中 5G 是 root 预留，
+	// 所以普通用户实际只剩 35G 可写
+	gib := func(n int64) int64 { return n * 1024 * 1024 * 1024 / frsize }
+	used, total, pct := diskStat(gib(100), gib(40), gib(35), frsize)
+	if total != 100*1024*1024*1024 {
+		t.Errorf("total = %d, 想 %d（100G）", total, 100*1024*1024*1024)
+	}
+	if used != 60*1024*1024*1024 {
+		t.Errorf("used = %d, 想 %d（已用按 blocks-bfree，不是 blocks-bavail）",
+			used, 60*1024*1024*1024)
+	}
+	// df 报的是 64%：60/(60+35)，而不是 60/100 = 60%
+	if want := 100 * 60.0 / 95.0; pct < want-0.01 || pct > want+0.01 {
+		t.Errorf("pct = %v, 想 %v（分母要剔掉 root 预留）", pct, want)
+	}
+}
+
+func TestDiskStatGuards(t *testing.T) {
+	// 伪文件系统、statfs 返回全零，都不能让胶囊画出个倒着走的比例
+	if used, total, pct := diskStat(0, 0, 0, 4096); used != 0 || total != 0 || pct != 0 {
+		t.Errorf("空盘应全 0, got %d/%d/%v", used, total, pct)
+	}
+	if _, total, pct := diskStat(100, 40, 40, 0); total != 0 || pct != 0 {
+		t.Errorf("frsize 为 0 时不该算出东西, total=%d pct=%v", total, pct)
+	}
+	// 计数读反了（bfree > blocks）时夹住，别给个负的已用
+	if used, _, pct := diskStat(100, 120, 100, 1024); used != 0 || pct != 0 {
+		t.Errorf("bfree 超过 blocks 应夹成 0, got used=%d pct=%v", used, pct)
+	}
+	// 满盘（bavail=0）就是 100%，不该因为分母退化成 used 而变 0
+	if _, _, pct := diskStat(100, 0, 0, 4096); pct != 100 {
+		t.Errorf("写满时应是 100, got %v", pct)
+	}
+}
+
+// readDiskUsage 的挂载点挑选：坏路径跳过、全坏才报错。
+// statfs 本身要真内核，这里只在 Linux 上跑。
+func TestReadDiskUsageFallsBack(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("statfs 需要 Linux")
+	}
+	used, total, pct, mount, err := readDiskUsage("/definitely-not-a-mount-point", "/")
+	if err != nil {
+		t.Fatalf("退回根分区该成功: %v", err)
+	}
+	if mount != "/" {
+		t.Errorf("mount = %q, 想 /（第一个路径 stat 不动就该换下一个）", mount)
+	}
+	if total <= 0 || used < 0 || pct <= 0 || pct > 100 {
+		t.Errorf("根分区读数不合理: used=%d total=%d pct=%v", used, total, pct)
+	}
+	if _, _, _, _, err := readDiskUsage(""); err == nil {
+		t.Error("一个挂载点都不给时应报错，别让胶囊显示 0/0")
+	}
+}
