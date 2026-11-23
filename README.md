@@ -28,7 +28,7 @@
   绿条是占用比例，右边是原始量，超过 75% 转黄、90% 转红（口径见下面「使用 → 顶栏负载」）。
   这一排单独占一行、装不下就横滑，手机上也能看到——之前窄屏是整排藏起来的。
 - 「设置与连接」里有一张「内置客户端」：卡上只留两份客户端的当前版本，点「检查更新」才报最新版号
-  （Xray 问 GitHub，openvpn 问本机包管理器），两份都能就地升级——Xray 由 fanout 换二进制，
+  （Xray 问 GitHub，openvpn 先刷索引再问本机包管理器），两份都能就地升级——Xray 由 fanout 换二进制，
   openvpn 走系统包且只点它一个包（口径见下面「使用 → 内置客户端（Xray 与 openvpn）」）。
 - 顶部一行 KPI：在线出口（带完成度圆环）、可用节点、覆盖地区、母机 IP、节点链接。
 - 批量开出口时下面跟着作业卡片，每条目标的状态单独显示，不用刷整页。
@@ -126,7 +126,7 @@ Xray 到 `/var/lib/fanout/bin/`，装了则跳过，入站交给面板管。
 > 才生效：`f` → `3) 重启`（或 `f restart`）。`install.sh` 现在重装会显式
 > `systemctl restart`——以前用 `enable --now`，对已运行的单元是空操作，
 > 于是新二进制在磁盘上、老进程还在服务老界面。
-> 想确认手上是哪一份：`fanout -version`，本仓库显示 `v2.0.0`，上游原版是 `v1.3.1`。
+> 想确认手上是哪一份：`fanout -version`，本仓库显示 `v2.0.1`，上游原版是 `v1.3.1`。
 
 > **发新版本。** 推一个 `v*` tag 就会触发 release workflow 出 amd64 / arm64
 > 两个包和 checksums；不打 tag 就没有 Release，`releases/latest/download/...`
@@ -255,13 +255,19 @@ Operation not permitted 的话，这台机器用不了，跟发行版无关。
 
 第 5 步会重启一次 Xray，已连上的节点链接会掉一下再自己重连，所以按钮点下去前有确认框。
 接管模式（3x-ui / xray-cf-lite）下这张卡只显示版本、不给按钮，并说明那份归谁管——
-覆盖别人的运行时，出了问题没人想得起来是这里动的。
+覆盖别人的运行时，出了问题没人想得起来是这里动的。这份 Xray 的检查更新也**只报数不判新旧**：
+显示 `Xray 26.10.21 · 上游 26.11.9`，因为 fanout 不动它，"已是最新"那句轮不到它来说。
 
 openvpn 那半边不跟 GitHub 比版本：它是系统包，新旧由发行版的仓库说了算，Debian 稳定版
-更是常年锁在 2.5.x，照社区最新版比会天天报"有新版"。所以点「检查更新」时问的是**本机包管理器**
-（`apt-cache policy` / `dnf list available` / `apk policy` / `pacman -Si` / `zypper info`），
-版本号显示成 `openvpn 2.5.8 → 2.6.11`，仓库里确实更新才亮出「升级 openvpn 到 2.6.11」。
-这一步不打网络，GitHub 挂了、API 额度用完了，这张卡至少 openvpn 那半边还是活的。
+更是常年锁在 2.5.x，照社区最新版比会天天报"有新版"。所以点「检查更新」时问的是**本机包管理器**，
+而且**先刷一次索引再问**（`apt-get update -qq` / `dnf --refresh list` / `apk update` / `pacman -Sy` /
+`zypper refresh`，然后才读 `apt-cache policy` / `dnf list` / `apk policy` / `pacman -Si` / `zypper info`）——
+`apt-cache policy` 看的是磁盘上那份本地索引，VPS 几个月不跑 `apt-get update` 太常见，这时 Candidate
+永远等于已装版本，问出来就是"每台机器都是仓库最新"。这一步打的是发行版镜像源，不打 GitHub：
+GitHub 挂了、API 额度用完了，openvpn 那半边还是活的。
+三种说法分得很清：仓库里有更新的显示 `openvpn 2.5.8 → 2.6.11` 并亮出升级按钮；仓库就是当前这份
+显示 `openvpn 2.6.14 · 仓库 2.6.14`（把号摆出来，不替下"你不用升"的结论）；索引刷不动显示
+`openvpn 2.6.14 · 旧索引 2.6.14`，卡片下面一行写清是哪条命令没跑成——版本号照给，但说清它是旧索引里的。
 真按下去之前，确认框里会把**打算在你机器上执行的命令原样摊开**。家族是读
 `/etc/os-release` 的 `ID` / `ID_LIKE` 认家族，再按家族挑工具：
 
@@ -400,7 +406,7 @@ REALITY 的密钥对和 shortId 自动生成；TLS 不填证书就生成自签�
 
 ```
   状态      运行中
-  版本      fanout v2.0.0
+  版本      fanout v2.0.1
   开机自启  enabled
 
   管理地址  http://1.2.3.4:8899/gwPuWHvaNr/

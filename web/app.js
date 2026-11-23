@@ -1778,10 +1778,17 @@ function paintClientBin(c, checked){
   $('#cliApply').hidden = true;
   $('#cliOvpnApply').hidden = true;
   $('#cliCheck').disabled = false;
-  $('#cliXrayLatest').textContent =
-    (checked && c.latest) ? (c.has_update ? ' → ' + c.latest : ' · 已是最新') : '';
-  $('#cliOvpnLatest').textContent =
-    (checked && c.openvpn_latest) ? (c.openvpn_has_update ? ' → ' + c.openvpn_latest : ' · 已是仓库最新') : '';
+  // "已是最新"只有在 fanout 真能替换这份二进制时才轮得到它说：接管模式下
+  // has_update 恒为 false（后端压根不动它），照原样显示就成了三台版本不同的机器
+  // 同时报"已是最新"。管不着的时候只报数，不下判断。
+  $('#cliXrayLatest').textContent = !checked || !c.latest ? ''
+    : !c.updatable ? ' · 上游 ' + c.latest
+    : c.has_update ? ' → ' + c.latest : ' · 已是最新';
+  // openvpn 一样：不说空话，把仓库里那个号原样摆出来，用户自己能跟上面对一下。
+  // stale 是索引没刷动，这个号来自旧索引，必须标出来。
+  $('#cliOvpnLatest').textContent = !checked || !c.openvpn_latest ? ''
+    : c.openvpn_has_update ? ' → ' + c.openvpn_latest
+    : ' · ' + (c.openvpn_stale ? '旧索引 ' : '仓库 ') + c.openvpn_latest;
   $('#cliXrayHint').textContent = c.updatable
     ? 'Xray 走官方发布，openvpn 走系统包管理器。'
     : (c.reason || '这台机器上没有可由 fanout 替换的 Xray。');
@@ -1793,8 +1800,8 @@ function paintClientBin(c, checked){
     $('#cliOvpnApplyVer').textContent = c.openvpn_latest;
     $('#cliOvpnApply').hidden = false;
   }
-  // 这行只在真出问题时装满：认不出家族、没有对应的包管理器、执行失败
-  clientNote(checked && !c.openvpn_updatable ? c.openvpn_reason : '');
+  // 这行只在真出问题时装满：认不出家族、没有对应的包管理器、索引没刷动、执行失败
+  clientNote(checked ? c.openvpn_reason : '');
   if(c.check_error) toast('问最新版失败: ' + c.check_error, 'bad');
 }
 
@@ -1808,9 +1815,11 @@ $('#cliCheck').onclick = async e => {
     const c = await api('/api/client/status?check=1');
     paintClientBin(c, true);
     if(c.has_update) toast('Xray 有新版本 ' + c.latest, 'info');
-    else if(!c.check_error) toast(c.updatable ? 'Xray 已是最新版' : '这份 Xray 不由 fanout 管', 'ok');
+    else if(c.latest && !c.updatable) toast('Xray 上游最新是 ' + c.latest + '，但这份不由 fanout 升级', 'ok');
+    else if(c.latest) toast('Xray 已是最新版', 'ok');
     if(c.openvpn_has_update) toast('仓库里的 openvpn 是 ' + c.openvpn_latest, 'info');
-    else if(c.openvpn_latest) toast('openvpn 已是仓库最新（' + c.openvpn_latest + '）', 'ok');
+    else if(c.openvpn_latest) toast('仓库里的 openvpn 就是 ' + c.openvpn_latest +
+      (c.openvpn_stale ? '（索引没刷动，这是旧索引里的号）' : ''), 'ok');
   }catch(err){
     $('#cliXrayLatest').textContent = '';
     clientNote('查询失败: ' + err.message);

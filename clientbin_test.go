@@ -410,25 +410,44 @@ func TestParseAptCandidate(t *testing.T) {
 	}
 }
 
-func TestParseDnfAvailable(t *testing.T) {
-	out := `Last metadata expiration check: 0:12:01 ago on Mon 23 Nov 2026 09:12:01 AM UTC.
+// `dnf list openvpn` 会把已装和仓库两段都印出来，仓库那段排在后面。取第一行等于
+// 拿已装版本跟自己比——三台机器三个不同版本同时报"已是仓库最新"，就是这个取法造成的。
+func TestParseDnfListRow(t *testing.T) {
+	both := `Last metadata expiration check: 0:12:01 ago on Mon 23 Nov 2026 09:12:01 AM UTC.
+Installed Packages
+openvpn.x86_64          1:2.5.8-1.el8          @System
 Available Packages
-openvpn.x86_64          1:2.5.8-1.el8          appstream
+openvpn.x86_64          1:2.6.11-1.el8         appstream
 `
-	// epoch（"1:"）不是版本的一部分，留着的话界面会显示成 1:2.5.8-1.el8
-	if got := parseDnfAvailable(out); got != "2.5.8-1.el8" {
-		t.Errorf("dnf 行解析 = %q, 想 2.5.8-1.el8", got)
+	if got := parseDnfListRow(both); got != "2.6.11-1.el8" {
+		t.Errorf("两段都该取仓库那段，得 %q, 想 2.6.11-1.el8", got)
 	}
-	noEpoch := "openvpn-2.4.11-1.el7.x86_64    2.4.11-1.el7    base\n"
-	if got := parseDnfAvailable(noEpoch); got != "2.4.11-1.el7" {
+	// epoch（"1:"）不是版本的一部分，留着的话界面会显示成 1:2.5.8-1.el8
+	installed := `Installed Packages
+openvpn.x86_64          1:2.5.8-1.el8          @System
+`
+	if got := parseDnfListRow(installed); got != "2.5.8-1.el8" {
+		t.Errorf("仓库里没有更新的时只有已装一段，得 %q, 想 2.5.8-1.el8", got)
+	}
+	// 老 yum 的 "name-version-release.arch" 写法，不带 epoch
+	legacy := "openvpn-2.4.11-1.el7.x86_64    2.4.11-1.el7    base\n"
+	if got := parseDnfListRow(legacy); got != "2.4.11-1.el7" {
 		t.Errorf("不带 epoch 的行 = %q, 想 2.4.11-1.el7", got)
 	}
-	if got := parseDnfAvailable("Error: No matching Packages to list\n"); got != "" {
+	plugin := `Installed Packages
+openvpn-auth-ldap.x86_64     2.0.4-1.el8     @System
+openvpn.x86_64               1:2.5.8-1.el8   @System
+`
+	if got := parseDnfListRow(plugin); got != "2.5.8-1.el8" {
+		t.Errorf("别把同前缀的插件当成 openvpn 本体，得 %q, 想 2.5.8-1.el8", got)
+	}
+	if got := parseDnfListRow("Error: No matching Packages to list\n"); got != "" {
 		t.Errorf("查无此包时应给空，得 %q", got)
 	}
 }
 
 func TestParseApkPolicy(t *testing.T) {
+	// 首行是 apk 当前选中的那份（已装且仓库没更新时就是已装版本），缩进的才是各仓库候选
 	out := `openvpn-2.6.11-r0:
   2.6.11-r0:
     V: https://dl-cdn.alpinelinux.org/alpine/v3.20/main
@@ -436,6 +455,17 @@ func TestParseApkPolicy(t *testing.T) {
 `
 	if got := parseApkPolicy(out); got != "2.6.11-r0" {
 		t.Errorf("apk 首行解析 = %q, 想 2.6.11-r0", got)
+	}
+	older := `openvpn-2.5.8-r0:
+  2.6.11-r0:
+    V: https://dl-cdn.alpinelinux.org/alpine/v3.21/main
+    A: x86_64
+  2.5.8-r0:
+    V: https://dl-cdn.alpinelinux.org/alpine/v3.20/main
+    A: x86_64
+`
+	if got := parseApkPolicy(older); got != "2.6.11-r0" {
+		t.Errorf("候选里有更高版本时应取最高的，得 %q, 想 2.6.11-r0", got)
 	}
 	if got := parseApkPolicy("ERROR: unable to select packages:\n  openvpn (no such package):\n"); got != "" {
 		t.Errorf("查无此包时应给空，得 %q", got)

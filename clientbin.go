@@ -43,13 +43,16 @@ type ClientBinStatus struct {
 	CheckErr  string `json:"check_error,omitempty"` // 问 GitHub 失败的原因，不影响上面的字段
 
 	// openvpn 这半边由发行版的包管理器负责：family/cmd 是"要点就跑这几条"，
-	// latest 是仓库里现在的版本（点了检查更新才有）
+	// latest 是仓库里现在的版本（点了检查更新才有，查之前会先刷一次索引）
 	OvpnFamily string `json:"openvpn_family,omitempty"` // deb / rpm / alpine / arch / suse
 	OvpnCmd    string `json:"openvpn_cmd,omitempty"`
 	OvpnUpdate bool   `json:"openvpn_updatable"` // 认得出家族、机器上有对应的包管理器
 	OvpnWhy    string `json:"openvpn_reason,omitempty"`
 	OvpnLatest string `json:"openvpn_latest,omitempty"`
 	OvpnHas    bool   `json:"openvpn_has_update"` // 仓库那份确实比本机新
+	// 索引没刷动时仓库版本号只能来自本机那份旧索引，这时"已是最新"是句假话，
+	// 界面必须换个说法（VPS 上几个月不 apt-get update 太常见了）
+	OvpnStale bool `json:"openvpn_stale,omitempty"`
 }
 
 // xrayAssetForArch 把 GOARCH 换成 Xray-core release 的资产名。
@@ -162,15 +165,19 @@ func clientBinStatus(askLatest bool) *ClientBinStatus {
 	if !askLatest {
 		return st
 	}
-	// 先问本机包管理器，再打 GitHub：openvpn 的答案不依赖网络，断网或额度用尽时
+	// 先问本机包管理器，再打 GitHub：openvpn 的答案不依赖 GitHub，额度用尽时
 	// 这张卡至少还有一半是活的。
 	if st.OvpnUpdate && st.OpenVPN != "" {
-		ver, why := openvpnRepoLatest(st.OvpnFamily, hasCmd)
-		st.OvpnLatest = ver
+		ver, why, stale := openvpnRepoLatest(st.OvpnFamily, hasCmd)
+		st.OvpnLatest, st.OvpnStale = ver, stale
 		if ver == "" {
 			st.OvpnWhy = why
 		} else {
 			st.OvpnHas = versionLess(st.OpenVPN, ver)
+			if why != "" {
+				// 版本号有，但那是没刷动的索引给的，界面得换个说法
+				st.OvpnWhy = why
+			}
 		}
 	}
 	rel, err := fetchReleaseLatest(xrayReleaseRepo)
@@ -179,6 +186,9 @@ func clientBinStatus(askLatest bool) *ClientBinStatus {
 		return st
 	}
 	st.Latest = strings.TrimSpace(rel.TagName)
+	// HasUpdate 只在 fanout 真能替换那份二进制时才有意义。接管模式下它恒为 false，
+	// 但 Latest 照样带出去——界面不能因此显示"已是最新"，那是把"轮不到我管"
+	// 说成"你不用升"，三台版本不同的 3x-ui 机器就是这么同时报最新的。
 	st.HasUpdate = st.Updatable && versionLess(st.Xray, st.Latest)
 	return st
 }
@@ -433,78 +443,110 @@ func openvpnUpgradePlan(osRelease string, have func(string) bool) (steps [][]str
 //
 // 不打 GitHub：openvpn 的新旧由发行版的仓库说了算，Debian 稳定版会把它锁在
 // 发布那天选定的版本上，拿上游最新版比只会天天报"你有新版"却永远装不上。
-// 各家的输出形状差得远，所以一种家族一个解析函数，别指望一个正则通吃。
-func openvpnRepoLatest(family string, have func(string) bool) (ver, why string) {
-	var argv []string
+//
+// 查之前必须先刷一次索引。`apt-cache policy` 读的是 /var/lib/apt/lists 里那份
+// 本地索引，VPS 上几个月不跑 apt-get update 太常见，这时 Candidate 就等于已装版本，
+// 于是每台机器都"已是仓库最新"——三台机器三个不同的 openvpn 版本同时报最新，
+// 就是这么来的。刷不动索引时不假装查到了：版本号照给，但标 stale，界面换个说法。
+func openvpnRepoLatest(family string, have func(string) bool) (ver, why string, stale bool) {
+	var refresh, query []string
 	switch family {
 	case "deb":
 		if !have("apt-cache") {
-			return "", "机器上没有 apt-cache，问不到仓库里的版本"
+			return "", "机器上没有 apt-cache，问不到仓库里的版本", false
 		}
-		argv = []string{"apt-cache", "policy", "openvpn"}
+		if have("apt-get") {
+			refresh = []string{"apt-get", "update", "-qq"}
+		}
+		query = []string{"apt-cache", "policy", "openvpn"}
 	case "rpm":
 		switch {
 		case have("dnf"):
-			argv = []string{"dnf", "-q", "list", "available", "openvpn"}
+			// --refresh 让 dnf 自己重取元数据；查询和刷新合成一条命令
+			query = []string{"dnf", "-q", "--refresh", "list", "openvpn"}
 		case have("yum"):
-			argv = []string{"yum", "-q", "list", "available", "openvpn"}
+			// 老 yum 没有 --refresh，删掉缓存元数据让下一条查询自己重新取
+			refresh = []string{"yum", "-q", "clean", "metadata"}
+			query = []string{"yum", "-q", "list", "openvpn"}
 		default:
-			return "", "机器上没有 dnf 或 yum，问不到仓库里的版本"
+			return "", "机器上没有 dnf 或 yum，问不到仓库里的版本", false
 		}
 	case "alpine":
 		if !have("apk") {
-			return "", "机器上没有 apk，问不到仓库里的版本"
+			return "", "机器上没有 apk，问不到仓库里的版本", false
 		}
-		argv = []string{"apk", "policy", "openvpn"}
+		refresh = []string{"apk", "update"}
+		query = []string{"apk", "policy", "openvpn"}
 	case "arch":
 		if !have("pacman") {
-			return "", "机器上没有 pacman，问不到仓库里的版本"
+			return "", "机器上没有 pacman，问不到仓库里的版本", false
 		}
-		argv = []string{"pacman", "-Si", "openvpn"}
+		refresh = []string{"pacman", "-Sy", "--noconfirm"}
+		query = []string{"pacman", "-Si", "openvpn"}
 	case "suse":
 		if !have("zypper") {
-			return "", "机器上没有 zypper，问不到仓库里的版本"
+			return "", "机器上没有 zypper，问不到仓库里的版本", false
 		}
-		argv = []string{"zypper", "-n", "info", "openvpn"}
+		refresh = []string{"zypper", "--non-interactive", "refresh"}
+		query = []string{"zypper", "-n", "info", "openvpn"}
 	default:
-		return "", "认不出这台机器的包管理器，问不到仓库里的版本"
+		return "", "认不出这台机器的包管理器，问不到仓库里的版本", false
 	}
 
-	out, err := runRepoQuery(argv)
+	if len(refresh) > 0 {
+		if _, err := runRepoQuery(refresh, repoRefreshTO); err != nil {
+			// 刷不动也继续问：拿旧索引里的号给出去，但要说清这个号的来历
+			stale = true
+			why = fmt.Sprintf("%s 没能刷新索引（下面这个版本是本机旧索引里的）：%v", refresh[0], err)
+		}
+	}
+
+	out, err := runRepoQuery(query, repoQueryTO)
 	if err != nil {
-		// 查不到版本在包管理器这里很常见（仓库里没这个包、索引还没刷过），
+		// 查不到版本在包管理器这里很常见（仓库里没这个包、镜像源连不上），
 		// 输出尾巴里就有答案，别只回一句"失败了"
-		return "", fmt.Sprintf("%s 没答上来：%v", argv[0], err)
+		if stale {
+			return "", why, true
+		}
+		return "", fmt.Sprintf("%s 没答上来：%v", query[0], err), false
 	}
 	switch family {
 	case "deb":
 		ver = parseAptCandidate(out)
 		if ver == "" {
-			return "", "apt 的仓库索引里没有 openvpn，先跑一次 apt-get update 再查"
+			return "", "apt 的仓库索引里没有 openvpn 这个包", stale
 		}
 	case "rpm":
-		ver = parseDnfAvailable(out)
+		ver = parseDnfListRow(out)
 		if ver == "" {
-			return "", "仓库里查不到 openvpn 这个包"
+			return "", "dnf/yum 的仓库里查不到 openvpn 这个包", stale
 		}
 	case "alpine":
 		ver = parseApkPolicy(out)
 		if ver == "" {
-			return "", "apk 的仓库索引里没有 openvpn"
+			return "", "apk 的仓库索引里没有 openvpn 这个包", stale
 		}
 	default: // arch / suse：都是 "Version : x.y" 那一行
 		ver = parseColonVersion(out)
 		if ver == "" {
-			return "", "包管理器没给出 openvpn 的版本号"
+			return "", "包管理器没给出 openvpn 的版本号", stale
 		}
 	}
-	return ver, ""
+	return ver, why, stale
 }
+
+// 查询命令各给多久的额度。刷新索引那条更短：镜像源连不上时 apt-get update 会
+// 挨个源重试很久，而那一步恰恰是最该快点承认"刷不动"的——它一超时界面就标出
+// 来下面这个版本号是从旧索引里读的，比让人盯着"查询中"干等有用。
+const (
+	repoRefreshTO = 45 * time.Second
+	repoQueryTO   = 60 * time.Second
+)
 
 // runRepoQuery 跑一条只读的查询命令。比升级命令的超时短得多：查询卡住说明
 // 镜像源连不上，那种时候让用户看到"查不到"比让请求挂十分钟有用。
-func runRepoQuery(argv []string) (string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+func runRepoQuery(argv []string, to time.Duration) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), to)
 	defer cancel()
 	// 和升级一样必须在母机命名空间里跑：请求线程可能正挂在某条隧道的 netns 上，
 	// 在那里面问镜像源会走 VPN，甚至根本不通（见 netnsguard.go）。
@@ -539,33 +581,71 @@ func parseAptCandidate(out string) string {
 	return ""
 }
 
-// parseDnfAvailable 取 dnf/yum list available 里那一行 openvpn 的版本。
-// 形状是 "openvpn.x86_64   1:2.5.8-1.el8   appstream"，版本号在第二列，
-// 前缀的 epoch（"1:"）不是版本的一部分，去掉。
-func parseDnfAvailable(out string) string {
+// parseDnfListRow 取 `dnf/yum list openvpn` 里 openvpn 那一行的版本。
+//
+// 用 list 而不是 list available：available 只列"没装着的更新版"，本机已经装到
+// 仓库最新时它一句 "No matching Packages" 就走了，那样根本问不出"仓库是多少"。
+// list 会把 Installed 和 Available 两段都印出来，形状是
+// "openvpn.x86_64   1:2.6.11-1.el8   baseos"，版本号在第二列，
+// 前缀的 epoch（"1:"）不是版本的一部分，去掉。Available 段排在 Installed 段后面，
+// 所以取**最后**那一行才是仓库版本；只有一段时说明仓库里没有更新的，取它也对。
+func parseDnfListRow(out string) string {
+	ver := ""
 	for _, line := range strings.Split(out, "\n") {
 		f := strings.Fields(line)
-		if len(f) < 2 || !strings.HasPrefix(f[0], "openvpn") {
+		if len(f) < 2 {
+			continue
+		}
+		// 认 "openvpn.x86_64" 和 "openvpn-2.4.11-1.el7.x86_64" 两种写法，
+		// 但别把 openvpn-auth-ldap 这种同前缀的插件当成 openvpn 本体的版本
+		head, _, _ := strings.Cut(f[0], ".")
+		if head != "openvpn" && !strings.HasPrefix(f[0], "openvpn-") {
 			continue
 		}
 		v := f[1]
 		if _, after, ok := strings.Cut(v, ":"); ok && after != "" {
 			v = after
 		}
-		return v
+		ver = v
 	}
-	return ""
+	return ver
 }
 
-// parseApkPolicy 取 apk policy 首行 "openvpn-2.6.11-r0:" 里的版本号。
+// parseApkPolicy 从 `apk policy openvpn` 里挑出仓库能给的最高版本。
+//
+// 输出长这样，两种形状都带版本号：
+//
+//	openvpn-2.6.11-r0:
+//	  2.6.11-r0:
+//	    V: https://dl-cdn.alpinelinux.org/alpine/v3.21/main
+//
+// 首行是 apk 选中的那份（装了且仓库没更新时就是已装版本），缩进行是各个仓库候选。
+// 只取首行会把"已装版本"当成"仓库版本"，所以把所有版本号收齐再取最高的那个。
 func parseApkPolicy(out string) string {
-	for _, line := range strings.Split(out, "\n") {
-		l := strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(line), ":"))
-		if strings.HasPrefix(l, "openvpn-") {
-			return strings.TrimPrefix(l, "openvpn-")
+	best := ""
+	consider := func(v string) {
+		if v == "" {
+			return
+		}
+		if best == "" || versionLess(best, v) {
+			best = v
 		}
 	}
-	return ""
+	for _, line := range strings.Split(out, "\n") {
+		l := strings.TrimSpace(line)
+		if !strings.HasSuffix(l, ":") {
+			continue // V:/A:/P: 那些字段行，不是版本号
+		}
+		l = strings.TrimSuffix(l, ":")
+		if head, _, ok := strings.Cut(l, "-"); ok && head == "openvpn" {
+			consider(strings.TrimPrefix(l, "openvpn-"))
+			continue
+		}
+		if r := []rune(l); len(r) > 0 && r[0] >= '0' && r[0] <= '9' {
+			consider(l) // 缩进的纯版本号行
+		}
+	}
+	return best
 }
 
 // parseColonVersion 取 "Version        : 2.6.11-1" 这种键值行（pacman -Si / zypper info）。
