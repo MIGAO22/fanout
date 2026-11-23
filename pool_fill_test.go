@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"testing"
 	"time"
 )
@@ -130,5 +131,96 @@ func TestPoolFillFollow(t *testing.T) {
 	any := poolFillFollow(2, nil)
 	if len(any) != 2 || any[0] != "" || any[1] != "" {
 		t.Fatalf("没有掉线记录时应给两个不限地区的名额：%v", any)
+	}
+}
+
+// retireFixture 造一个「组刚把人换掉、还剩一条死出口」的现场。
+//
+// poolHosts 是各组此刻的成员表（本次顶替已经写回，所以换掉的那个不在里面了），
+// p 是后端，决定"有没有入站直接绑在这条出口上"问不问得到。
+func retireFixture(t *testing.T, host, status string, poolHosts [][]string, p Panel) (*Manager, *PoolService) {
+	t.Helper()
+	usePanel(t, p)
+	mgr := NewManager(4, t.TempDir())
+	if status != "" {
+		mgr.tunnels[3] = &Tunnel{Slot: 3, Node: Node{HostName: host, CountryCode: "DE"}, Status: status}
+	}
+	svc, _ := newTestPoolService(t, mgr)
+	svc.store.Pools = nil
+	for i, hs := range poolHosts {
+		svc.store.Pools = append(svc.store.Pools,
+			&Pool{ID: fmt.Sprintf("p%d", i+1), Name: "补位组", Mode: poolModeSingle, Hosts: hs})
+	}
+	return mgr, svc
+}
+
+// 顶替完成之后原来那条必须收掉。
+//
+// 判死的成员不会自己消失：它带着原节点在重连回路里无限重试，只在被删掉时才停。
+// 补位每轮再搭一条新的进来，这些僵尸就把槽位一点点吃光，
+// 于是界面只剩"槽位不够，先不补"——看着正是"节点没了也不自动换"。
+func TestRetireMemberStopsReplacedTunnel(t *testing.T) {
+	mgr, svc := retireFixture(t, "vpn-gate-dead", "starting",
+		[][]string{{"vpn-gate-new"}}, &fakePanel{})
+
+	svc.retireMember("vpn-gate-dead")
+	if got := len(mgr.Tunnels()); got != 0 {
+		t.Fatalf("被顶替掉的死出口还留着 %d 条，槽位没释放", got)
+	}
+}
+
+// 四种情况下不能停：它又连上了、别的组还指着它、有入站直接绑着它、后端问不到。
+// 误停的代价是把别人正在用的连接拆掉，比留一条僵尸严重得多。
+func TestRetireMemberKeepsWhatOthersStillNeed(t *testing.T) {
+	cases := []struct {
+		name      string
+		status    string
+		poolHosts [][]string
+		panel     Panel
+	}{
+		{"补位这几分钟里它自己连回来了", "up", [][]string{{"vpn-gate-new"}}, &fakePanel{}},
+		{"另一个出口组还指着它", "starting", [][]string{{"vpn-gate-new"}, {"vpn-gate-dead"}}, &fakePanel{}},
+		{"有入站直接绑在这条出口上", "failed", [][]string{{"vpn-gate-new"}},
+			&fakePanel{inbounds: []Inbound{{ID: 7, Port: 20071, BoundTo: "vpn-gate-dead"}}}},
+		{"后端问不到答案时按有人绑着处理", "failed", [][]string{{"vpn-gate-new"}},
+			&fakePanel{ibErr: fmt.Errorf("面板连不上")}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			mgr, svc := retireFixture(t, "vpn-gate-dead", c.status, c.poolHosts, c.panel)
+			svc.retireMember("vpn-gate-dead")
+			if len(mgr.Tunnels()) != 1 {
+				t.Fatal("不该停的出口被停掉了")
+			}
+		})
+	}
+}
+
+// 成员被顶替时隧道早已被用户删掉，是最常见的情况：没东西要收，也不能报错。
+func TestRetireMemberNoTunnel(t *testing.T) {
+	mgr, svc := retireFixture(t, "vpn-gate-dead", "", [][]string{{"vpn-gate-new"}}, &fakePanel{})
+	svc.retireMember("vpn-gate-dead")
+	svc.retireMember("")
+	if len(mgr.Tunnels()) != 0 {
+		t.Fatal("不该凭空造出隧道")
+	}
+}
+
+// 补位要跟住失效成员的地区，而"节点从列表里消失了"恰恰是最需要跟住的那次。
+func TestMemberRegionFallsBackToTunnel(t *testing.T) {
+	// 列表里只剩 US 节点，jp-gone 只活在隧道自己的记录里
+	mgr := mgrWith([]Node{{HostName: "us1", CountryCode: "US", Residential: true}})
+	mgr.tunnels[2] = &Tunnel{Slot: 2, Node: Node{HostName: "jp-gone", CountryCode: "JP"}, Status: "starting"}
+
+	if got := mgr.MemberRegion("jp-gone"); got != "JP" {
+		t.Fatalf("节点没了就该退回出口记着的地区，实际 %q", got)
+	}
+	// 列表里查得到时以列表为准（节点可能改过归属）
+	if got := mgr.MemberRegion("us1"); got != "US" {
+		t.Fatalf("列表里的地区优先，实际 %q", got)
+	}
+	// 两边都不知道才留空，让上层按任意地区处理
+	if got := mgr.MemberRegion("never-existed"); got != "" {
+		t.Fatalf("查不到时应返回空串，实际 %q", got)
 	}
 }

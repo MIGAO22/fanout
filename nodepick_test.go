@@ -265,6 +265,32 @@ func TestCandidatesForKeepsCurrentFirstAndAvoidsSwapped(t *testing.T) {
 	}
 }
 
+// 节点从列表里消失了（家宽节点说没就没），而它所在地区已经没有别的空闲节点：
+// 第二轮必须跨区补上，否则这条出口就在死节点上无限重试，
+// 出口组也就永远等不到"自动替换没了的节点"。
+func TestCandidatesForWidensWhenRegionEmptied(t *testing.T) {
+	withResidentialOnly(t, boolPtr(true))
+	// 列表里已经没有 JP 了，jp-gone 只是隧道自己身上记着的那个节点
+	m := mgrWith([]Node{
+		{HostName: "us1", CountryCode: "US", Residential: true},
+		{HostName: "de1", CountryCode: "DE", Residential: true},
+	})
+	tn := &Tunnel{Slot: 1, Node: Node{HostName: "jp-gone", CountryCode: "JP"}, Status: "starting"}
+	m.tunnels[1] = tn
+
+	got := m.candidatesFor(tn, false)
+	if len(got) == 0 || got[0].HostName == "jp-gone" {
+		t.Fatalf("同区空了还不跨区，这条出口永远换不回来：%+v", namesOf(got))
+	}
+	if got[len(got)-1].HostName != "jp-gone" {
+		t.Fatalf("原来那条该垫到最后留一次机会，实际 %+v", namesOf(got))
+	}
+	// 首轮不许跨区：那是要按用户挑的地区把出口恢复原样
+	if first := m.candidatesFor(tn, true); len(first) != 1 || first[0].HostName != "jp-gone" {
+		t.Fatalf("首轮不该偷偷跑到别的国家：%+v", namesOf(first))
+	}
+}
+
 // ---- 每个国家各开几个 ----
 
 var manyRegions = []Node{

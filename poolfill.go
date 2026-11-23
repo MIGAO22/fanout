@@ -79,7 +79,7 @@ func (s *PoolService) fillPool(p *Pool) {
 
 	filled := 0
 	for i, follow := range poolFillFollow(need, gone) {
-		region := s.mgr.NodeRegion(follow)
+		region := s.mgr.MemberRegion(follow)
 		picks, err := s.mgr.pickNodes(region, 1, s.fillAvoid(p.ID))
 		if err != nil {
 			s.setFillNote(p.ID, fmt.Sprintf("还差 %d 条：%v", need-i, err))
@@ -124,8 +124,88 @@ func (s *PoolService) fillOne(p *Pool, node Node, oldHost string) bool {
 	// 顶替完成后清掉这条旧记录的计时：它已经不在这个组里了，
 	// 留着会让 fillDead 越来越长，也会让同名节点日后回来时被误判。
 	s.forgetFillDead(p.ID, oldHost)
+	// 顺序要紧：先确认新那条真的接上了位置，再收尾旧的。
+	// 反过来做的话中途 Start 失败，等于既没补上人、又把原来的拆了。
+	s.retireMember(oldHost)
 	log.Printf("出口组 %s：用 %s 顶替了 %s", p.Name, node.HostName, orNone(oldHost))
 	return true
+}
+
+// retireMember 顶替完成后收掉原来那条出口。
+//
+// 不收它会一直占着槽位：被判死的成员在自己的重连回路里循环重试，
+// 只有用户删掉它才会停。补位每轮搭一条新的进来，死的就攒成一群僵尸，
+// 最后把槽位上限吃光——那时补位只剩"槽位不够，先不补"这一句话，
+// 看上去正是"节点没了也不会自动换"。
+//
+// 三条前提缺一条就不动它：
+//   - 它自己回来了（补位从挑节点到等 up 中间隔着几分钟，够同区节点重新上线）；
+//   - 还有别的组指着它，停了就是拆别人的保活；
+//   - 有入站直接绑在它身上。组的绑定走 pool-<id>，绑到组的不会命中这一条；
+//     问后端要不到答案时按"绑着"处理——宁可留一条僵尸，
+//     也不能把谁正在用的连接悄悄停掉。
+func (s *PoolService) retireMember(host string) {
+	if host == "" {
+		return
+	}
+	var t *Tunnel
+	for _, x := range s.mgr.Tunnels() {
+		if x.host() == host {
+			t = x
+			break
+		}
+	}
+	if t == nil || t.status() == "up" {
+		return
+	}
+	if s.hostInPool(host) {
+		log.Printf("出口组顶替后保留 %s：还有出口组指着它", host)
+		return
+	}
+	if s.hostBound(host) {
+		log.Printf("出口组顶替后保留 %s：还有入站直接绑着它", host)
+		return
+	}
+	if err := s.mgr.Stop(t.Slot); err != nil {
+		log.Printf("出口组顶替后收尾 %s 失败: %v", host, err)
+		return
+	}
+	log.Printf("出口组顶替后停掉了原来的出口 %s（槽位 %d 已释放）", host, t.Slot)
+}
+
+// hostInPool 判断此刻还有没有组把这个主机名当成员。
+// 调用它的时候本次顶替已经写回存储了，所以本组不会算进来。
+func (s *PoolService) hostInPool(host string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, p := range s.store.Pools {
+		if slices.Contains(p.Hosts, host) {
+			return true
+		}
+	}
+	return false
+}
+
+// hostBound 问后端有没有入站直接绑在这条出口上。
+//
+// 走 openPanel 现问，不走 cachedInbounds：那份缓存是给界面用的，
+// 里面存着按界面口径算好的 BoundUp，补位拿 nil 去填会把它刷成"全部离线"。
+func (s *PoolService) hostBound(host string) bool {
+	x, err := openPanel()
+	if err != nil {
+		return true
+	}
+	list, err := x.Inbounds(nil)
+	if err != nil {
+		return true
+	}
+	tag := sanitizeTag(host)
+	for _, ib := range list {
+		if ib.BoundTo == tag {
+			return true
+		}
+	}
+	return false
 }
 
 // swapMember 只改 Hosts 这一项，不走 setPool。

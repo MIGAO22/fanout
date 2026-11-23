@@ -14,11 +14,16 @@ import (
 type fakePanel struct {
 	inbounds []Inbound
 	linkErr  error
+	// ibErr 非空表示"问不到入站"，用来验那些拿不到答案时必须保守的分支。
+	ibErr error
 }
 
 func (f *fakePanel) Kind() string     { return "fake" }
 func (f *fakePanel) Describe() string { return "测试用" }
 func (f *fakePanel) Inbounds(live map[string]bool) ([]Inbound, error) {
+	if f.ibErr != nil {
+		return nil, f.ibErr
+	}
 	return f.inbounds, nil
 }
 func (f *fakePanel) InboundDetail(id int, publicHost string) (*InboundDetail, error) {

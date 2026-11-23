@@ -155,16 +155,36 @@ func (m *Manager) SlotHeadroom() int {
 	return free
 }
 
-// NodeRegion 按主机名查它属于哪个国家码。
+// MemberRegion 按主机名查一个组员该跟哪个地区。
 //
-// 补位要"跟着掉线那个的地区"，可掉线的那条隧道可能已经被停掉删掉了，
-// 这时候只能从节点清单里查。查不到返回空串，调用方按任意地区处理。
-func (m *Manager) NodeRegion(host string) string {
+// 两个来源按顺序问，各治一种缺失：
+// 掉线的那条隧道可能已经被停掉删掉了，只能从节点清单里查；
+// 反过来家宽节点说没就没（用户报的"节点没了"就是这一种），清单里查不到，
+// 但隧道自己身上还记着当初连的是哪个国家。只问清单的话，
+// 恰恰在最需要跟住地区的时候返回空串，补位补出来的是任意地区。
+// 两边都查不到才返回空串，调用方按任意地区处理。
+func (m *Manager) MemberRegion(host string) string {
 	if host == "" {
 		return ""
 	}
 	m.mu.RLock()
-	defer m.mu.RUnlock()
+	listed := m.nodeRegionLocked(host)
+	var remembered string
+	for _, t := range m.tunnels {
+		if t.host() == host {
+			remembered = t.node().CountryCode
+			break
+		}
+	}
+	m.mu.RUnlock()
+	if listed != "" {
+		return listed
+	}
+	return remembered
+}
+
+// nodeRegionLocked 从当前节点清单里查国家码。调用方必须已持 m.mu。
+func (m *Manager) nodeRegionLocked(host string) string {
 	for _, n := range m.nodes {
 		if n.HostName == host {
 			return n.CountryCode
@@ -290,6 +310,8 @@ func (m *Manager) tryCandidates(t *Tunnel, notify bool, preferCurrent bool) bool
 	// VPN Gate 是志愿者节点，列表里有相当比例已下线或满员（AUTH_FAILED），
 	// 连不上就顺着候选列表换下一个，不必让用户手动试。
 	candidates := m.candidatesFor(t, preferCurrent)
+	// 本轮起点的地区，用来说明某一次换候选是不是跨区换的。
+	home := t.node().CountryCode
 	for i, node := range candidates {
 		if !m.tunnelActive(t) {
 			return false
@@ -300,7 +322,7 @@ func (m *Manager) tryCandidates(t *Tunnel, notify bool, preferCurrent bool) bool
 		}
 		t.setNode(node)
 		if i > 0 {
-			t.setStatus("starting", fmt.Sprintf("已换到第 %d 个候选节点", i+1))
+			t.setStatus("starting", swapNote(i, home, node.CountryCode))
 		} else {
 			t.setStatus("starting", "")
 		}
@@ -363,6 +385,7 @@ func (m *Manager) tryNode(t *Tunnel) (string, error) {
 // 它刚把这一轮带崩，再让它打头就是反复撞同一块石头。
 // 备选会避开用户手动换掉过的节点——那些是他明确不想要的 IP，
 // 让重连悄悄换回去等于撤销了他的操作。
+// 排序规则本身在 orderCandidates，包括"同区掏空之后跨区补齐"那一条。
 func (m *Manager) candidatesFor(t *Tunnel, preferCurrent bool) []Node {
 	maxTries := connConf().MaxTries
 	first := t.node()
@@ -380,40 +403,10 @@ func (m *Manager) candidatesFor(t *Tunnel, preferCurrent bool) []Node {
 	// 否则会退化成"任意地区都算同区"。
 	region := first.CountryCode
 	if region == "" {
-		for _, n := range m.nodes {
-			if n.HostName == first.HostName {
-				region = n.CountryCode
-				break
-			}
-		}
+		region = m.nodeRegionLocked(first.HostName)
 	}
 
-	var out []Node
-	if preferCurrent {
-		out = append(out, first)
-	}
-	for _, n := range m.nodePoolLocked() {
-		if len(out) >= maxTries {
-			break
-		}
-		if used[n.HostName] || avoid[n.HostName] {
-			continue
-		}
-		// 地区实在拿不到时不做限制，总比连不上强
-		if region != "" && n.CountryCode != region {
-			continue
-		}
-		out = append(out, n)
-	}
-	// 不优先当前节点时把它垫到最后：刚把一整轮带崩的那个节点不该再占第一个
-	// 握手预算，但同地区只剩它时还得让它有机会上场。
-	if !preferCurrent && len(out) < maxTries {
-		out = append(out, first)
-	}
-	if len(out) == 0 {
-		out = append(out, first)
-	}
-	return out
+	return orderCandidates(first, region, preferCurrent, maxTries, m.nodePoolLocked(), used, avoid)
 }
 
 // Stop 停掉一条隧道并释放槽位。
