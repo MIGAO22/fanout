@@ -158,12 +158,14 @@ func ovpnSrcMakeJobs(n int) int {
 
 // ovpnSrcDeps 是编译 openvpn 2.7 需要的包，只给 deb 家族。
 //
-// 依据是 tarball 里 INSTALL 的 SYSTEM REQUIREMENTS 和 configure.ac：OpenSSL 必需；
-// Linux 上缺 libcap-ng 是 AC_MSG_ERROR（硬失败，不是警告），所以 libcap-ng-dev 必装；
-// gnupg 用来验官方签名。
+// 依据是 configure.ac 里那几处 AC_MSG_ERROR（缺了就是硬失败，不是警告）：
+// pkg-config :386、libcap-ng :761、lzo :1190、lz4 :1099，加 OpenSSL 本身；
+// gnupg 用来验官方签名。pkcs11 和 systemd 默认关，不用装。
+// lzo / lz4 是 Actions 的 ubuntu-24.04 上真跑出来的：少装一个 configure 就停在
+// "lzo enabled but missing"，runner 上 lz4 看着能过只是因为镜像自带了 liblz4-dev。
 //
-// rpm 家族故意不给：pkgconf / openssl-devel / libcap-ng-devel 的包名在 RHEL、Alma、
-// Amazon Linux 上各不相同，装错一个就是白等几分钟，那种情况不如让人手动来。
+// rpm 家族故意不给：pkgconf / openssl-devel / libcap-ng-devel / lzo-devel 的包名在
+// RHEL、Alma、Amazon Linux 上各不相同，装错一个就是白等几分钟，那种情况不如让人手动来。
 func ovpnSrcDeps(family string) [][]string {
 	if family != "deb" {
 		return nil
@@ -171,7 +173,8 @@ func ovpnSrcDeps(family string) [][]string {
 	return [][]string{
 		{"apt-get", "update", "-qq"},
 		{"apt-get", "install", "-y", "--no-install-recommends",
-			"build-essential", "pkg-config", "libssl-dev", "libcap-ng-dev", "gnupg"},
+			"build-essential", "pkg-config", "libssl-dev", "libcap-ng-dev",
+			"liblzo2-dev", "liblz4-dev", "gnupg"},
 	}
 }
 
@@ -541,7 +544,7 @@ func runOpenVPNSourceBuild(job *Job, ver, tarURL, ascURL, digest string) {
 	done(bStepSign, "主钥匙 "+shortFingerprint(ovpnSrcSigners[0])+" 的子钥匙 "+shortFingerprint(signer))
 
 	// 5) 依赖
-	job.Set(bStepDeps, "running", "apt-get update && install build-essential libssl-dev libcap-ng-dev gnupg")
+	job.Set(bStepDeps, "running", "apt-get update && apt-get install 编译依赖")
 	deps := ovpnSrcDeps(d.Family)
 	if len(deps) == 0 {
 		fail(bStepDeps, "%s 家族没有给定的依赖包名表", d.Family)
@@ -551,7 +554,12 @@ func runOpenVPNSourceBuild(job *Job, ver, tarURL, ascURL, digest string) {
 		fail(bStepDeps, "%v", err)
 		return
 	}
-	done(bStepDeps, "build-essential / pkg-config / libssl-dev / libcap-ng-dev / gnupg")
+	// 这一步报的是真装了哪些包，不在这里另抄一份清单——少写一个 lzo 就是白跑十几分钟
+	var pkgs []string
+	if len(deps) > 1 && len(deps[1]) > 4 {
+		pkgs = deps[1][4:]
+	}
+	done(bStepDeps, strings.Join(pkgs, " / "))
 
 	// 6) 解包
 	job.Set(bStepUnpack, "running", "")

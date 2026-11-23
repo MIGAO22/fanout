@@ -29,12 +29,12 @@ jobs:
       PREFIX: /usr/local/fanout-openvpn/proof
 
     steps:
-      - name: 装编译依赖（和 ovpnSrcDeps 的 deb 分支一致）
+      - name: 装编译依赖（和 ovpnSrcDeps 的 deb 分支一致，TestOvpnSrcDepsMirrorsWorkflow 会核对）
         run: |
           set -euo pipefail
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
-            build-essential pkg-config libssl-dev libcap-ng-dev gnupg
+            build-essential pkg-config libssl-dev libcap-ng-dev liblzo2-dev liblz4-dev gnupg
 
       - name: 定版本、下载地址与摘要
         id: rel

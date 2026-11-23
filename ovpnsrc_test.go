@@ -1,6 +1,7 @@
 package main
 
 import (
+	"os"
 	"strings"
 	"testing"
 )
@@ -145,9 +146,13 @@ func TestOvpnSrcDeps(t *testing.T) {
 	if len(steps) != 2 {
 		t.Fatalf("deb 应该是刷索引 + 装包两步，拿到 %d 步", len(steps))
 	}
-	allow := map[string]bool{
-		"build-essential": true, "pkg-config": true, "libssl-dev": true,
-		"libcap-ng-dev": true, "gnupg": true,
+	// 这张表是 configure.ac 里几处 AC_MSG_ERROR 对出来的，且由 .github/workflows/openvpn-src.yml
+	// 在 ubuntu-24.04 上原地跑过一遍：liblzo2-dev 漏装时 configure 直接停在 "lzo enabled but missing"
+	wantPkgs := []string{"build-essential", "pkg-config", "libssl-dev", "libcap-ng-dev",
+		"liblzo2-dev", "liblz4-dev", "gnupg"}
+	allow := map[string]bool{}
+	for _, p := range wantPkgs {
+		allow[p] = true
 	}
 	for _, s := range steps {
 		line := strings.Join(s, " ")
@@ -161,13 +166,6 @@ func TestOvpnSrcDeps(t *testing.T) {
 			// 把 openvpn 混进依赖表就等于让 apt 决定用哪一份，和"独立目录"这个前提冲突
 			t.Errorf("依赖表里不该出现 openvpn 本身：%s", line)
 		}
-		if s[1] == "install" || (len(s) > 2 && s[1] == "-y") {
-			for _, tok := range s {
-				if allow[tok] && tok == "openvpn" {
-					t.Fatal("不该装 openvpn 包")
-				}
-			}
-		}
 		if strings.ContainsAny(line, "&|;$`") {
 			t.Errorf("命令是 argv 数组，不该出现 shell 元字符：%s", line)
 		}
@@ -179,11 +177,32 @@ func TestOvpnSrcDeps(t *testing.T) {
 			pkgs = append(pkgs, tok)
 		}
 	}
-	if strings.Join(last, " ") == "" || len(pkgs) != 5 {
-		t.Errorf("五个依赖包都要在命令里，实际只有 %v（%s）", pkgs, strings.Join(last, " "))
+	if strings.Join(last, " ") == "" || strings.Join(pkgs, " ") != strings.Join(wantPkgs, " ") {
+		t.Errorf("依赖表必须正好是 %v，实际抓到 %v（%s）", wantPkgs, pkgs, strings.Join(last, " "))
 	}
 	if !strings.Contains(strings.Join(last, " "), "--no-install-recommends") {
 		t.Error("必须 --no-install-recommends：装编译器不该顺手拖进一堆推荐包")
+	}
+}
+
+// 依赖清单在 workflow 配方和 README 里还各有一份给人看的副本。漂移一次的代价是用户在自己
+// VPS 上等十几分钟、configure 才报 "lzo enabled but missing"，所以让单测去比对字面量。
+func TestOvpnSrcDepsMirrorsWorkflow(t *testing.T) {
+	steps := ovpnSrcDeps("deb")
+	if len(steps) < 2 || len(steps[1]) <= 4 {
+		t.Fatalf("deb 依赖表形状不对：%v", steps)
+	}
+	want := strings.Join(steps[1][4:], " ")
+	for _, f := range []string{".github/workflows/openvpn-src.yml", "README.md"} {
+		b, err := os.ReadFile(f)
+		if err != nil {
+			t.Skipf("读不到 %s（不在仓库根跑的），跳过副本比对", f)
+		}
+		// workflow 里那行用反斜杠续行，压平空白再比
+		flat := strings.Join(strings.Fields(strings.ReplaceAll(string(b), `\`, " ")), " ")
+		if !strings.Contains(flat, want) {
+			t.Errorf("%s 里的依赖清单和 ovpnSrcDeps 不一致，应为：%s", f, want)
+		}
 	}
 }
 

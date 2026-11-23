@@ -351,7 +351,7 @@ questing 是 `2.7~rc1`——数字上比 2.6.19 大，实际比本机那份旧�
 核对 GitHub 在 release 资产上自己报的 sha256
 用 OpenVPN 官方主钥匙验签名（F554A3687412CFFEBDEFE0A312F5F7B42F2B01E7）
 apt-get update -qq
-apt-get install -y --no-install-recommends build-essential pkg-config libssl-dev libcap-ng-dev gnupg
+apt-get install -y --no-install-recommends build-essential pkg-config libssl-dev libcap-ng-dev liblzo2-dev liblz4-dev gnupg
 ./configure --prefix=/usr/local/fanout-openvpn/2.7.9 --disable-dco --disable-unit-tests
 make -j<N> && make install
 ```
@@ -369,8 +369,9 @@ make -j<N> && make install
   主钥匙 2027-02-07 到期，官方换主钥匙时这里要跟着换（`ovpnSrcSigners`）。
 - **`--disable-dco`**：DCO 要么靠内核 6.16+ 自带的 `ovpn` 模块，要么装 out-of-tree kmod，
   两条都不该由一个装客户端的按钮顺手引入；顺带也免掉 `libnl-genl-3-dev`
-  （`configure.ac` 里它是启用 DCO 时的硬要求）。libcap-ng 则必须装——Linux 上缺它是
-  `AC_MSG_ERROR`，configure 当场停，不是警告。
+  （`configure.ac` 里它是启用 DCO 时的硬要求）。libcap-ng、lzo、lz4 则必须装——缺任何一个是
+  `AC_MSG_ERROR`，configure 当场停，不是警告（`liblzo2-dev` 最初就漏了，是那条 workflow 报的
+  "lzo enabled but missing"；runner 上 lz4 看着能过只是因为镜像自带 `liblz4-dev`）。
 - **只给 deb。** RHEL / Alpine / Arch 的 `pkgconf`、`openssl-devel`、`libcap-ng-devel` 包名各家不同，
   装错一个是白等几分钟，不如让人手动。这条口径和按钮判据写在一起，有单测钉着。
 - **任何一步失败都不登记、删掉那棵树**，隧道继续用系统那份；跑完还会核一次
