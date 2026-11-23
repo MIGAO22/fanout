@@ -30,7 +30,9 @@
 - 「设置与连接」里有一张「内置客户端」：卡上只留两份客户端的当前版本，点「检查更新」才报最新版号
   （两份都问 GitHub 官方 release，openvpn 另外问一次本机包管理器和 OpenVPN 官方 apt 源），两份都能就地升级——
   Xray 由 fanout 换二进制，openvpn 走系统包且只点它一个包，本机仓库不够新时才会接一次官方源，
-  接了还给一键撤销（口径见下面「使用 → 内置客户端（Xray 与 openvpn）」）。
+  接了还给一键撤销；apt 和官方源都够不到官方最新时（noble / bookworm 就是这种），
+  另外给一条「自己编译 openvpn」：验官方签名、装进独立目录、不覆盖系统那份，也给了撤销按钮
+  （口径见下面「使用 → 内置客户端（Xray 与 openvpn）」）。
 - 顶部一行 KPI：在线出口（带完成度圆环）、可用节点、覆盖地区、母机 IP、节点链接。
 - 批量开出口时下面跟着作业卡片，每条目标的状态单独显示，不用刷整页。
 - 出口列表支持卡片 / 表格两种密度，可按「已连通 / 连接中 / 失败」筛，能搜 IP、国家、节点名。
@@ -72,6 +74,10 @@
   每条出口都起不来。现在先读本机 `openvpn --version`，按版本段挑名字，读不出来就
   一个都不传、用默认算法表，宁少不多。`fallback` 留 `AES-256-CBC` 是为了那些只讲
   老算法的 VPN Gate 节点：2.6 的客户端默认协商不出 CBC，不加这条会直接握手失败。
+- **那份 openvpn 的"版本"和"路径"永远一起解析**。机器上可能同时有两份（系统包一份、fanout 自己
+  编的一份装在 `/usr/local/fanout-openvpn/` 下），所以版本探测和 netns 里真正 exec 的那一条都走
+  同一个 `openvpnBinary()`——分头查就会写成"读的是 2.7、跑的是 2.6"，症状正好是上一条那个
+  `Unrecognized option` 当场退出。
 - 上面这些阈值全部进了「设置与连接」，填错会夹回可用区间，不会把自己调死。
 
 ### 出口组（本版本新增）
@@ -127,7 +133,7 @@ Xray 到 `/var/lib/fanout/bin/`，装了则跳过，入站交给面板管。
 > 才生效：`f` → `3) 重启`（或 `f restart`）。`install.sh` 现在重装会显式
 > `systemctl restart`——以前用 `enable --now`，对已运行的单元是空操作，
 > 于是新二进制在磁盘上、老进程还在服务老界面。
-> 想确认手上是哪一份：`fanout -version`，本仓库显示 `v2.0.3`，上游原版是 `v1.3.1`。
+> 想确认手上是哪一份：`fanout -version`，本仓库显示 `v2.0.4`，上游原版是 `v1.3.1`。
 
 > **发新版本。** 推一个 `v*` tag 就会触发 release workflow 出 amd64 / arm64
 > 两个包和 checksums；不打 tag 就没有 Release，`releases/latest/download/...`
@@ -328,6 +334,56 @@ Fedora Copr（`@OpenVPN/openvpn-release-2.7`，`dnf copr enable` 那条路），
 至于 openvpn 的版本为什么要看一眼：2.4 和 2.5 之后连数据通道算法的参数名都不一样，
 喂错名字 openvpn 直接退出、一条出口都连不上，fanout 按本机版本挑名字（见上面「连接层加固」）。
 
+**apt 到不了的地方，还有一条源码编译的路。** 官方 apt 源的 `release/2.7` 通道在不少发行版上
+只喂到预发布：实测 noble / bookworm / jammy / plucky 是 `2.7~alpha1`，trixie 是 `2.7~beta1`，
+questing 是 `2.7~rc1`——数字上比 2.6.19 大，实际比本机那份旧两年，所以 fanout 认 Debian 语义、
+见 `~` 就拒（装上它等于一次降级）。稳定版通道又只到 2.6.10 / 2.6.0 这一档。
+这种机器想上官方最新只剩自己编，于是「设置与连接 → 内置客户端」多一颗
+**「自己编译 openvpn <官方版本号>」**，只在四个条件同时成立时出现：deb 家族、
+确实比官方 release 旧、发行版仓库加官方源都够不到那个号、那个号还没编好。
+判据全在后端算，前端只看结果，理由和那颗升级按钮一样——藏按钮不等于把关。
+
+确认框会把要发生的事整个摊开（下载哪个 URL、怎么验、apt 装哪几个包、configure 参数、
+装去哪个目录、怎么退），因为这一步比升级包重：它要在机器上装编译器。实际动作是
+
+```
+下载 https://github.com/OpenVPN/openvpn/releases/download/v2.7.9/openvpn-2.7.9.tar.gz 和它的 .asc
+核对 GitHub 在 release 资产上自己报的 sha256
+用 OpenVPN 官方主钥匙验签名（F554A3687412CFFEBDEFE0A312F5F7B42F2B01E7）
+apt-get update -qq
+apt-get install -y --no-install-recommends build-essential pkg-config libssl-dev libcap-ng-dev gnupg
+./configure --prefix=/usr/local/fanout-openvpn/2.7.9 --disable-dco --disable-unit-tests
+make -j<N> && make install
+```
+
+几个决定是有意为之的：
+
+- **装进 `/usr/local/fanout-openvpn/<版本>` 这棵独立的树**，`/usr/sbin/openvpn` 一个字不改。
+  fanout 在 `/var/lib/fanout/openvpn/source.json` 里记下"隧道该 exec 哪一个"，
+  版本探测和 netns 里那一跳走同一个解析入口——否则会出现"按 2.7 的参数名喂给实际是 2.6 的二进制"。
+  胶囊上因此会写成 `openvpn 2.7.9（自编译）`，卡片另起一行说明系统包里那份还是几号。
+- **钉的是主钥匙，不是签名子钥匙。** 子钥匙一年一换（v2.6.11 用 `533A6860…`、v2.6.19 用
+  `389251C7…`、v2.7.9 用 `33DA8C9E…`，实测三次的 `.asc` 都验证到同一把 2017 年生成的主钥匙）。
+  钉子钥匙等于每年让这条路断一次。验签在只装了这把钥匙的独立 `GNUPGHOME` 里做，
+  还要求 `VALIDSIG` 行末的主钥匙指纹正好是钉住那把——钥匙服务器给错东西时会直接红。
+  主钥匙 2027-02-07 到期，官方换主钥匙时这里要跟着换（`ovpnSrcSigners`）。
+- **`--disable-dco`**：DCO 要么靠内核 6.16+ 自带的 `ovpn` 模块，要么装 out-of-tree kmod，
+  两条都不该由一个装客户端的按钮顺手引入；顺带也免掉 `libnl-genl-3-dev`
+  （`configure.ac` 里它是启用 DCO 时的硬要求）。libcap-ng 则必须装——Linux 上缺它是
+  `AC_MSG_ERROR`，configure 当场停，不是警告。
+- **只给 deb。** RHEL / Alpine / Arch 的 `pkgconf`、`openssl-devel`、`libcap-ng-devel` 包名各家不同，
+  装错一个是白等几分钟，不如让人手动。这条口径和按钮判据写在一起，有单测钉着。
+- **任何一步失败都不登记、删掉那棵树**，隧道继续用系统那份；跑完还会核一次
+  `openvpn --version` 确实是预期版本号，号不对同样不登记。
+- 卡片上有**「撤销源码版」**：删掉那棵树和这条记录，系统那份原地还在，接着的出口回到它。
+  已在跑的隧道挂在旧进程上，新建出口、换节点或重启服务之后才换——这句也写在确认框里。
+- 自己编的这份**没人跟安全更新**。官方再出新版时这颗按钮会重新出现，这是故意的。
+
+配方本身有一条手动 workflow 钉着：[`openvpn-src.yml`](.github/workflows/openvpn-src.yml)
+在 ubuntu-24.04（就是需要它的那档机器）上把"下载 → 核摘要 → 验签 → configure → make → install
+→ 自检"整个跑一遍，并确认系统那份没被覆盖、产物认识 `--data-ciphers`。
+资产改名、钥匙轮换、依赖变硬要求，都会先在那里红，而不是在用户的 VPS 上红了才知道。
+
 ### 只用家宽
 
 VPN Gate 的清单里混着一批它自己的机房服务器（`public-vpn-*` 和
@@ -445,7 +501,7 @@ REALITY 的密钥对和 shortId 自动生成；TLS 不填证书就生成自签�
 
 ```
   状态      运行中
-  版本      fanout v2.0.3
+  版本      fanout v2.0.4
   开机自启  enabled
 
   管理地址  http://1.2.3.4:8899/gwPuWHvaNr/
@@ -503,6 +559,15 @@ Go 测试需要 Linux 运行时（部分用例依赖 netns），在 Windows / ma
 go test ./...
 ```
 
+纯逻辑那批不碰 netns，非 Linux 也能跑，改它们时没必要开虚拟机：
+
+```bash
+go test -run 'OvpnSrc|Gpg|OpenvpnCanBuildSource|DebStableVer|DataCipherArgs' ./...
+```
+
+`ovpnsrc_test.go` 里钉了 `gpg --with-colons` 和 `--status-fd 1` 的真实输出片段——
+钥匙指纹和签名者的解析规则一改就会让验签安静失灵，所以形状必须留档。
+
 ## 已知限制
 
 - SOCKS5 支持 CONNECT 和 UDP ASSOCIATE，DNS/QUIC 这类 UDP 也走隧道
@@ -526,6 +591,11 @@ go test ./...
   补位只在打开开关的组里发生，不会碰你没编进组的出口，也不会自己把组扩大。
 - 补位挑的是当前 VPN Gate 列表里的空闲节点。列表拉不下来（断网、被墙）时补不了，
   组上会写明「没有可用节点」而不是静默不管。
+- 「自己编译 openvpn」只在 deb 家族提供，且编译期间不拦别的 apt 事务：机器上恰好有
+  `unattended-upgrades` 在刷索引时，那条 `apt-get update -qq` 会撞锁。撞锁报的是包管理器
+  的原话，稍等一下重新点即可——不会留下半截状态（失败即删树、不登记）。
+  编出来的那份不过包管理器，`apt list --upgradable` 看不见它，安全更新要靠这里的按钮重新出现；
+  不想自己承担这件事就别用它，等发行版仓库喂到稳定版。
 - 本仓库的界面截图与交互仍在补充，`README` 里描述的是当前代码的实际行为。
 
 ## 许可

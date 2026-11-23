@@ -1,0 +1,168 @@
+name: openvpn-src-recipe
+
+# 验证「自己编译 openvpn」那条路的配方在真实 Ubuntu 上仍然跑得通。
+#
+# 这条路依赖三个会变的外部事实：GitHub release 的资产名与摘要、OpenVPN 的签名钥匙、
+# configure 的硬依赖。任何一个变了，VPS 上点按钮的人只会看到红字，而且是在等了
+# 十几分钟之后——所以把它钉成一条手动可跑的检查，改配方时先在这儿过一遍。
+#
+# 跑在 ubuntu-24.04（noble）：正是「发行版仓库和 OpenVPN 官方 apt 源都给不到 2.7.x、
+# 只能自己编」那档机器，和实际用户场景一致。
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 要编的 OpenVPN 版本（留空则取 GitHub 最新 release）
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      PINNED_FPR: F554A3687412CFFEBDEFE0A312F5F7B42F2B01E7
+      PREFIX: /usr/local/fanout-openvpn/proof
+
+    steps:
+      - name: 装编译依赖（和 ovpnSrcDeps 的 deb 分支一致）
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config libssl-dev libcap-ng-dev gnupg
+
+      - name: 定版本、下载地址与摘要
+        id: rel
+        env:
+          INPUT_VER: ${{ github.event.inputs.version }}
+        run: |
+          set -euo pipefail
+          api() {
+            for i in 1 2 3 4 5; do
+              if out=$(curl -fsSL --max-time 60 "https://api.github.com/$1"); then printf '%s' "$out"; return 0; fi
+              sleep 4
+            done
+            echo "拿不到 $1" >&2; return 1
+          }
+          TAG=$(api repos/OpenVPN/openvpn/releases/latest | jq -r .tag_name)
+          VER="${INPUT_VER:-${TAG#v}}"
+          case "$VER" in
+            [0-9].[0-9].[0-9]|[0-9][0-9].[0-9].[0-9]*) ;;
+            *) echo "版本号 $VER 不像能拼进路径的三位号"; exit 1 ;;
+          esac
+          json=$(api "repos/OpenVPN/openvpn/releases/tags/$TAG")
+          URL=$(printf '%s' "$json" | jq -r --arg n "openvpn-$VER.tar.gz" '.assets[]|select(.name==$n).browser_download_url')
+          AURL=$(printf '%s' "$json" | jq -r --arg n "openvpn-$VER.tar.gz.asc" '.assets[]|select(.name==$n).browser_download_url')
+          DIG=$(printf '%s' "$json" | jq -r --arg n "openvpn-$VER.tar.gz" '.assets[]|select(.name==$n).digest')
+          # 和 Go 侧 ovpnSrcAssets 同一套判据：地址必须在官方仓库的 release 下载路径下，
+          # 摘要必须是 sha256: 加 64 位十六进制
+          for u in "$URL" "$AURL"; do
+            case "$u" in
+              https://github.com/OpenVPN/openvpn/releases/download/*) ;;
+              *) echo "资产地址不像官方 release：$u"; exit 1 ;;
+            esac
+          done
+          echo "$DIG" | grep -Eq '^sha256:[0-9a-f]{64}$' || { echo "GitHub 给的摘要不是 sha256：$DIG"; exit 1; }
+          {
+            echo "ver=$VER"
+            echo "url=$URL"
+            echo "ascurl=$AURL"
+            echo "digest=${DIG#sha256:}"
+          } >> "$GITHUB_OUTPUT"
+          echo "ver=$VER digest=${DIG#sha256:}"
+
+      - name: 下载源码包与签名
+        run: |
+          set -euo pipefail
+          VER=${{ steps.rel.outputs.ver }}
+          for i in 1 2 3 4 5; do
+            if curl -fsSL --max-time 600 -o "openvpn-$VER.tar.gz" "${{ steps.rel.outputs.url }}"; then break; fi
+            [ "$i" = 5 ] && exit 1; sleep 5
+          done
+          for i in 1 2 3 4 5; do
+            if curl -fsSL --max-time 300 -o "openvpn-$VER.tar.gz.asc" "${{ steps.rel.outputs.ascurl }}"; then break; fi
+            [ "$i" = 5 ] && exit 1; sleep 5
+          done
+          ls -la "openvpn-$VER.tar.gz" "openvpn-$VER.tar.gz.asc"
+
+      - name: 核对摘要，再用官方钥匙验签（和 verifyOpenVPNTarball 同一步骤序列）
+        run: |
+          set -euo pipefail
+          VER=${{ steps.rel.outputs.ver }}
+          WANT=${{ steps.rel.outputs.digest }}
+          GOT=$(sha256sum "openvpn-$VER.tar.gz" | cut -d' ' -f1)
+          echo "sha256 want=$WANT got=$GOT"
+          [ "$GOT" = "$WANT" ] || { echo "源码包摘要对不上 GitHub 给的"; exit 1; }
+
+          GNUPGHOME=$(mktemp -d)
+          chmod 700 "$GNUPGHOME"
+          export GNUPGHOME
+          curl -fsSL --retry 5 --retry-delay 3 -o release-signing.pgp \
+            "https://keys.openpgp.org/vks/v1/by-fingerprint/$PINNED_FPR"
+          gpg --batch --no-tty --quiet --import release-signing.pgp
+          gpg --batch --with-colons --list-keys --with-subkey-fingerprints > keys.colons
+          grep -q "fpr:::::::::$PINNED_FPR:" keys.colons || { echo "下载到的钥匙里没有钉住那把"; exit 1; }
+          gpg --batch --no-tty --quiet --status-fd 1 \
+            --verify "openvpn-$VER.tar.gz.asc" "openvpn-$VER.tar.gz" > verify.status 2>&1
+          grep -E '^\[GNUPG:\] (GOODSIG|VALIDSIG)' verify.status
+          grep -q '^\[GNUPG:\] GOODSIG' verify.status || { echo "没有 GOODSIG"; exit 1; }
+          VL=$(grep -m1 '^\[GNUPG:\] VALIDSIG ' verify.status)
+          [ -n "$VL" ] || { echo "没有 VALIDSIG"; exit 1; }
+          # VALIDSIG 第一个字段是签名的子钥匙，最后一个字段是它所属的主钥匙
+          SIGNER=$(echo "$VL" | awk '{print $3}')
+          PRIMARY=$(echo "$VL" | awk '{print $NF}')
+          echo "signer=$SIGNER primary=$PRIMARY"
+          [ "$PRIMARY" = "$PINNED_FPR" ] || { echo "签名挂在别的主钥匙上：$PRIMARY"; exit 1; }
+          grep -q "fpr:::::::::$SIGNER:" keys.colons || { echo "子钥匙 $SIGNER 不在导入的这串指纹里"; exit 1; }
+
+      - name: 解包 + configure + make + install
+        run: |
+          set -euo pipefail
+          VER=${{ steps.rel.outputs.ver }}
+          rm -rf build
+          mkdir -p build
+          tar -xzf "openvpn-$VER.tar.gz" -C build --no-same-owner
+          cd "build/openvpn-$VER"
+          {
+            ./configure --prefix="$PREFIX" --disable-dco --disable-unit-tests
+            make -j3
+            sudo make install
+          } 2>&1 | tee -a /tmp/last.log
+
+      - name: 自检
+        run: |
+          set -euo pipefail
+          VER=${{ steps.rel.outputs.ver }}
+          "$PREFIX"/sbin/openvpn --version > /tmp/vers.txt 2>&1 || { cat /tmp/vers.txt; exit 1; }
+          head -3 /tmp/vers.txt
+          GOT=$(grep -m1 -oE 'OpenVPN [0-9]+\.[0-9]+\.[0-9]+' /tmp/vers.txt | cut -d' ' -f2)
+          echo "跑出来的是 $GOT，预期 $VER"
+          [ "$GOT" = "$VER" ] || { echo "版本对不上，登记这一步在程序里也会拒绝"; exit 1; }
+          # 数据通道算法的参数名按 2.5+ 走；程序里 dataCipherArgs 的判据靠它
+          "$PREFIX"/sbin/openvpn --help 2>&1 | grep -q -- '--data-ciphers' \
+            || { echo "这份构建不认识 --data-ciphers，dataCipherArgs 的判据要重看"; exit 1; }
+          # 整个前提是"不覆盖系统那份"：apt 装的话它还在原处
+          if command -v openvpn > /dev/null; then
+            SYS=$(command -v openvpn)
+            echo "系统那份 $SYS 未动：$(grep -m1 -oE 'OpenVPN [0-9.]+' <(openvpn --version) || true)"
+            [ "$(readlink -f "$SYS")" != "$PREFIX/sbin/openvpn" ] || { echo "系统那份被覆盖了"; exit 1; }
+          else
+            echo "这台机器本来就没装 openvpn 包，跳过共存检查"
+          fi
+
+      - name: 失败时把线索导出到公开字段
+        if: failure()
+        run: |
+          {
+            echo '### 源码编译配方失败'
+            echo '```'
+            tail -c 60000 /tmp/last.log 2>/dev/null || echo '（构建日志为空，看上面各步）'
+            echo '--- verify.status ---'
+            grep -E '^\[GNUPG:\]' verify.status 2>/dev/null | tail -20 || echo '（没有验签输出）'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

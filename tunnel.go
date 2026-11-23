@@ -401,9 +401,13 @@ func (t *Tunnel) startOpenVPN(dir string) error {
 		"--verb", "3",
 		"--log", logPath,
 	}
-	args = append(args, dataCipherArgs(parseOpenVPNVersion(probeVersion("openvpn", "--version")))...)
+	// ovpnBinary 和上面那个版本探测必须同一个入口：喂给 dataCipherArgs 的参数名
+	// 是按版本挑的（2.4 叫 --ncp-ciphers，2.5+ 叫 --data-ciphers），
+	// 一旦"探的是系统那份、跑的是编出来的那份"，openvpn 会当场 Unrecognized option 退出。
+	ovpnBin := openvpnBinary()
+	args = append(args, dataCipherArgs(parseOpenVPNVersion(probeVersion(ovpnBin, "--version")))...)
 	args = append(args, ovpnTuning(budget)...)
-	cmd := exec.Command("ip", append([]string{"netns", "exec", ns, "openvpn"}, args...)...)
+	cmd := exec.Command("ip", append([]string{"netns", "exec", ns, ovpnBin}, args...)...)
 
 	// 自己 Wait 并把结果送进 channel：既回收了子进程不留僵尸，
 	// 又让"进程已退出"变成可等待的事件，而不是靠轮询 ProcessState。

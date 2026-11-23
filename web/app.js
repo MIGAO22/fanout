@@ -862,6 +862,7 @@ function renderNodes(){
 /* ───────────── 任务进度 ───────────── */
 
 function renderJobs(){
+  paintBuildJob();
   const box = $('#jobs');
   if(!jobs.length){ box.innerHTML = ''; return; }
   box.innerHTML = jobs.map(j => {
@@ -887,6 +888,28 @@ function renderJobs(){
       + '<div class="prog"><i style="width:' + pct + '%"></i></div>'
       + '<div class="steps">' + steps + '</div></div>';
   }).join('');
+}
+
+// 自己编 openvpn 是个十几分钟到几十分钟的后台活，卡片里必须看得见跑到哪一步。
+// 作业卡片本身渲染在出口页，用户点完按钮人还留在设置页，所以这里镜像一行进来；
+// 取"最该看的那一步"：先失败、再进行中、都没有就看最后一条已完成的。
+function paintBuildJob(){
+  const box = $('#cliOvpnJob');
+  if(!box) return;
+  const j = (jobs || []).find(x => (x.summary || '').indexOf('源码编译 openvpn') === 0);
+  if(!j){ box.hidden = true; box.textContent = ''; return; }
+  const st = j.steps || [];
+  const cur = st.find(s => s.status === 'failed')
+    || st.find(s => s.status === 'running')
+    || st.slice().reverse().find(s => s.status === 'ok');
+  const head = j.status === 'running' ? '正在自己编译 openvpn'
+    : j.status === 'failed' ? '自己编译 openvpn 没成功' : '自己编译 openvpn 已完成';
+  let t = head + '（' + num(j.done) + '/' + num(j.total) + '）'
+    + (cur ? '：' + cur.label : '');
+  if(cur && cur.detail) t += '\n' + cur.detail;
+  if(j.status !== 'running') t += '\n（这一行在出口页的作业卡片里关掉后消失）';
+  box.textContent = t;
+  box.hidden = false;
 }
 
 /* ───────────── 轮询 ───────────── */
@@ -1774,10 +1797,15 @@ function clientNote(msg){
 function paintClientBin(c, checked){
   binState = c;
   $('#cliXray').textContent = c.current || '未知';
-  $('#cliOvpn').textContent = c.openvpn || '未安装';
+  // 用的是 fanout 自己编的那份时必须标出来：胶囊上那个号就不再是"系统包里那份"了，
+  // 不标会让人以为 apt 已经升到 2.7.9，之后查安全公告会找错对象。
+  $('#cliOvpn').textContent = !c.openvpn ? '未安装'
+    : c.openvpn + (c.openvpn_source_active ? '（自编译）' : '');
   $('#cliApply').hidden = true;
   $('#cliOvpnApply').hidden = true;
   $('#cliOvpnRepoOff').hidden = true;
+  $('#cliOvpnBuild').hidden = true;
+  $('#cliOvpnSrcOff').hidden = true;
   $('#cliCheck').disabled = false;
   // "已是最新"只有在 fanout 真能替换这份二进制时才轮得到它说：接管模式下
   // has_update 恒为 false（后端压根不动它），照原样显示就成了三台版本不同的机器
@@ -1808,9 +1836,25 @@ function paintClientBin(c, checked){
   // 接了官方源就得给一条等号的原路退回，不能只写在 README 里让人自己找文件
   const undo = $('#cliOvpnRepoOff');
   if(undo) undo.hidden = !(checked && c.openvpn_repo_wired);
+  // 源码编译这条路：判据全在后端（deb 家族 + 确实落后 + apt 和官方源都够不到那个号
+  // + 那个号还没编好），前端只看 openvpn_can_build，不在这里重比版本号。
+  const build = $('#cliOvpnBuild');
+  if(build && checked && c.openvpn_can_build && c.openvpn_build_ver){
+    $('#cliOvpnBuildVer').textContent = c.openvpn_build_ver;
+    build.hidden = false;
+  }
+  // 撤销源码版不给 checked 门槛：只要当前在用就该随时退得掉，
+  // 哪怕用户没点过「检查更新」（后端还会再核一遍前缀在不在自己目录下面）
+  const srcOff = $('#cliOvpnSrcOff');
+  if(srcOff) srcOff.hidden = !c.openvpn_source_active;
+  // 正在用编出来的那份时，把系统包那个号也摆出来，不然两个号只有一个看得见
+  const srcNote = c.openvpn_source_active && c.openvpn_apt
+    ? '隧道在跑的是自己编译的 ' + c.openvpn + '（' + c.openvpn_source_bin + '），系统包里是 '
+      + c.openvpn_apt + '，没被覆盖。'
+    : '';
   // 这行只在有话非说不可时装满：认不出家族、没有包管理器、索引没刷动，
   // 或者官方已经 2.7.9 而 apt 最高只给到 2.6.x——后者不说就成了"明明有新版却说没有"
-  clientNote(checked ? (c.openvpn_reason || c.openvpn_note) : '');
+  clientNote(checked ? [c.openvpn_reason, c.openvpn_note, srcNote].filter(Boolean).join('\n') : '');
   if(c.check_error) toast('问最新版失败: ' + c.check_error, 'bad');
 }
 
@@ -1903,7 +1947,56 @@ $('#cliOvpnRepoOff').onclick = async e => {
   loadClientBin();
 };
 
-// 端口/监听地址变了要提示用户之后从新地址进；密码/路径可原地生效
+// 自己编译 openvpn：apt 和官方源都给不到官方最新时才出现这颗按钮。
+// 确认框里摊开的是后端算好的完整步骤（下载哪个包、怎么验签、apt 装什么、
+// configure 参数、装去哪个目录），因为它要在机器上装编译器、往 /usr/local 写东西。
+$('#cliOvpnBuild').onclick = async e => {
+  const d = binState || {};
+  const ver = d.openvpn_build_ver || '';
+  const dir = d.openvpn_build_path || '/usr/local/fanout-openvpn/' + ver;
+  const cmd = d.openvpn_build_cmd || '（没读到步骤，请先「检查更新」）';
+  if(!confirm('从 OpenVPN 官方源码包编一份 ' + ver + '？\n\n' + cmd +
+      '\n\n三件事先说清：\n'
+      + '· 会 apt 装编译器（build-essential 那一套），编完不卸；\n'
+      + '· 编出来的只放进 ' + dir + '，系统那份 openvpn 一个字不改；\n'
+      + '· 自己编的没人跟安全更新，官方再出新版时这颗按钮会再出现。\n'
+      + '\n全程十几分钟到几十分钟，中间可以关掉页面，进度会留在这里。')) return;
+  const b = e.currentTarget;
+  const label = b.innerHTML;
+  b.disabled = true;
+  try{
+    const r = await api('/api/client/openvpn/build', {method:'POST'});
+    toast(r.message || '已开始编译', 'ok');
+    clientNote('已开始后台编译，进度在这张卡下面。');
+    paintBuildJob();
+  }catch(err){
+    toast(err.message, 'bad');
+    clientNote('没能开始：' + err.message);
+  }
+  b.innerHTML = label;
+  loadClientBin();
+};
+
+// 撤销源码版：删掉那棵树和记录，隧道回到系统包里那份。已装的系统包不受影响。
+$('#cliOvpnSrcOff').onclick = async e => {
+  const d = binState || {};
+  if(!confirm('删掉自己编译的 openvpn ' + (d.openvpn_source_ver || '') + '\n\n删的是 '
+      + (d.openvpn_source_bin || '') + ' 所在的那棵树和 fanout 那条记录，系统包里的 openvpn 不动。\n'
+      + '已在跑的隧道挂在旧进程上，新建出口、换节点或重启服务之后才用系统那份。')) return;
+  const b = e.currentTarget;
+  const label = b.innerHTML;
+  b.disabled = true;
+  try{
+    const r = await api('/api/client/openvpn/source?off=1', {method:'POST'});
+    toast(r.message || '已撤销', 'ok');
+    clientNote(r.message || '已撤销');
+  }catch(err){
+    toast(err.message, 'bad');
+    clientNote('撤销失败：' + err.message);
+  }
+  b.innerHTML = label;
+  loadClientBin();
+};
 function nextURL(port, listen, path){
   const host = (listen && listen !== '0.0.0.0') ? listen : location.hostname;
   return location.protocol + '//' + host + ':' + port + (path ? '/' + path : '') + '/';

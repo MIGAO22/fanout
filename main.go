@@ -199,6 +199,8 @@ func main() {
 	mux.HandleFunc("/api/client/xray/apply", apiClientXrayApply)
 	mux.HandleFunc("/api/client/openvpn/apply", apiClientOpenVPNApply)
 	mux.HandleFunc("/api/client/openvpn/repo", apiClientOpenVPNRepo)
+	mux.HandleFunc("/api/client/openvpn/build", apiClientOpenVPNBuild(mgr))
+	mux.HandleFunc("/api/client/openvpn/source", apiClientOpenVPNSource)
 
 	log.Printf("管理界面: http://<本机IP>%s%s/", webCfg.listenAddrString(), currentBasePath())
 	log.Printf("SOCKS5 端口在 %d-%d 之间随机分配", randPortMin, randPortMax)
@@ -529,6 +531,46 @@ func apiClientOpenVPNRepo(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true,
 		"message": "已删掉 fanout 写的官方源和签名钥匙，包索引也刷过一遍；已在跑的隧道不受影响"})
+}
+
+// apiClientOpenVPNBuild 从 OpenVPN 官方源码包编一份。走作业而不是同步等：
+// 完整跑一遍是十几分钟到几十分钟，同步返回迟早撞上代理和浏览器的耐心，
+// 而且中途断了用户看不到是哪一步没成。
+//
+// 能不能编的判据在 startOpenVPNSourceBuild 里重算一遍，不信前端传来的状态。
+func apiClientOpenVPNBuild(m *Manager) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "用 POST"})
+			return
+		}
+		job, err := startOpenVPNSourceBuild(&m.jobs)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "job": job.ID(),
+			"message": "已在后台开始编译，进度在这张卡和出口页的作业卡片里"})
+	}
+}
+
+// apiClientOpenVPNSource 撤销源码版。和接官方源那条一个道理：往机器上写了东西，
+// 就得在这儿留下等号的退路，而不是只写在 README 里让人自己找目录。
+func apiClientOpenVPNSource(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "用 POST"})
+		return
+	}
+	if r.URL.Query().Get("off") != "1" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "编译由「自己编译 openvpn」发起，这个接口只负责撤销"})
+		return
+	}
+	msg, err := removeOpenVPNSourceBuild()
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "message": msg})
 }
 
 // apiExits 返回主界面需要的一切：出口以及挂在它上面的入站。

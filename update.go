@@ -43,6 +43,9 @@ type releaseInfo struct {
 	Assets  []struct {
 		Name string `json:"name"`
 		URL  string `json:"browser_download_url"`
+		// Digest 是 GitHub 在上传资产时自己算的摘要，形如 "sha256:<64hex>"。
+		// 源码编译那条路拿它当场核对下载到的 tarball，等于让 GitHub 做一次传输完整性背书。
+		Digest string `json:"digest"`
 	} `json:"assets"`
 }
 

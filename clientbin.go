@@ -110,7 +110,7 @@ type ClientBinStatus struct {
 	Backend   string `json:"backend"`    // 当前节点后端：native / 3x-ui / xray-cf-lite
 	Path      string `json:"path"`       // 正在用的 xray 可执行文件
 	Xray      string `json:"current"`    // 本机 xray 版本，读不到为空
-	OpenVPN   string `json:"openvpn"`    // 系统 openvpn 版本
+	OpenVPN   string `json:"openvpn"`    // **正在用的那份** openvpn 版本（可能是 fanout 编的）
 	Latest    string `json:"latest"`     // Xray-core 最新版（只有点了检查才有）
 	HasUpdate bool   `json:"has_update"` // Latest 比 Xray 新
 	Updatable bool   `json:"updatable"`  // 这份 xray 归 fanout 管、可以就地替换
@@ -143,6 +143,22 @@ type ClientBinStatus struct {
 	OvpnWired    bool   `json:"openvpn_repo_wired,omitempty"` // 官方源已经在这台机器上配着
 	// 还没配、而升级又必须配时，将要写进 sources.list.d 的那一行；确认框原样摊开给人看
 	OvpnRepoLine string `json:"openvpn_repo_line,omitempty"`
+
+	// 源码编译这条路：apt 和官方源都够不到官方最新时才给。
+	// can_build 的判据全在这边算，前端只按布尔显示按钮——按钮藏不住不该按的情况。
+	OvpnCanBuild bool `json:"openvpn_can_build,omitempty"`
+	// build_ver 是要编的那个号（= 官方 release），build_cmd 是准备在你机器上跑的命令，
+	// 确认框原样摊开，和「升级 openvpn」那颗按钮一个规矩。build_path 是它会装进去的
+	// 独立目录，由后端给——前端不该自己猜路径，否则哪天改了常量就成了界面在骗人。
+	OvpnBuildVer  string `json:"openvpn_build_ver,omitempty"`
+	OvpnBuildCmd  string `json:"openvpn_build_cmd,omitempty"`
+	OvpnBuildPath string `json:"openvpn_build_path,omitempty"`
+	// src_active 表示隧道当前 exec 的是 fanout 编的那份；aptVer 是系统包那份的号，
+	// 两者不一样时必须都写出来，否则用户看到"2.7.9"会以为 apt 升到 2.7.9 了。
+	OvpnSrcActive bool   `json:"openvpn_source_active,omitempty"`
+	OvpnSrcVer    string `json:"openvpn_source_ver,omitempty"`
+	OvpnSrcBin    string `json:"openvpn_source_bin,omitempty"`
+	OvpnApt       string `json:"openvpn_apt,omitempty"`
 }
 
 // xrayAssetForArch 把 GOARCH 换成 Xray-core release 的资产名。
@@ -237,7 +253,19 @@ func clientBinStatus(askLatest bool) *ClientBinStatus {
 		st.Reason = err.Error()
 	}
 	var osRel string
-	st.OpenVPN = parseOpenVPNVersion(probeVersion("openvpn", "--version"))
+	// 探测的是**隧道真正会 exec 的那一份**（openvpnBinary），不是 PATH 上那份。
+	// 这里的版本会喂给 dataCipherArgs 决定参数名，和实际跑的二进制必须同源。
+	active := openvpnBinary()
+	st.OpenVPN = parseOpenVPNVersion(probeVersion(active, "--version"))
+	if r := readOpenvpnSrcRecord(); r != nil && isExecutableFile(r.Bin) {
+		st.OvpnSrcVer, st.OvpnSrcBin = r.Version, r.Bin
+		st.OvpnSrcActive = active == r.Bin
+		if st.OvpnSrcActive {
+			// 用的是编出来的那份，系统包那份是另一个号——两个都得写出来，
+			// 否则卡片上那个号会让人以为 apt 升到 2.7.9 了。
+			st.OvpnApt = parseOpenVPNVersion(probeVersion("openvpn", "--version"))
+		}
+	}
 	if st.OpenVPN == "" {
 		st.OvpnWhy = "本机没有 openvpn，出口隧道起不来；先装一个（apt/apk install openvpn）"
 	} else if blob, err := os.ReadFile(osReleasePath); err != nil {
@@ -301,6 +329,23 @@ func clientBinStatus(askLatest bool) *ClientBinStatus {
 		st.OvpnUpstream = ov
 		st.OvpnBehind = versionLess(st.OpenVPN, ov)
 		st.OvpnNote = ovpnGapNote(st.OvpnFamily, st.OpenVPN, st.OvpnTarget, ov)
+		// 只有"正在用的那份就是编出来的那份"才算编好；记录在但文件被删了得能重新编回来
+		builtVer := ""
+		if st.OvpnSrcActive {
+			builtVer = st.OvpnSrcVer
+		}
+		// 源码编译这条路：判据全在 openvpnCanBuildSource（含"只给 deb"，
+		// 和 ovpnSrcDeps 的家族口径必须一致，否则按钮点下去第一步就红）。
+		if openvpnCanBuildSource(st.OvpnFamily, st.OpenVPN, st.OvpnTarget, ov, builtVer) {
+			st.OvpnBuildVer = ov
+			if plan := openvpnSrcPlan(ov, st.OvpnFamily); plan != "" {
+				st.OvpnCanBuild, st.OvpnBuildCmd = true, plan
+				st.OvpnBuildPath = ovpnSrcPrefix(ov)
+				if st.OvpnNote != "" {
+					st.OvpnNote += "；可以从官方源码包编一份（装进独立目录，不动系统那份）"
+				}
+			}
+		}
 	}
 	return st
 }
@@ -1257,6 +1302,13 @@ func applyOpenVPNUpdate() (string, error) {
 	if before == "" {
 		return "", fmt.Errorf("本机没有可用的 openvpn，先在系统里装一个（apt/apk install openvpn）再回来点这个按钮")
 	}
+	// 有 fanout 编的那份在用时，升级系统包并不会改变隧道用的二进制——
+	// 不写这句，用户会以为按下去之后出口就跑在 2.7 上了。
+	shadow := ""
+	if r := readOpenvpnSrcRecord(); r != nil && isExecutableFile(r.Bin) && openvpnBinary() == r.Bin {
+		shadow = fmt.Sprintf("（隧道当前用的是 fanout 编的 %s，在 %s；这次只动系统包，换完仍不会用它。"+
+			"要让它回到系统那份，点「撤销源码版」。）", r.Version, r.Bin)
+	}
 	blob, err := os.ReadFile(osReleasePath)
 	if err != nil {
 		return "", fmt.Errorf("读 %s 失败: %w", osReleasePath, err)
@@ -1282,13 +1334,22 @@ func applyOpenVPNUpdate() (string, error) {
 	case after == "":
 		return "", fmt.Errorf("升级后 openvpn 跑不起来了（升级前是 %s），请检查包管理器的输出", before)
 	case after == before:
-		return fmt.Sprintf("openvpn 已是本机装得到的最新版 %s，没有变化%s。已在跑的隧道本来就用着它，不用管。", before, wired), nil
+		return fmt.Sprintf("系统包里的 openvpn 已是本机装得到的最新版 %s，没有变化%s。%s",
+			before, wired, orFallback(shadow, "已在跑的隧道本来就用着它，不用管。")), nil
 	case d.Target != "" && versionLess(after, d.Target):
 		// 包管理器升了一截却没到问到的那个号（依赖不满足、索引还没生效都可能），
 		// 这时候说"已升到目标版本"就是假话，按失败报出来并把当前版本写清
-		return "", fmt.Errorf("openvpn 只升到 %s（升级前 %s，预期 %s），包管理器的输出里有原因", after, before, d.Target)
+		return "", fmt.Errorf("openvpn 只升到 %s（升级前 %s，预期 %s），包管理器的输出里有原因%s", after, before, d.Target, shadow)
 	default:
-		return fmt.Sprintf("openvpn 已从 %s 升到 %s%s。已在跑的隧道仍挂在旧进程上（进程不会被包管理器动到），"+
-			"新建出口、换节点或重启服务之后自然切到新版。", before, after, wired), nil
+		return fmt.Sprintf("openvpn 已从 %s 升到 %s%s。%s已在跑的隧道仍挂在旧进程上（进程不会被包管理器动到），"+
+			"新建出口、换节点或重启服务之后自然切到新版。", before, after, wired, shadow), nil
 	}
+}
+
+// orFallback 让"没有别的话要说"时补一句默认文案，避免出现两个空格加空括号。
+func orFallback(s, def string) string {
+	if s != "" {
+		return s
+	}
+	return def
 }
