@@ -251,12 +251,9 @@ EOF
 
 show_links() {
   echo
-  echo -e "  交流群  ${B}https://t.me/+ft-zI76oovgwNmRh${N}"
-  echo -e "  油管    ${B}https://youtube.com/@joeyblog${N}"
-  echo -e "  博客    ${B}https://joeyblog.net${N}"
-  echo -e "  项目    ${B}https://github.com/byJoey/fanout${N}"
+  echo -e "  项目    ${B}https://github.com/MIGAO22/fanout${N}"
   echo
-  echo -e "  ${D}用着有问题、或者想要什么功能，去群里说或提 issue。${N}"
+  echo -e "  ${D}用着有问题、或者想要什么功能，去仓库提 issue。${N}"
 }
 
 # 老版本把 -web 写死在服务文件里，和 settings.json 互相拽回旧值。

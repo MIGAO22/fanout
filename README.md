@@ -113,7 +113,7 @@ Xray 到 `/var/lib/fanout/bin/`，装了则跳过，入站交给面板管。
 > 才生效：`f` → `3) 重启`（或 `f restart`）。`install.sh` 现在重装会显式
 > `systemctl restart`——以前用 `enable --now`，对已运行的单元是空操作，
 > 于是新二进制在磁盘上、老进程还在服务老界面。
-> 想确认手上是哪一份：`fanout -version`，本仓库显示 `v1.5.0`，上游原版是 `v1.3.1`。
+> 想确认手上是哪一份：`fanout -version`，本仓库显示 `v1.5.1`，上游原版是 `v1.3.1`。
 
 > **发新版本。** 推一个 `v*` tag 就会触发 release workflow 出 amd64 / arm64
 > 两个包和 checksums；不打 tag 就没有 Release，`releases/latest/download/...`
@@ -294,7 +294,7 @@ REALITY 的密钥对和 shortId 自动生成；TLS 不填证书就生成自签�
 
 ```
   状态      运行中
-  版本      fanout v1.5.0
+  版本      fanout v1.5.1
   开机自启  enabled
 
   管理地址  http://1.2.3.4:8899/gwPuWHvaNr/
@@ -322,7 +322,7 @@ f uninstall  # 卸载（服务、二进制、netns 和 /var/lib/fanout 全删）
 > **界面还是旧的？** 十有八九是老进程还在跑。二进制是单文件、界面用 `go:embed`
 > 打在里面的，所以换二进制必须重启服务才生效：`f` → `3) 重启`。
 > `install.sh` 现在重装会显式 `systemctl restart`，不再出现「装完没变化」。
-> 分清手上是哪一份：`fanout -version`，本仓库构建的显示 `v1.5.0` 及以上，
+> 分清手上是哪一份：`fanout -version`，本仓库构建的显示 `v1.5.1` 及以上，
 > 上游原版显示 `v1.3.1`。
 
 隧道状态存在 `/var/lib/fanout/state.json`，重启后自动恢复，端口保持不变。
@@ -361,7 +361,9 @@ go test ./...
 - VPN Gate 是志愿者节点，有相当比例已下线或满员（`AUTH_FAILED`）。
   连不上会自动顺着同地区候选往下试，默认最多 6 个。
 - 管理界面只有随机路径 + 口令登录，没有 HTTPS。放公网建议前面套一层反代。
-  订阅地址同理，token 是明文走的。
+  订阅地址同理，token 是明文走的。会话 12 小时自动过期，侧栏底部有「退出登录」，
+  它会把本机 token 从会话表里收回——只在浏览器里清 cookie 是不够的，
+  被抄走的 token 原本到过期前都还能进门。
 - 换节点会避开这条出口之前用过的节点（最多记 16 个），同地区都换过一轮后
   从头开始。一个地区只有一个可用节点时换不动，界面会直接说明原因。
 - 出口组的并发策略只对 TCP 生效。UDP ASSOCIATE 那一路「拨号」是在成员里建转发通道，

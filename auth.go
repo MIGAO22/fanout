@@ -165,6 +165,13 @@ func (a *Auth) Wrap(next http.Handler) http.Handler {
 			a.handleLogin(w, r)
 			return
 		}
+		// 退出要在鉴权之前拦：拿一个已经失效的 cookie 也要能把浏览器请回去，
+		// 放在鉴权分支后面就变成"点退出→判定未登录→又发一次登录页"，
+		// cookie 还留在浏览器里。
+		if r.URL.Path == "/logout" {
+			a.handleLogout(w, r)
+			return
+		}
 		// 订阅得让客户端直接拉，带不了登录态，所以这条路放行。
 		// 它不是无门槛：handleSub 自己校验一串独立口令，且仍在访问路径之后。
 		if r.URL.Path == "/sub" {
@@ -263,4 +270,39 @@ func (a *Auth) handleLogin(w http.ResponseWriter, r *http.Request) {
 		MaxAge:   int(sessionTTL.Seconds()),
 	})
 	writeJSON(w, http.StatusOK, map[string]string{"ok": "已登录"})
+}
+
+// handleLogout 收回这个浏览器手上的会话并回登录页。
+//
+// 只清 cookie 是不够的：会话表里那条 token 到 TTL 之前仍然有效，
+// 而 token 是会被人从代理日志、共享浏览器里抄走的——所以两边都作废。
+func (a *Auth) handleLogout(w http.ResponseWriter, r *http.Request) {
+	if c, err := r.Cookie(sessionCookie); err == nil {
+		a.revoke(c.Value)
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name:     sessionCookie,
+		Value:    "",
+		Path:     "/",
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+		MaxAge:   -1,
+		Expires:  time.Unix(0, 0),
+	})
+	// 界面里那条调用走 XHR，回 JSON 就行；直接敲地址栏进来的要跳回登录页。
+	if r.Method == http.MethodPost {
+		writeJSON(w, http.StatusOK, map[string]string{"ok": "已退出"})
+		return
+	}
+	http.Redirect(w, r, currentBasePath()+"/login", http.StatusSeeOther)
+}
+
+// revoke 让一个 token 立刻失效。
+func (a *Auth) revoke(tok string) {
+	if tok == "" {
+		return
+	}
+	a.mu.Lock()
+	delete(a.sessions, tok)
+	a.mu.Unlock()
 }

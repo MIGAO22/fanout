@@ -173,6 +173,17 @@ function applyTheme(t){
 $('#themeBtn').onclick = () =>
   applyTheme(document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark');
 
+// 退出要问一句：后台还在跑健康检查和自动补齐，点了就断掉正在做的事。
+// 服务端 POST 那条分支只回 JSON，所以跳登录页由这里做。
+$('#logoutBtn').onclick = async () => {
+  if(!confirm('退出登录？出口和节点链接都在服务端继续跑，只是关掉这个管理页面。')) return;
+  // 轮询先停：退出之后每个 tick 都会撞上 401，那会让 api() 把页面整页重载回登录壳，
+  // 在跳转途中多闪一次不说，还可能把退出请求本身打断。
+  clearTimeout(pollTimer);
+  try{ await api('logout', { method: 'POST' }); }catch(e){ /* 会话本来就没了也算退出成功 */ }
+  location.href = 'login';
+};
+
 /* ───────────── 视图切换 ───────────── */
 
 const VIEWS = {
