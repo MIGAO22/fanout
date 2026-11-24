@@ -103,6 +103,14 @@
 `tun-mtu`（写死 1500 时，1450/1400 的链路上所有节点都会以超时收场）；
 以及把「连不上」拆成能行动的原因——WARP 那一跳不通时，不再让 18 条出口逐条去撞同一堵墙。
 
+**v2.0.9 才是让开关真能用起来的那一刀。** 建 WireGuard 设备的命令原先写成
+`ip link add dev fow2 type wireguard mtu 1420`，而 iproute2 把 `type` 之后的全部尾巴交给
+那个类型自己的解析器，wireguard 只认 `private-key` / `peer` 那几个，于是回
+`Garbage instead of arguments "mtu ..."` ——从 v2.0.6 起每条出口都在架设备这一步死掉，
+注册却成功、依赖也装好了，症状正好是「所有节点都连不上」。`mtu` 挪到 `type` 之前，
+并把「通用选项不许排在 `type` 之后」钉进测试：原先那条断言是照着错的写法写的，
+所以测试全绿而功能全红。
+
 这一层是拿内核的 WireGuard 直接架在每条出口的 netns 里的，不装也不跑官方 `warp-cli`：
 fanout 只要那 32 字节密钥和一条策略路由，多养一个 daemon 只会多一个会掉线的环节。
 
@@ -159,7 +167,7 @@ Xray 到 `/var/lib/fanout/bin/`，装了则跳过，入站交给面板管。
 > 才生效：`f` → `3) 重启`（或 `f restart`）。`install.sh` 现在重装会显式
 > `systemctl restart`——以前用 `enable --now`，对已运行的单元是空操作，
 > 于是新二进制在磁盘上、老进程还在服务老界面。
-> 想确认手上是哪一份：`fanout -version`，本仓库显示 `v2.0.8`，上游原版是 `v1.3.1`。
+> 想确认手上是哪一份：`fanout -version`，本仓库显示 `v2.0.9`，上游原版是 `v1.3.1`。
 
 > **发新版本。** 推一个 `v*` tag 就会触发 release workflow 出 amd64 / arm64
 > 两个包和 checksums；不打 tag 就没有 Release，`releases/latest/download/...`
@@ -631,7 +639,7 @@ REALITY 的密钥对和 shortId 自动生成；TLS 不填证书就生成自签�
 
 ```
   状态      运行中
-  版本      fanout v2.0.8
+  版本      fanout v2.0.9
   开机自启  enabled
 
   管理地址  http://1.2.3.4:8899/gwPuWHvaNr/

@@ -469,7 +469,12 @@ func warpSetupCmds(in warpSetupInput) [][]string {
 		cmds = append(cmds, []string{"ip", "route", "add", ip + "/32", "via", in.VethGw, "dev", in.Veth})
 	}
 	cmds = append(cmds,
-		[]string{"ip", "link", "add", "dev", in.Dev, "type", "wireguard", "mtu", strconv.Itoa(in.MTU)},
+		// mtu 必须排在 type 之前：`ip link add` 的通用选项（mtu/address/…）由
+		// 前面的解析器吃，`type` 之后的尾巴全交给那个类型自己的解析器，而
+		// wireguard 只认 private-key/peer 那几个。写成 `type wireguard mtu 1420`
+		// 会被判成 "Garbage instead of arguments \"mtu ...\""，于是每台机器的
+		// 每一条出口都在架设备这一步死掉——注册成功、包也装好了，症状却是"连不上节点"。
+		[]string{"ip", "link", "add", "dev", in.Dev, "mtu", strconv.Itoa(in.MTU), "type", "wireguard"},
 		[]string{"ip", "addr", "add", in.TunIP + "/32", "dev", in.Dev},
 		[]string{"wg", "set", in.Dev,
 			"private-key", in.KeyFile,

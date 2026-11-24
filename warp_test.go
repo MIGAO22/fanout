@@ -229,7 +229,13 @@ func TestWarpSetupCommandsOrder(t *testing.T) {
 		t.Errorf("最后一条 = %q，必须是把默认路由换成 WARP 设备", last)
 	}
 	// 中间几条按顺序：建设备 → 配地址 → 设密钥 → 启用
-	if got := strings.Join(cmds[2], " "); !strings.Contains(got, "type wireguard mtu 1420") {
+	//
+	// mtu 必须排在 type 之前：iproute2 把 `type` 之后的全部尾巴交给那个类型自己的
+	// 解析器，而 wireguard 只认 private-key / peer 那几个。写成
+	// `type wireguard mtu 1420` 会得到 "Garbage instead of arguments \"mtu ...\""，
+	// 于是每台机器、每一条出口都在架设备那一步死掉——注册成功、包也装好了，
+	// 症状却是"连不上节点"。这条断言当初正是照着错的写法钉的，所以测试全绿而功能全红。
+	if got := strings.Join(cmds[2], " "); got != "ip link add dev fow12 mtu 1420 type wireguard" {
 		t.Errorf("第三条不是建 WireGuard 设备：%s", got)
 	}
 	if got := strings.Join(cmds[3], " "); !strings.Contains(got, "172.16.0.2/32 dev fow12") {
@@ -251,6 +257,45 @@ func TestWarpSetupCommandsOrder(t *testing.T) {
 		if !strings.Contains(strings.Join(c, " "), "route add") {
 			t.Errorf("第 %d 条之前不该动设备：%v", i+1, c)
 		}
+	}
+}
+
+// 上面那条只钉住建设备这一句。这里钉整条规则：凡是 `ip … type <kind>` 的命令，
+// 通用选项都不许排到 type 之后。iproute2 的报错是"Garbage instead of arguments"，
+// 而它发生在 netns 里、由 fanout 转述——上一次就是靠这句话才定位到，别再犯第二次。
+func TestGenericOptionsNeverFollowType(t *testing.T) {
+	in := warpSetupInput{
+		Dev: "fow3", KeyFile: "k", PeerKey: warpPeerPub,
+		Endpoint: "162.159.192.6", Port: 2408, TunIP: "172.16.0.2", MTU: 1390,
+		VethGw: "10.99.3.1", Veth: "fop3", DirectIPs: []string{"8.8.8.8"},
+	}
+	cmds := append(warpSetupCmds(in), warpSplitCmds("fow3", "tun0", []string{"61.215.116.134"})...)
+	generic := map[string]bool{"mtu": true, "address": true, "name": true,
+		"numtxqueues": true, "numrxqueues": true, "txqueuelen": true}
+	n := 0
+	for _, c := range cmds {
+		joined := strings.Join(c, " ")
+		if c[0] != "ip" || !strings.Contains(joined, " type ") {
+			continue
+		}
+		n++
+		for i, tok := range c {
+			if tok != "type" {
+				continue
+			}
+			for _, after := range c[i+2:] {
+				if generic[after] {
+					t.Errorf("通用选项 %q 排到了 type 之后：%v", after, joined)
+				}
+			}
+		}
+	}
+	if n != 1 {
+		t.Errorf("带 type 的命令数 = %d，这套链路里只该有一条（建 WireGuard 设备）", n)
+	}
+	// MTU 的值要真的跟着母机网卡缩下来，不能只改顺序不改数
+	if got := strings.Join(cmds[2], " "); !strings.Contains(got, "mtu 1390 type wireguard") {
+		t.Errorf("建设备那条没带上算出来的 MTU：%s", got)
 	}
 }
 
