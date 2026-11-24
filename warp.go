@@ -519,6 +519,34 @@ func wireguardErrorHint(raw string) string {
 	return ""
 }
 
+// warpArgv 把一条架桥命令换成 exec 需要的 (程序, 参数)。
+//
+// 每条命令自己就带着程序名（`ip link add …`、`wg set …`），所以在母机上要照原样跑；
+// 只有进出口 netns 时才多一层前缀 `ip netns exec <ns> <整条>`。
+// v2.0.10 的自检在母机上又套了一次 ip，于是执行的是 `ip ip link add …`，
+// iproute2 把第二个 ip 当成对象名，回 `Object "ip" is unknown, try "ip help".`——
+// 自检自己先失败并把开关退回，所有出口反而一条都没试。
+func warpArgv(ns string, c []string) (string, []string) {
+	if ns == "" {
+		return c[0], c[1:]
+	}
+	return "ip", append([]string{"netns", "exec", ns}, c...)
+}
+
+// warpCmdTag 是报错开头那句"哪一步"：只留前三个参数。
+// 密钥、接入点、私钥文件路径都不进报错，否则命令回显会把内核那句挤到截断之外。
+func warpCmdTag(ns string, c []string) string {
+	head := c
+	if len(head) > 3 {
+		head = head[:3]
+	}
+	tag := strings.Join(head, " ")
+	if ns != "" {
+		tag = ns + "：" + tag
+	}
+	return tag
+}
+
 // warpProbeDev 是自检用的设备名：不碰路由、不碰 DNS，只问内核和 wg
 // "这套参数你到底接不接受"。名字短且固定，方便在母机上认出残骸。
 const warpProbeDev = "foarpprobe"

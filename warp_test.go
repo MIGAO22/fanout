@@ -357,6 +357,49 @@ func TestWarpProbeCommandsTouchNothingButTheDevice(t *testing.T) {
 	}
 }
 
+// 每条架桥命令自己就带着程序名，母机上照原样跑、netns 里才加 `ip netns exec` 前缀。
+// v2.0.10 的自检在母机上又套了一次 ip，执行成 `ip ip link add …`，
+// 内核回 Object "ip" is unknown——自检自己先失败，反而一条出口都没试过。
+func TestWarpArgvNeverDoublesTheProgram(t *testing.T) {
+	linkCmd := []string{"ip", "link", "add", "dev", warpProbeDev, "mtu", "1420", "type", "wireguard"}
+	wgCmd := []string{"wg", "set", warpProbeDev, "private-key", "/var/lib/fanout/fow1.wgkey"}
+
+	name, argv := warpArgv("", linkCmd)
+	if got := strings.Join(append([]string{name}, argv...), " "); got != strings.Join(linkCmd, " ") {
+		t.Errorf("母机上该原样跑：%s", got)
+	}
+	name, argv = warpArgv("", wgCmd)
+	if got := strings.Join(append([]string{name}, argv...), " "); got != strings.Join(wgCmd, " ") {
+		t.Errorf("母机上 wg 不该被包进 ip：%s", got)
+	}
+	name, argv = warpArgv("fo1", linkCmd)
+	want := "ip netns exec fo1 " + strings.Join(linkCmd, " ")
+	if got := strings.Join(append([]string{name}, argv...), " "); got != want {
+		t.Errorf("netns 里 = %q，期望 %q", got, want)
+	}
+
+	// 通用规则：拼出来的整条命令不许出现 `ip ip` 或 `wg wg`
+	for _, ns := range []string{"", "fo1"} {
+		for _, c := range [][]string{linkCmd, wgCmd} {
+			n, a := warpArgv(ns, c)
+			full := strings.Join(append([]string{n}, a...), " ") + " "
+			for _, bad := range []string{"ip ip ", "wg wg ", "ip netns exec  "} {
+				if strings.Contains(full, bad) {
+					t.Errorf("命令拼重了（%q）：%s", bad, full)
+				}
+			}
+		}
+	}
+
+	// 报错前缀只留前三条参数：密钥和私钥路径不进报错，否则截断会吃掉内核那句
+	if got := warpCmdTag("fo1", append(wgCmd, "peer", "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=")); got != "fo1：wg set foarpprobe" {
+		t.Errorf("tag = %q", got)
+	}
+	if got := warpCmdTag("", linkCmd); got != "ip link add" {
+		t.Errorf("母机上的 tag = %q", got)
+	}
+}
+
 // 界面上出现 "exit status 1" 而看不见原因，是这功能连错三轮的根子。
 // wireguardErrorHint 负责把内核/wg 的原话翻成一个下一步，认不出来时必须闭嘴。
 func TestWireguardErrorHintNamesTheActionableCause(t *testing.T) {

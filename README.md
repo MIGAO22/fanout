@@ -119,6 +119,14 @@
 任何一条出口都还没动就能把内核那句完整报回来并退回开关；这句还会钉在开关那一行下面
 （徽章「上次没开成」），因为作业里的失败几分钟就淡出，而没解决的事不该跟着一起消失。
 
+**v2.0.11：自检第一次跑就把真因带回来了，而那句说的是 fanout 自己。** 界面报
+`建 WireGuard 设备：ip link add: Object "ip" is unknown, try "ip help".`——母机那条路上执行的是
+`ip ip link add …`：每条架桥命令自己就带程序名，`ip netns exec <ns>` 只是出口 netns 那层前缀，
+而 v2.0.10 的自检在母机上把它当成通用前缀又套了一次。netns 里那条路径没受影响，
+所以出口的失败其实另有原因，但自检先失败就把开关退了、一条出口都没试过。
+命令怎么拼现在收进 `warpArgv`／`warpCmdTag` 两个纯函数，并钉住「整条命令不许出现 `ip ip`、`wg wg`」——
+这类"包装层重复"的错误以前只在真机上现形，现在在本机就红。
+
 这一层是拿内核的 WireGuard 直接架在每条出口的 netns 里的，不装也不跑官方 `warp-cli`：
 fanout 只要那 32 字节密钥和一条策略路由，多养一个 daemon 只会多一个会掉线的环节。
 
@@ -175,7 +183,7 @@ Xray 到 `/var/lib/fanout/bin/`，装了则跳过，入站交给面板管。
 > 才生效：`f` → `3) 重启`（或 `f restart`）。`install.sh` 现在重装会显式
 > `systemctl restart`——以前用 `enable --now`，对已运行的单元是空操作，
 > 于是新二进制在磁盘上、老进程还在服务老界面。
-> 想确认手上是哪一份：`fanout -version`，本仓库显示 `v2.0.10`，上游原版是 `v1.3.1`。
+> 想确认手上是哪一份：`fanout -version`，本仓库显示 `v2.0.11`，上游原版是 `v1.3.1`。
 
 > **发新版本。** 推一个 `v*` tag 就会触发 release workflow 出 amd64 / arm64
 > 两个包和 checksums；不打 tag 就没有 Release，`releases/latest/download/...`
@@ -650,7 +658,7 @@ REALITY 的密钥对和 shortId 自动生成；TLS 不填证书就生成自签�
 
 ```
   状态      运行中
-  版本      fanout v2.0.10
+  版本      fanout v2.0.11
   开机自启  enabled
 
   管理地址  http://1.2.3.4:8899/gwPuWHvaNr/

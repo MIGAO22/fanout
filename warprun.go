@@ -475,11 +475,8 @@ func warpEnsureTools(budget time.Duration) error {
 // 这里只回显程序名加前三个参数（够认出是哪一步、哪台设备），stderr 放最前，
 // 再按 wireguardErrorHint 补一句下一步。
 func warpRun(ns string, c []string) error {
-	argv := c
-	if ns != "" {
-		argv = append([]string{"netns", "exec", ns}, c...)
-	}
-	out, err := cmdCombined(exec.Command("ip", argv...))
+	name, argv := warpArgv(ns, c)
+	out, err := cmdCombined(exec.Command(name, argv...))
 	if err == nil {
 		return nil
 	}
@@ -503,15 +500,7 @@ func warpRun(ns string, c []string) error {
 			why += " —— " + hint
 		}
 	}
-	head := c
-	if len(head) > 3 {
-		head = head[:3] // 够认出是哪一步（ip link add / wg set fow1），后面的密钥不参与
-	}
-	tag := strings.Join(head, " ")
-	if ns != "" {
-		tag = ns + "：" + tag
-	}
-	return fmt.Errorf("%s: %s", tag, oneLine(why, 200))
+	return fmt.Errorf("%s: %s", warpCmdTag(ns, c), oneLine(why, 200))
 }
 
 // warpSelfTest 拿一条真实注册记录在母机上把 WARP 设备架一遍，然后立刻拆掉。
