@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
@@ -396,7 +397,9 @@ func (t *Tunnel) startOpenVPN(dir string, acc *WarpAccount) error {
 
 	on := acc != nil
 	budget := warpBudget(time.Duration(connConf().ConnectBudget)*time.Second, on)
-	_, _, mssfix := warpPathMTU(on)
+	// 三层 MTU 一次读出来一起用：外层是 WireGuard，再外面是母机那块真网卡，
+	// 按它而不是按 1500 算（见 warpPathMTU）。
+	_, tunMTU, mssfix := warpMTUs(on)
 
 	logPath := filepath.Join(dir, ns+".log")
 	args := []string{
@@ -407,12 +410,16 @@ func (t *Tunnel) startOpenVPN(dir string, acc *WarpAccount) error {
 		"--verb", "3",
 		"--log", logPath,
 	}
-	args = append(args, warpOpenVPNArgs(on)...)
-	// ovpnBinary 和上面那个版本探测必须同一个入口：喂给 dataCipherArgs 的参数名
-	// 是按版本挑的（2.4 叫 --ncp-ciphers，2.5+ 叫 --data-ciphers），
+	args = append(args, warpOpenVPNArgs(on, tunMTU)...)
+	// ovpnBinary 和版本探测必须同一个入口：喂给 openvpn 的参数名是按版本挑的
+	// （2.4 叫 --ncp-ciphers、2.5+ 叫 --data-ciphers，--pull filter 也是 2.4 才有），
 	// 一旦"探的是系统那份、跑的是编出来的那份"，openvpn 会当场 Unrecognized option 退出。
 	ovpnBin := openvpnBinary()
-	args = append(args, dataCipherArgs(parseOpenVPNVersion(probeVersion(ovpnBin, "--version")))...)
+	ovpnVer := parseOpenVPNVersion(probeVersion(ovpnBin, "--version"))
+	args = append(args, dataCipherArgs(ovpnVer)...)
+	// 开着 WARP 时还要挡住服务器推送的 MTU：推送的优先级比命令行高，
+	// 而这三层数字是按外层封装算出来的（见 warpPathMTU）。
+	args = append(args, warpPullFilters(on, ovpnVer)...)
 	args = append(args, ovpnTuning(budget, mssfix)...)
 	cmd := exec.Command("ip", append([]string{"netns", "exec", ns, ovpnBin}, args...)...)
 
@@ -432,9 +439,124 @@ func (t *Tunnel) startOpenVPN(dir string, acc *WarpAccount) error {
 
 	waitErr := t.waitTunUp(ns, budget, done)
 	if waitErr != nil {
-		return fmt.Errorf("%v，详见 %s", waitErr, logPath)
+		// 光说"连不上"没有价值：同一句错背后可能是认证被拒、证书过期、
+		// 外层包发大了，也可能只是这个节点今天死了。把日志里那句和 WARP
+		// 那一跳的实况一起带上，界面和作业里才看得见下一步该干什么。
+		var hints []string
+		if h := ovpnLogHint(logPath); h != "" {
+			hints = append(hints, h)
+		}
+		if on {
+			hints = append(hints, warpHopNote(ns, acc))
+		}
+		tail := ""
+		if len(hints) > 0 {
+			tail = "；" + strings.Join(hints, "；")
+		}
+		return fmt.Errorf("%v%s，详见 %s", waitErr, tail, logPath)
 	}
 	return nil
+}
+
+// ovpnOwnFaults 是"我们的链路有问题"那一类：说出这句话时，换多少个节点都没用，
+// 所以它必须优先于节点那类报错。
+//
+// 关键句只写"message too long"而不是整句 "write UDP: …"：openvpn 在不同版本里
+// 打成 "write UDPv4: Message too long [nonblocking:1]"、"sendto …: Message too long"，
+// 前缀一变就漏检，而那正是我们要认的那一种。
+var ovpnOwnFaults = []struct{ needle, why string }{
+	{"message too long", "外层包超过链路 MTU"},
+	{"emsgsize", "外层包超过链路 MTU"},
+	{"options error", "参数没被接受"},
+	{"unrecognized option", "参数没被接受"},
+}
+
+// ovpnNodeFaults 是"这个节点不行"那一类：程序本来就会顺着候选换下一个，
+// 说清是哪一种只是为了让人知道为什么还在转。
+// 顺序即同一行里的优先级：证书过期比"校验不过"更能指明下一步。
+var ovpnNodeFaults = []struct{ needle, why string }{
+	{"certificate has expired", "节点证书过期"},
+	{"verify error", "节点证书校验不过"},
+	{"auth_failed", "节点拒绝了用户名/密码"},
+	{"authentication failed", "节点拒绝了用户名/密码"},
+	{"tls_error", "TLS 握手没走完"},
+	{"tls handshake failed", "TLS 握手没走完"},
+	{"cannot resolve host address", "节点域名解析不出来"},
+	{"network is unreachable", "母机到节点没有路由"},
+	{"no route to host", "母机到节点没有路由"},
+	{"connection reset", "节点掐了连接"},
+	{"connection timed out", "节点的端口没应答"},
+	{"peer connection initiated", "节点已应答，卡在后面的步骤"},
+}
+
+// whyHere 按表里的顺序找第一条命中的关键句，返回它的说法。
+// 顺序就是同一行里的优先级——"Message too long" 和 "Connection timed out"
+// 常常同时出现，但只有前者说明是我们把包发大了。
+func whyHere(table []struct{ needle, why string }, lower string) string {
+	for _, p := range table {
+		if strings.Contains(lower, p.needle) {
+			return p.why
+		}
+	}
+	return ""
+}
+
+// ovpnErrorLine 从 openvpn 日志文本里挑最能说明问题的一句。
+//
+// 先给"我们自己的链路有问题"那一类（MTU、参数），因为换节点不会有用；
+// 剩下的取**最后**匹配上的一条：openvpn 一轮里会按顺序试好几个 remote，
+// 前面那些是过程，最后那句才是这一轮的结论。
+func ovpnErrorLine(log string) string {
+	own, node := "", ""
+	for _, line := range strings.Split(log, "\n") {
+		l := strings.ToLower(line)
+		if w := whyHere(ovpnOwnFaults, l); w != "" {
+			own = w + "：" + strings.TrimSpace(line)
+			continue
+		}
+		if w := whyHere(ovpnNodeFaults, l); w != "" {
+			node = w + "：" + strings.TrimSpace(line)
+		}
+	}
+	if own != "" {
+		return oneLine(own, 220)
+	}
+	return oneLine(node, 220)
+}
+
+// oneLine 把多行/带制表符的文本压成一行并截断：这句要进状态栏和作业标题，
+// 留换行会把界面撑坏。
+func oneLine(s string, max int) string {
+	s = strings.Join(strings.Fields(s), " ")
+	r := []rune(s)
+	if len(r) > max {
+		return string(r[:max]) + "…"
+	}
+	return s
+}
+
+// ovpnLogHint 读这条隧道日志的尾巴并挑一句。只读最后 64KB：
+// 连不上的节点会被反复重试，整份读进来对一个错误提示没有意义。
+func ovpnLogHint(path string) string {
+	f, err := os.Open(path)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+	st, err := f.Stat()
+	if err != nil || st.Size() == 0 {
+		return ""
+	}
+	const span = 64 << 10
+	off := st.Size() - span
+	if off < 0 {
+		off = 0
+	}
+	buf := make([]byte, int(st.Size()-off))
+	if _, err := f.ReadAt(buf, off); err != nil && err != io.EOF {
+		return ""
+	}
+	return ovpnErrorLine(string(buf))
 }
 
 // tun0Up 看 netns 里的 tun0 是否已经拿到地址。

@@ -267,16 +267,19 @@ func (m *Manager) bringUpPersist(t *Tunnel, notify bool, persist bool) {
 	// 自动重连的目标是"恢复这条出口"，第一轮先试当前节点；
 	// 手动换节点时 t.Node 已经是用户挑的那个，必须打头。
 	prefer := true
+	lastErr := ""
 	for {
-		if m.tryCandidates(t, notify, prefer) {
+		ok, err := m.tryCandidates(t, notify, prefer)
+		if ok {
 			return
 		}
+		lastErr = err
 		// 隧道已被用户停掉或从管理器移除，别再重试
 		if !persist || !m.tunnelActive(t) {
 			if persist {
 				return
 			}
-			t.setStatus("failed", "")
+			t.setStatus("failed", oneLine(lastErr, 300))
 			if serr := m.saveState(); serr != nil {
 				log.Printf("保存状态失败: %v", serr)
 			}
@@ -286,7 +289,8 @@ func (m *Manager) bringUpPersist(t *Tunnel, notify bool, persist bool) {
 		// 一整轮都没连上，说明当前这个节点（以及这批候选）不行了：
 		// 下一轮别再拿它打头，否则会反复在同一批死节点上空转。
 		prefer = false
-		t.setStatus("starting", fmt.Sprintf("暂无可用节点，%.0f 秒后重试", backoff.Seconds()))
+		t.setStatus("starting", fmt.Sprintf("暂无可用节点，%.0f 秒后重试（%s）",
+			backoff.Seconds(), oneLine(lastErr, 160)))
 		log.Printf("隧道 %d 一轮候选均失败，%.0f 秒后刷新节点重试", t.Slot, backoff.Seconds())
 		time.Sleep(backoff)
 		if !m.tunnelActive(t) {
@@ -304,17 +308,21 @@ func (m *Manager) bringUpPersist(t *Tunnel, notify bool, persist bool) {
 	}
 }
 
-// tryCandidates 走一轮候选节点，成功返回 true。失败不改 Status（留给调用方决定）。
+// tryCandidates 走一轮候选节点，成功返回 true；失败时第二个返回值是最后一个候选
+// 的真实报错。失败本身不改 Status（留给调用方决定），但**原因必须带出去**——
+// 界面只会显示"failed / 暂无可用节点"，而那两种情况下下一步该做的事完全不同：
+// 节点死了就等下一轮，认证被拒是节点名单的问题，WARP 没握手则是换多少节点都没用。
 // preferCurrent 为真时把隧道当前绑定的节点排在最前（见 candidatesFor）。
-func (m *Manager) tryCandidates(t *Tunnel, notify bool, preferCurrent bool) bool {
+func (m *Manager) tryCandidates(t *Tunnel, notify bool, preferCurrent bool) (bool, string) {
 	// VPN Gate 是志愿者节点，列表里有相当比例已下线或满员（AUTH_FAILED），
 	// 连不上就顺着候选列表换下一个，不必让用户手动试。
 	candidates := m.candidatesFor(t, preferCurrent)
 	// 本轮起点的地区，用来说明某一次换候选是不是跨区换的。
 	home := t.node().CountryCode
+	lastErr := "没有可用候选节点"
 	for i, node := range candidates {
 		if !m.tunnelActive(t) {
-			return false
+			return false, lastErr
 		}
 		// 其他隧道可能在重试期间占用了这个节点，跳过以免多个端口撞同一出口 IP
 		if i > 0 && m.nodeInUse(node.HostName, t.Slot) {
@@ -338,11 +346,15 @@ func (m *Manager) tryCandidates(t *Tunnel, notify bool, preferCurrent bool) bool
 			if notify {
 				m.notifyPanel()
 			}
-			return true
+			return true, ""
 		}
+		lastErr = err.Error()
+		// 每个候选失败都写一行日志：journalctl 里能看到这一轮撞过哪些节点，
+		// 而界面上只有最后那一条。
+		log.Printf("fanout: 出口 %d 用 %s 没连上: %v", t.Slot, node.HostName, err)
 		t.teardownNetns()
 	}
-	return false
+	return false, lastErr
 }
 
 // tunnelActive 判断这条隧道是否还归管理器所有且未被用户停掉。
@@ -387,6 +399,12 @@ func (m *Manager) tryNode(t *Tunnel) (string, error) {
 	}
 	ip, err := t.probeExitIP()
 	if err != nil {
+		if acc != nil {
+			// 隧道起来了却查不到出口 IP：可能是节点那边没放行，也可能是外层包
+			// 太大传不动（openvpn 的握手小包过了，探测的大包过不去）。
+			// 这两种在界面上长得一样，但 WARP 那一跳的实况能把它们分开。
+			return "", fmt.Errorf("%v；%s", err, warpHopNote(t.nsName(), acc))
+		}
 		return "", err
 	}
 	return ip, nil

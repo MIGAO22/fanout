@@ -377,6 +377,36 @@ func readWarpOSRelease() string {
 	return string(blob)
 }
 
+// warpUnderMTU 读母机默认出口网卡的 MTU。读不到返回 0，
+// 由 warpPathMTU 按 1500 处理——宁可回到以前的行为，也不要因为读盘失败就配不出设备。
+//
+// 拿默认路由那块网卡而不是 netns 里的 veth：veth 永远是 1500，真正会卡住外层包的是
+// 母机往外走的那一块（隧道、overlay、PPPoE 的 1492 都在这）。
+func warpUnderMTU() int {
+	route, err := os.ReadFile("/proc/net/route")
+	if err != nil {
+		return 0
+	}
+	dev := warpDefaultDev(string(route))
+	if dev == "" {
+		return 0
+	}
+	blob, err := os.ReadFile("/sys/class/net/" + dev + "/mtu")
+	if err != nil {
+		return 0
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(string(blob)))
+	if err != nil || n <= 0 {
+		return 0
+	}
+	return n
+}
+
+// warpMTUs 是给执行层用的一行入口：读一次母机网卡，算出三层 MTU。
+func warpMTUs(on bool) (wgMTU, tunMTU, mssfix int) {
+	return warpPathMTU(on, warpUnderMTU())
+}
+
 const (
 	// warpInstallWait 是"翻开开关"那条路上装包的时限：用户在界面前台等，
 	// 但作业进度在跑，给足到能让一次慢镜像源走完。
@@ -475,7 +505,7 @@ func (t *Tunnel) setupWarp(acc *WarpAccount) error {
 	if err := os.WriteFile(keyFile, []byte(acc.PrivKey+"\n"), 0600); err != nil {
 		return fmt.Errorf("写 WireGuard 私钥失败: %w", err)
 	}
-	mtu, _, _ := warpPathMTU(true)
+	mtu, _, _ := warpMTUs(true)
 	in := warpSetupInput{
 		Dev: dev, KeyFile: keyFile, PeerKey: acc.PeerKey,
 		Endpoint: acc.Endpoint, Port: acc.Port, TunIP: acc.TunIP, MTU: mtu,
@@ -557,6 +587,34 @@ var warpStatusCache = struct {
 	value map[string]warpLiveStatus
 }{at: map[string]time.Time{}, value: map[string]warpLiveStatus{}}
 
+// warpHandshakeNow 读这条 netns 里 WireGuard 设备的握手实况，不走缓存。
+// 诊断要的是"此刻"，而界面那套 5 秒缓存是为了省 fork——目的不同，不能共用。
+func warpHandshakeNow(ns, dev string) (age int64, seen bool) {
+	out, err := cmdOutput(exec.Command("ip", "netns", "exec", ns, "wg", "show", dev, "dump"))
+	if err != nil {
+		return 0, false
+	}
+	peers := parseWgDump(string(out))
+	if len(peers) == 0 || !peers[0].up() {
+		return 0, false
+	}
+	return warpHandshakeAge(peers[0].Handshake, procUptime(), time.Now().Unix())
+}
+
+// warpHopNote 在"这条出口没连上"的报错里补一句 WARP 那一跳的通不通。
+//
+// 少了这句，两种完全不同的故障长得一模一样：节点死了，和 Cloudflare 那跳没握手。
+// 前者该换节点（程序本来就在换），后者换多少节点都不会好——
+// 而 netns 里的默认路由是 WireGuard，没握手就是黑洞，openvpn 只会等到超时。
+func warpHopNote(ns string, acc *WarpAccount) string {
+	age, seen := warpHandshakeNow(ns, acc.devName())
+	if seen {
+		return fmt.Sprintf("WARP 已握手（接入点 %s:%d，%d 秒前）", acc.Endpoint, acc.Port, age)
+	}
+	return fmt.Sprintf("WARP 未握手（接入点 %s:%d）——是 Cloudflare 这一跳不通，换节点不会有用", acc.Endpoint, acc.Port)
+}
+
+// warpStatusTTL 是界面那套实况的缓存时长。
 const warpStatusTTL = 5 * time.Second
 
 // warpStatus 读 netns 里 WireGuard 设备的实况：当前真正在用的 Cloudflare
@@ -625,6 +683,10 @@ func warpSettle(on bool) time.Duration {
 // 只等 up，不等 failed：reconnect 走的是 bringUpPersist，一轮候选全失败它会退避重试
 // 而不是把状态停成 failed。所以超时那句要说清"还在自动重试"，不能说成"失败了"——
 // 用户看到失败会去点停止，其实再等半分钟就起来了。
+//
+// 状态栏里那句真实报错（openvpn 日志里挑的 + WARP 握手实况）要一起带上：
+// 光说"还没连上"，18 条出口就是 18 个猜谜，而节点死了、认证被拒、
+// Cloudflare 那跳不通，三种的下一步完全不同。
 func warpWait(t *Tunnel, timeout time.Duration) (bool, string) {
 	deadline := time.After(timeout)
 	tick := time.NewTicker(500 * time.Millisecond)
@@ -632,6 +694,15 @@ func warpWait(t *Tunnel, timeout time.Duration) (bool, string) {
 	for {
 		select {
 		case <-deadline:
+			raw := t.state().Err
+			// WARP 那一跳不通时这句要排在最前面：它决定作业要不要继续逐条撞，
+			// 而排在后面会被截断吃掉，界面和 fail-fast 就都认不出来了。
+			if i := strings.Index(raw, "WARP 未握手"); i >= 0 {
+				return false, "还没连上：" + oneLine(raw[i:], 200)
+			}
+			if e := oneLine(raw, 200); e != "" {
+				return false, "还没连上：" + e + "（出口会继续自动重试）"
+			}
 			return false, "还没连上，出口会继续自动重试（WARP 那一跳不通时所有节点都会连不上）"
 		case <-tick.C:
 			switch t.status() {
@@ -734,21 +805,37 @@ func warpSet(m *Manager, on bool) (*Job, error) {
 			at++
 		}
 		failed := 0
+		aborted := ""
 		for i, t := range list {
 			job.Set(at+i, "running", "正在重连")
 			m.reconnect(t, t.host())
-			if ok, why := warpWait(t, timeout); ok {
+			ok, why := warpWait(t, timeout)
+			if ok {
 				job.Set(at+i, "ok", "出口 IP "+t.exitIP())
-			} else {
-				failed++
-				job.Set(at+i, "failed", why)
+				continue
+			}
+			failed++
+			job.Set(at+i, "failed", why)
+			// WARP 那一跳没握手时，剩下每条出口都会撞同一堵墙，而且每条都要
+			// 等满 settle 时间——18 条就是二十多分钟的"看着在忙"。
+			// 但只有"到此刻为止没有一条成功过"才停下并退回开关：前面已经有
+			// 出口连着 WARP 的话把开关退回，界面就成了"中转已关闭"而那条出口
+			// 还在走 Cloudflare，那种不一致比多等几条更难解释。
+			if strings.Contains(why, "WARP 未握手") && failed == i+1 {
+				aborted = why
+				for k := at + i + 1; k < len(labels); k++ {
+					job.Set(k, "failed", "没再重连：WARP 那一跳不通，换节点不会有用")
+				}
+				break
 			}
 		}
 		if !on {
 			// 关到底把注册一起退掉：留着就是 Cloudflare 那边一堆没人用的设备。
 			warpSvc.dropAll()
 		}
-		if on && len(list) > 0 && failed == len(list) {
+		if on && len(list) > 0 && aborted != "" {
+			revert(aborted)
+		} else if on && len(list) > 0 && failed == len(list) {
 			// 全都回不来，说明这台机器现在跑不了中转。把开关原样退回，
 			// 比留着一堆"显示已连通、其实一步都走不出去"的出口好。
 			revert("所有出口都没能连上")

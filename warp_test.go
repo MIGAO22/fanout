@@ -359,17 +359,17 @@ func TestWarpNameserversFromResolvConf(t *testing.T) {
 func TestWarpOffChangesNothing(t *testing.T) {
 	// 关掉中转时，参数、预算、MTU 必须回到没有这个功能时的值——
 	// 这是"默认关闭 = 零回归"唯一的证据。
-	wgMTU, tunMTU, mssfix := warpPathMTU(false)
+	wgMTU, tunMTU, mssfix := warpPathMTU(false, 1500)
 	if wgMTU != 0 || tunMTU != 0 || mssfix != 1380 {
 		t.Errorf("关闭时的 MTU = %d/%d/%d，想要 0/0/1380（openvpn 原默认）", wgMTU, tunMTU, mssfix)
 	}
-	if args := warpOpenVPNArgs(false); len(args) != 0 {
+	if args := warpOpenVPNArgs(false, 0); len(args) != 0 {
 		t.Errorf("关闭时不该给 openvpn 加任何参数，得到 %v", args)
 	}
 	if b := warpBudget(45*time.Second, false); b != 45*time.Second {
 		t.Errorf("关闭时预算 = %v，不该变", b)
 	}
-	onWG, onTun, onMSS := warpPathMTU(true)
+	onWG, onTun, onMSS := warpPathMTU(true, 1500)
 	if onWG != 1420 || onTun != 1380 || onMSS != 1340 {
 		t.Errorf("开启时 MTU = %d/%d/%d，想要 1420/1380/1340（两层封装）", onWG, onTun, onMSS)
 	}
@@ -378,12 +378,97 @@ func TestWarpOffChangesNothing(t *testing.T) {
 	}
 	// --route-nopull 是整套分流的前提：不挡掉推送的 redirect-gateway，
 	// tun0 会和 WARP 抢默认路由并撞 File exists
-	args := strings.Join(warpOpenVPNArgs(true), " ")
+	args := strings.Join(warpOpenVPNArgs(true, onTun), " ")
 	if !strings.Contains(args, "--route-nopull") || !strings.Contains(args, "--tun-mtu 1380") {
 		t.Errorf("开启时的参数 = %q", args)
 	}
 	if b := warpBudget(45*time.Second, true); b != 45*time.Second+warpExtraBudget {
 		t.Errorf("开启时预算 = %v，要多出 WARP 那一跳", b)
+	}
+}
+
+// 服务器推送的 MTU 优先级比命令行高：不挡回去，外层就超过链路扛得住的大小，
+// 症状是"每条出口、每个节点都超时"，看着像 VPN Gate 全死了。
+func TestWarpPullFilters(t *testing.T) {
+	if got := warpPullFilters(false, "2.6.8"); got != nil {
+		t.Errorf("关掉中转时不该加任何参数，得到 %v", got)
+	}
+	off := strings.Join(warpPullFilters(true, "2.6.8"), " ")
+	for _, k := range []string{"tun-mtu", "link-mtu", "mssfix"} {
+		if !strings.Contains(off, "ignore "+k) {
+			t.Errorf("没挡住服务器推送的 %s：%q", k, off)
+		}
+	}
+	if strings.Count(off, "--pull") != 3 {
+		t.Errorf("每条 ignore 都要自带 --pull，得到 %q", off)
+	}
+	// 2.3 没有 --pull filter：传上去是 Unrecognized option 当场退出，
+	// 那比 MTU 大了还糟——宁可不挡。
+	for _, ver := range []string{"2.3.20", "2.2.1", "", "读不出来"} {
+		if got := warpPullFilters(true, ver); got != nil {
+			t.Errorf("openvpn %q 不该给 --pull filter，得到 %v", ver, got)
+		}
+	}
+	// 2.4 起才有，且发行版后缀（2.4.9-1ubuntu5）不能把版本读成不认识
+	for _, ver := range []string{"2.4.0", "2.4.9-1ubuntu5", "2.5.8", "2.6.20-1ubuntu1", "3.0.0"} {
+		if warpPullFilters(true, ver) == nil {
+			t.Errorf("openvpn %s 该挡住推送的 MTU", ver)
+		}
+	}
+}
+
+// 外层封装是按母机那块真网卡算的。写死 1500 的代价是：1450/1400/1492 这类
+// 链路上，WireGuard 的外层包超过真实 MTU 又被 DF 拦住，表现是"握手成了、
+// 什么都传不动"，而 openvpn 最吃大包的 TLS 握手正好卡在那儿——症状就是
+// 所有节点都连不上，看着像 VPN Gate 全死了。
+func TestWarpMTUFollowsUnderLink(t *testing.T) {
+	cases := []struct {
+		under           int
+		wg, tun, mssfix int
+	}{
+		{1500, 1420, 1380, 1340}, // 和以前一字不差
+		{1492, 1420, 1380, 1340}, // PPPoE：1432 仍高于 1420，按 1420 封顶就够
+		{1450, 1390, 1350, 1310},
+		{1400, 1340, 1300, 1260},
+		{1300, 1280, 1240, 1200}, // 触到 WireGuard 规定的下限 1280
+		{0, 1420, 1380, 1340},    // 读不到母机网卡：回到 1500 的行为
+		{-5, 1420, 1380, 1340},
+		{9000, 1420, 1380, 1340}, // 巨型帧也不放大到 1420 以上，白丢余量
+	}
+	for _, c := range cases {
+		wg, tun, mss := warpPathMTU(true, c.under)
+		if wg != c.wg || tun != c.tun || mss != c.mssfix {
+			t.Errorf("under=%d 得到 %d/%d/%d，想要 %d/%d/%d",
+				c.under, wg, tun, mss, c.wg, c.tun, c.mssfix)
+		}
+		if wg < 1280 {
+			t.Errorf("under=%d 时 wg=%d 低于 WireGuard 的 1280 下限，内核会拒绝配设备", c.under, wg)
+		}
+		if !(mss < tun && tun < wg) {
+			t.Errorf("under=%d 时没有逐层递减：%d/%d/%d", c.under, wg, tun, mss)
+		}
+	}
+}
+
+// /proc/net/route 的形状：表头 + 每行 Iface Destination Gateway Flags RefCnt
+// Use Metric Mask MTU Window IRTT CCODES。目的 00000000 那条才是默认路由。
+func TestWarpDefaultDevReadsDefaultRoute(t *testing.T) {
+	blob := "Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\tMTU\tWindow\tIRTT\n" +
+		"eth0\t00000000\t010251C0\t0003\t0\t0\t100\t00000000\t1500\t0\t0\n" +
+		"eth0\t000251C0\t00000000\t0001\t0\t0\t100\t00FFFFFF\t1500\t0\t0\n" +
+		"docker0\t00000000\t00000000\t0001\t0\t0\t0\t00000000\t1500\t0\t0\n"
+	if got := warpDefaultDev(blob); got != "eth0" {
+		t.Errorf("默认网卡 = %q，想要 eth0（第一条默认路由）", got)
+	}
+	if got := warpDefaultDev("Iface\tDestination\n"); got != "" {
+		t.Errorf("只有表头时应为空，得到 %q", got)
+	}
+	if got := warpDefaultDev(""); got != "" {
+		t.Errorf("空内容时应为空，得到 %q", got)
+	}
+	// 没有默认路由的机器（容器里常见）不能挑到一块不相干的网卡
+	if got := warpDefaultDev("Iface\tDestination\neth0\t000251C0\n"); got != "" {
+		t.Errorf("没有默认路由时应为空，得到 %q", got)
 	}
 }
 

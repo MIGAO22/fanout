@@ -487,6 +487,9 @@ html[data-theme="dark"] select.inp{background-image:url("data:image/svg+xml;char
   font-size:11.5px;color:var(--bad);line-height:1.5;word-break:break-word}
 .errbox b{display:block;font-size:10.5px;text-transform:uppercase;letter-spacing:.05em;
   margin-bottom:2px;opacity:.85}
+/* 重试中不是失败：程序还在自动换节点，用警告色而不是红——
+   满屏红框会让人去点停止，其实再等半分钟就起来了 */
+.errbox.soft{background:var(--warn-soft);border-color:var(--warn-line);color:var(--warn)}
 
 .skel{border:1px solid var(--border);border-radius:var(--r-lg);background:var(--surface);
   padding:15px;overflow:hidden;position:relative}

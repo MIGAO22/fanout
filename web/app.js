@@ -469,8 +469,11 @@ function exitCard(e){
         + '<span class="pt">:' + i.port + '</span></button>').join('')
     : '<span class="chip none">还没有节点链接</span>';
 
-  const err = (st === 'failed' && e.err)
-    ? '<div class="errbox"><b>连接失败</b>' + esc(e.err) + '</div>' : '';
+  // 失败和"正在重试"都要把原因写出来：只有"连接中…"的话，
+  // 人分不清是在等节点应答，还是 WARP 那一跳根本没通、换多少节点都没用。
+  const err = e.err && (st === 'failed' || st === 'starting')
+    ? '<div class="errbox' + (st === 'failed' ? '' : ' soft') + '"><b>'
+      + (st === 'failed' ? '连接失败' : '重试中') + '</b>' + esc(e.err) + '</div>' : '';
 
   const since = (st === 'up' && e.since)
     ? '<span class="it" title="自 ' + esc(agoFrom(e.since) || '—') + ' 起">' + ICON.clock

@@ -260,17 +260,52 @@ func hostPort(host string) int {
 
 // warpPathMTU 返回开 WARP 之后该用的三层 MTU。
 //
-// 母机网卡按 1500 算：WireGuard 外层要 8(UDP)+4(WireGuard 头)+20(IP)=32 字节，
+// under 是母机真正出网那块网卡的 MTU。写死 1500 是不够的：VPS 的默认出口
+// 经常不是 1500（1450 的隧道、1400 的 overlay、拨号线的 1492），而 WireGuard
+// 的外层包是带 DF 的——超了就静默丢掉，表现是"握手成了但什么都传不动"，
+// 而 openvpn 最吃大包的一步正好是 TLS 握手。于是症状变成"所有节点都连不上"，
+// 看着像节点死了，其实是我们把包发大了。
+//
+// 母机网卡按 1500 算时：WireGuard 外层要 8(UDP)+4(WireGuard 头)+20(IP)=32 字节，
 // 所以设备给 1420；openvpn 的 UDP 包装再吃掉约 40，tun 只能到 1380。
 // mssfix 再留一档余量，夹住 TCP；UDP 大包（QUIC 常见）靠 tun 的 1380 挡。
 // 关掉 WARP 时返回的 tunMTU 是 0，意思是"照 openvpn 自己的默认来"，
 // 和没这个功能时一字不差。
-func warpPathMTU(on bool) (wgMTU, tunMTU, mssfix int) {
+func warpPathMTU(on bool, under int) (wgMTU, tunMTU, mssfix int) {
 	if !on {
 		return 0, 0, 1380
 	}
-	return 1420, 1380, 1340
+	if under <= 0 || under > 1500 {
+		under = 1500 // 读不到、或离谱到不像话：按以前的 1500 算，行为不变
+	}
+	wg := under - 60
+	if wg > 1420 {
+		wg = 1420
+	}
+	if wg < 1280 {
+		wg = 1280 // WireGuard 自己规定的最小 MTU，再小内核会直接拒绝配置设备
+	}
+	tun := wg - 40
+	return wg, tun, tun - 40
 }
+
+// warpDefaultDev 从 /proc/net/route 里找默认路由（目的 00000000）走的那块网卡。
+// 有多条默认路由时拿第一条——和内核一样，不做策略路由的猜测。
+func warpDefaultDev(blob string) string {
+	lines := strings.Split(blob, "\n")
+	if len(lines) < 2 {
+		return "" // 只有表头或空文件
+	}
+	for _, line := range lines[1:] {
+		f := strings.Fields(line)
+		if len(f) >= 2 && f[1] == "00000000" {
+			return f[0]
+		}
+	}
+	return ""
+}
+
+// warpUnderMTU 在 warprun.go（要读 /proc 与 /sys），这里只留纯函数。
 
 // warpOpenVPNArgs 是开着 WARP 时要额外加给 openvpn 的参数。
 //
@@ -285,12 +320,38 @@ func warpPathMTU(on bool) (wgMTU, tunMTU, mssfix int) {
 //
 // 开关关掉时返回空切片——非 WARP 那条路径一个参数都不加，
 // 行为和没这个功能时一字不差。
-func warpOpenVPNArgs(on bool) []string {
+//
+// tunMTU 由调用方算好递进来（见 warpMTUs）：这个文件不碰 /proc，
+// 而且同一个连接里三层 MTU 必须出自同一次读取，分两次读会读到不同的网卡 MTU。
+func warpOpenVPNArgs(on bool, tunMTU int) []string {
 	if !on {
 		return nil
 	}
-	_, tunMTU, _ := warpPathMTU(true)
 	return []string{"--route-nopull", "--tun-mtu", strconv.Itoa(tunMTU)}
+}
+
+// warpPullFilters 挡住服务器推送的 MTU 相关选项。
+//
+// 必须挡的原因：openvpn 里**服务器推送的优先级高于命令行**，VPN Gate 上确实有节点
+// 推 tun-mtu / mssfix。一被盖回去，外层就超过链路扛得住的大小，表现是"握手成了、
+// 什么都传不动"——而 openvpn 最吃大包的 TLS 握手正好卡在这一步，于是每条出口、
+// 每个候选节点都以超时收场，看着像 VPN Gate 全死了。
+//
+// --pull filter 是 2.4 才有的选项，2.3 传上去会变成 Unrecognized option 直接退出，
+// 所以按版本给（和数据通道算法那套同一个理由）。关掉中转时返回空切片。
+func warpPullFilters(on bool, ver string) []string {
+	if !on {
+		return nil
+	}
+	major, minor, ok := parseVersionParts(ver)
+	if !ok || major < 2 || (major == 2 && minor < 4) {
+		return nil
+	}
+	var out []string
+	for _, k := range []string{"tun-mtu", "link-mtu", "mssfix"} {
+		out = append(out, "--pull", "filter", "ignore", k)
+	}
+	return out
 }
 
 // warpBudget 给单节点连接预算加上 WARP 那一跳的开销。
