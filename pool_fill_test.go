@@ -334,6 +334,32 @@ func TestFillPoolGrowsForExtraSlot(t *testing.T) {
 	}
 }
 
+// 刚重启那会儿组员全在自动重连：一个都不许顶掉，也不许往名单里加人。
+//
+// 这条是"要快"的另一半——快是给确定死了的成员用的。还在自救的成员大概率
+// 自己回来，提前占位会把别的组的在线出口整批抢成自己的组员，等原来那批回来，
+// 名单就比用户设的条数长了（并发模式下每次访问要多抢几路）。
+func TestFillPoolWaitsForReconnectingMembers(t *testing.T) {
+	_, svc := fillFixture(t, 3, []string{"gate-a", "gate-b", "gate-c"},
+		[]fillExit{
+			{"gate-a", "starting"}, {"gate-b", "starting"}, {"gate-c", "starting"},
+			{"gate-spare", "up"},
+		}, nil)
+
+	svc.fillPool(svc.pool("p1"))
+
+	p := svc.pool("p1")
+	if !slices.Equal(p.Hosts, []string{"gate-a", "gate-b", "gate-c"}) {
+		t.Fatalf("组员 = %v, 想一个都不动：它们还在自救", p.Hosts)
+	}
+	if p.Size != 3 {
+		t.Fatalf("Size = %d, 想保持 3", p.Size)
+	}
+	if note := svc.fillNotes()["p1"]; !strings.Contains(note, "正在自动重连") {
+		t.Fatalf("note = %q, 想写明差的那几条是在重连、不是缺人", note)
+	}
+}
+
 // 顶替完成之后原来那条必须收掉。
 //
 // 判死的成员不会自己消失：它带着原节点在重连回路里无限重试，只在被删掉时才停。

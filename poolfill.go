@@ -69,11 +69,22 @@ func (s *PoolService) fillPool(p *Pool) {
 	// 直接把锁内的 map 递出去，就等于在锁外改它——删组那侧的 dropFillLedger
 	// 正在同一把锁下删这同一个 key，-race 下就是数据竞争。
 	first := s.fillDeadSnapshot(p.ID)
-	live, gone := poolGoneHosts(s.resolveMembers(p.ID), first, poolFillDeadAfter, now)
+	members := s.resolveMembers(p.ID)
+	live, gone := poolGoneHosts(members, first, poolFillDeadAfter, now)
 	s.mergeFillDead(p.ID, first)
-	need := p.Size - live
-	if need <= 0 {
+	short := p.Size - live
+	if short <= 0 {
 		s.setFillNote(p.ID, "")
+		return
+	}
+
+	// 名额只给两种坑：已经判死的（gone），以及名单本身就比目标短的那几个
+	// （用户把条数调大了）。还在自救窗口里的那些不给——它们大概率自己回来，
+	// 提前占位会让组员名单比用户设的条数长，而且刚重启时组员全在这一档，
+	// 不给就把别的组的在线出口整批抢成自己的组员了。
+	need := min(short, len(gone)+max(0, p.Size-len(members)))
+	if need <= 0 {
+		s.setFillNote(p.ID, waitingNote(short))
 		return
 	}
 
@@ -84,46 +95,61 @@ func (s *PoolService) fillPool(p *Pool) {
 			filled++
 		}
 	}
-	rest := need - filled
-	if rest <= 0 {
+	if filled > 0 {
 		log.Printf("出口组 %s 用在线出口顶回 %d 条（目标 %d）", p.Name, filled, p.Size)
-		s.setFillNote(p.ID, "")
-		return
 	}
 
 	// 第二优先（最后手段）：新建出口。地区不限——用户要的是"数量立刻回来"，
 	// 不是"地区一模一样"；跟着死成员的地区挑，恰恰最容易挑到同一批一起挂的机房。
-	headroom := s.mgr.SlotHeadroom()
-	room := headroom - poolFillSlotFloor
+	// 循环按"还差几条"收敛：不然一次就能把可用槽位全开走。
+	left := need - filled
+	created := 0
+	reason := ""
+	room := s.mgr.SlotHeadroom() - poolFillSlotFloor
 	if room < 0 {
 		room = 0
 	}
-	if room < rest {
-		s.setFillNote(p.ID, fmt.Sprintf(
-			"已顶回 %d 条，还差 %d 条：在线出口都用上了，新建受槽位限制（还能开 %d 个，要留 %d 个余量）",
-			filled, rest, room, poolFillSlotFloor))
-	}
-	created := 0
-	for i := 0; i < room; i++ {
+	for created < left && room > 0 {
+		room--
 		picks, err := s.mgr.pickNodes("", 1, s.fillAvoid(p.ID))
 		if err != nil {
-			s.setFillNote(p.ID, fmt.Sprintf("已顶回 %d 条，还差 %d 条：%v", filled+created, need-filled-created, err))
-			return
+			reason = err.Error()
+			break
 		}
 		node := picks[0]
 		if !s.fillOne(p, node, slotOf(gone, filled+created)) {
 			s.markFillBad(node.HostName)
-			s.setFillNote(p.ID, fmt.Sprintf("补位没成：试了 %s，还是连不上（冷却 %d 分钟）",
-				node.HostName, int(poolFillPenalty.Minutes())))
+			reason = fmt.Sprintf("试了 %s 还是连不上（冷却 %d 分钟）",
+				node.HostName, int(poolFillPenalty.Minutes()))
 			continue
 		}
 		created++
 	}
 	if created > 0 {
-		log.Printf("出口组 %s 自动补齐 %d 条成员（在线顶替 %d 条 + 新建 %d 条，目标 %d）",
-			p.Name, filled+created, filled, created, p.Size)
-		s.setFillNote(p.ID, "")
+		log.Printf("出口组 %s 另新建 %d 条成员补位（在线顶替 %d 条，目标 %d）",
+			p.Name, created, filled, p.Size)
 	}
+	filled += created
+	if created < left && reason == "" {
+		reason = fmt.Sprintf("在线出口都用上了，新建又受槽位限制（要留 %d 个余量）", poolFillSlotFloor)
+	}
+
+	leftover := p.Size - live - filled
+	switch {
+	case leftover <= 0:
+		s.setFillNote(p.ID, "")
+	case reason != "":
+		s.setFillNote(p.ID, fmt.Sprintf("已顶回 %d 条，还差 %d 条：%s", filled, leftover, reason))
+	default:
+		// 剩下的都还在自救窗口里，不是缺人，下一轮再看
+		s.setFillNote(p.ID, waitingNote(leftover))
+	}
+}
+
+// waitingNote 解释"还差的那几条正自己在重连，这轮不该动它们"。
+func waitingNote(n int) string {
+	return fmt.Sprintf("另有 %d 条正在自动重连，等满 %d 秒没回来才顶替",
+		n, int(poolFillDeadAfter.Seconds()))
 }
 
 // fillCandidates 列出此刻能拿来顶替的现有出口：在线、不在这个组里、不在冷却里。
