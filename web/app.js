@@ -1815,6 +1815,7 @@ async function loadSettingsPage(){
     setV('#setPanelDebounce',   c.panel_debounce ?? DEF.panel_debounce);
     setV('#setNodeTtl',         c.node_ttl ?? DEF.node_ttl);
     $('#setScoreMode').value = c.score_mode || DEF.score_mode;
+    $('#setAeadOnly').checked = !!c.aead_only;
     markDirty(false);
   }catch(err){ $('#setPathHint').textContent = '读取失败: ' + err.message; }
 }
@@ -2196,6 +2197,7 @@ $('#setSave').onclick = async e => {
     panel_debounce:   getV('#setPanelDebounce', DEF.panel_debounce),
     node_ttl:         getV('#setNodeTtl', DEF.node_ttl),
     score_mode:       $('#setScoreMode').value,
+    aead_only:        $('#setAeadOnly').checked,
   };
 
   const portChanged = curSettings && (port !== curSettings.port

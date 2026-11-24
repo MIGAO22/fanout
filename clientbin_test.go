@@ -366,7 +366,7 @@ func TestDataCipherArgs(t *testing.T) {
 		{"junk", "", true},
 	}
 	for _, c := range cases {
-		got := dataCipherArgs(c.ver)
+		got := dataCipherArgs(c.ver, false)
 		if c.wantNil {
 			if len(got) != 0 {
 				t.Errorf("%s 不该给算法参数（默认表更安全），得到 %v", c.ver, got)
@@ -381,11 +381,64 @@ func TestDataCipherArgs(t *testing.T) {
 		}
 	}
 	// fallback 只在认得这个参数的版本上给，否则同样是"未识别选项"
-	if s := strings.Join(dataCipherArgs("2.4.11"), " "); strings.Contains(s, "fallback") {
+	if s := strings.Join(dataCipherArgs("2.4.11", false), " "); strings.Contains(s, "fallback") {
 		t.Errorf("2.4 不认 --data-ciphers-fallback：%s", s)
 	}
-	if s := strings.Join(dataCipherArgs("2.6.8"), " "); !strings.Contains(s, "--data-ciphers-fallback") {
+	if s := strings.Join(dataCipherArgs("2.6.8", false), " "); !strings.Contains(s, "--data-ciphers-fallback") {
 		t.Errorf("2.6 应该带 fallback，不然只讲 AES-256-CBC 的老节点连不上：%s", s)
+	}
+}
+
+// AEAD-only 那一档存在的唯一理由：2.7 见到 fallback 就自己禁用内核 offload。
+// 所以这一档必须同时做到"没有 fallback"和"表里没有 CBC"，留一个都不算数。
+func TestDataCipherArgsAeadOnly(t *testing.T) {
+	got := strings.Join(dataCipherArgs("2.7.9", true), " ")
+	if strings.Contains(got, "fallback") {
+		t.Errorf("AEAD-only 还带 fallback，offload 照样被禁：%s", got)
+	}
+	if strings.Contains(got, "CBC") {
+		t.Errorf("AEAD-only 的表里不该再有 CBC：%s", got)
+	}
+	if !strings.Contains(got, "AES-256-GCM") || !strings.Contains(got, "CHACHA20-POLY1305") {
+		t.Errorf("AEAD-only 要把三种 AEAD 都给上：%s", got)
+	}
+	// 2.4 没有 --data-ciphers，也没有 allow-compression，这一档对它不生效
+	if s := strings.Join(dataCipherArgs("2.4.11", true), " "); s == "" || !strings.Contains(s, "--ncp-ciphers") {
+		t.Errorf("2.4 上这一档必须退回原行为（ncp-ciphers 全表），得到 %q", s)
+	}
+	if s := strings.Join(dataCipherArgs("2.3.20", true), " "); s != "" {
+		t.Errorf("读不懂的版本一律不加参数，得到 %q", s)
+	}
+	// --allow-compression 同样只有 2.5+ 认
+	if len(compressionOffArgs("2.4.11")) != 0 {
+		t.Error("2.4 不认 --allow-compression，不能给")
+	}
+	if s := strings.Join(compressionOffArgs("2.6.8"), " "); s != "--allow-compression no" {
+		t.Errorf("2.6 应该给 --allow-compression no，得到 %q", s)
+	}
+}
+
+// 节点自己开了压缩时不能再传 --allow-compression no：openvpn 当成配置冲突直接退出，
+// 那条出口就一个节点都连不上，而不是退回用户态加解密。
+func TestOvpnConfigEnablesCompression(t *testing.T) {
+	cases := []struct {
+		cfg  string
+		want bool
+	}{
+		{"dev tun\nproto tcp\nremote a 443\n", false},
+		{"dev tun\ncomp-lzo yes\n", true},
+		{"dev tun\n  COMP-LZ4 yes\n", true},
+		{"dev tun\n--comp-noadapt\n", true},
+		{"dev tun\nallow-compression asym\n", true},
+		// 注释行不算
+		{"dev tun\n; comp-lzo yes\n", false},
+		// --compress <算法> 也是开压缩
+		{"dev tun\ncompress lz4-v2\n", true},
+	}
+	for _, c := range cases {
+		if got := ovpnConfigEnablesCompression(c.cfg); got != c.want {
+			t.Errorf("cfg %q = %v, 想 %v", c.cfg, got, c.want)
+		}
 	}
 }
 

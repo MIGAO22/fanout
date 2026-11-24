@@ -66,6 +66,13 @@ type ConnSettings struct {
 	// ReconnectLimit 是一轮健康检查里最多同时重连几条出口。
 	// VPN Gate 的机房常常整段一起掉线，全放开了重连等于自己打自己。
 	ReconnectLimit int `json:"reconnect_limit,omitempty"`
+	// AeadOnly 是"数据通道只要 AEAD"那一档，默认关。
+	//
+	// 开的代价与收益都很具体：openvpn 2.7 见到 --data-ciphers-fallback 就禁用
+	// 内核 data channel offload（它自己在日志里明说），去掉 fallback 才能拿到
+	// 内核加解密；代价是只讲 AES-256-CBC 的老节点直接连不上——VPN Gate 上这批
+	// 不少，所以默认关着，让要性能的人自己换。
+	AeadOnly bool `json:"aead_only,omitempty"`
 }
 
 // 连接层默认参数。改这里要同步改 web/app.js 里输入框的占位默认值。

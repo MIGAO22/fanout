@@ -16,23 +16,65 @@ import (
 // "Unrecognized option" 直接失败，于是 Ubuntu 20.04、Debian 10 这些还在
 // 2.4 的机器上一条出口都连不上，界面上只显示"连接失败"，看不出原因。
 //
-// 2.5 起多给一条 fallback：VPN Gate 上一大批老节点关了 NCP、只讲 AES-256-CBC，
+// 2.5 起默认多给一条 fallback：VPN Gate 上一大批老节点关了 NCP、只讲 AES-256-CBC，
 // 新版客户端没有 fallback 会因为算法谈不拢而拒绝连接。
-func dataCipherArgs(ver string) []string {
+//
+// aeadOnly 是"只要 AEAD"那一档（设置里的开关）：CBC 从表里去掉、fallback 也不给。
+// 2.7 的二进制里写死了原因——`--data-ciphers-fallback` 一出现就禁用内核
+// data channel offload，想拿到内核加解密就只能放弃那批老节点。所以这一档
+// 只在认得 --data-ciphers 的版本上生效，2.4 及读不出版本时一律维持现状。
+func dataCipherArgs(ver string, aeadOnly bool) []string {
 	major, minor, ok := parseVersionParts(ver)
 	if !ok {
 		// 读不出版本就不赌，让 openvpn 用自己默认的算法表
 		return nil
 	}
-	list := "AES-128-CBC:AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305:AES-256-CBC"
 	switch {
 	case major > 2 || (major == 2 && minor >= 5):
+		if aeadOnly {
+			return []string{"--data-ciphers", aeadCipherList}
+		}
+		list := "AES-128-CBC:AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305:AES-256-CBC"
 		return []string{"--data-ciphers", list, "--data-ciphers-fallback", "AES-256-CBC"}
 	case major == 2 && minor == 4:
-		return []string{"--ncp-ciphers", list}
+		return []string{"--ncp-ciphers", "AES-128-CBC:AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305:AES-256-CBC"}
 	default:
 		return nil
 	}
+}
+
+// aeadCipherList 是 AEAD-only 那一档给的表：一个 CBC 都不留。
+const aeadCipherList = "AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305"
+
+// compressionOffArgs 是 AEAD-only 那一档顺手要补的另一条：openvpn 明写
+// "--allow-compression 不是 no 就不启用 offload"。只在 2.5+ 给（更早的版本
+// 没有这个选项，喂上去是 Unrecognized option 当场退出）。
+func compressionOffArgs(ver string) []string {
+	major, minor, ok := parseVersionParts(ver)
+	if !ok || major < 2 || (major == 2 && minor < 5) {
+		return nil
+	}
+	return []string{"--allow-compression", "no"}
+}
+
+// ovpnConfigEnablesCompression 看节点那份 .ovpn 自己有没有开数据通道压缩。
+//
+// 开着就不能再补 --allow-compression no：openvpn 把这当成配置冲突直接退出
+// （"'--allow-compression no' conflicts with enabling compression"），
+// 不是降级处理——那条出口就一个节点都连不上了。宁可少要一点性能，
+// 也不能因为一个开关把所有隧道点不着。
+func ovpnConfigEnablesCompression(cfg string) bool {
+	for _, line := range strings.Split(cfg, "\n") {
+		f := strings.Fields(line)
+		if len(f) == 0 {
+			continue
+		}
+		switch strings.ToLower(strings.TrimPrefix(f[0], "--")) {
+		case "comp-lzo", "comp-lz4", "comp-noadapt", "compress", "allow-compression":
+			return true
+		}
+	}
+	return false
 }
 
 // parseVersionParts 把 "2.6.8" 拆成主/次版本。多出来的段（-ubuntu1、.1）忽略。

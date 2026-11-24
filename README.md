@@ -185,6 +185,18 @@ fanout 只要那 32 字节密钥和一条策略路由，多养一个 daemon 只�
 「还能开几个槽位」收敛，没按「还差几条」收敛，差 1 条时最坏能把整批空槽全开成出口。
 两处各配一条用例，把任一处理解掉用例就红。
 
+**v2.1.3 把 openvpn 2.7 能白拿的东西接上了。** 母机上跑的就是 2.7.9，实测到 2.7 已经在
+自己起作用：`Socket flags: TCP_NODELAY=1 succeeded`（2.7.6 起默认常开，我们没传）、
+`TLS: soft reset … aead_limit_send=…`（AES-GCM 用量上限强制换钥）、TLS 1.3 控制通道。
+这一版加的是剩下那两条需要客户端主动给参数或主动开口的：
+
+- **AEAD-only 开关（默认关）**：见上面「内置客户端」那一节。它是 2.7 上唯一能兑现的
+  性能项，但会把只讲 CBC 的老节点挡在外面，所以不替用户决定。
+- **TLS alert 上界面**：2.7 会把 TLS alert 发给对端并记一句 `… SSL alert: …`，
+  以前只能看到"TLS 握手没走完"，现在能看出是节点主动拒了握手。
+  另外 AEAD-only 的两种反噬（算法谈不拢、节点硬要开压缩）都以 `OPTIONS ERROR:` 开头，
+  专门排在通用的"参数没被接受"前面，否则报出来的原因是错的。
+
 ## 原理
 
 每个节点跑在独立的 network namespace 里，netns 内启动官方 openvpn 客户端。
@@ -238,7 +250,7 @@ Xray 到 `/var/lib/fanout/bin/`，装了则跳过，入站交给面板管。
 > 才生效：`f` → `3) 重启`（或 `f restart`）。`install.sh` 现在重装会显式
 > `systemctl restart`——以前用 `enable --now`，对已运行的单元是空操作，
 > 于是新二进制在磁盘上、老进程还在服务老界面。
-> 想确认手上是哪一份：`fanout -version`，本仓库显示 `v2.1.2`，上游原版是 `v1.3.1`。
+> 想确认手上是哪一份：`fanout -version`，本仓库显示 `v2.1.3`，上游原版是 `v1.3.1`。
 
 > **发新版本。** 推一个 `v*` tag 就会触发 release workflow 出 amd64 / arm64
 > 两个包和 checksums；不打 tag 就没有 Release，`releases/latest/download/...`
@@ -439,6 +451,17 @@ Fedora Copr（`@OpenVPN/openvpn-release-2.7`，`dnf copr enable` 那条路），
 
 至于 openvpn 的版本为什么要看一眼：2.4 和 2.5 之后连数据通道算法的参数名都不一样，
 喂错名字 openvpn 直接退出、一条出口都连不上，fanout 按本机版本挑名字（见上面「连接层加固」）。
+
+**2.7 还多了一层取舍：只要 AEAD 才拿得到内核 offload。** openvpn 2.7 只要看见
+`--data-ciphers-fallback` 就自己禁用 data channel offload（那句
+`Note: --data-ciphers-fallback … disables data channel offload` 是它自己打的），
+而 fallback 正是为了连上 VPN Gate 上那批只讲 AES-256-CBC 的老节点才给的。
+所以「设置与连接 → 重试与面板」里有个**默认关着**的「数据通道只要 AEAD（放开内核 offload）」：
+打开后算法表只留 AES-256-GCM / AES-128-GCM / CHACHA20-POLY1305、不给 fallback、
+并补 `--allow-compression no`（同样是 offload 的前置条件），加解密就落到内核里；
+代价是只支持老算法的节点直接连不上。节点那份配置自己开了压缩时这条不生效——
+`--allow-compression no` 和它是冲突，openvpn 会直接退出而不是降级。
+2.4 及读不出版本时这个开关不起作用，行为与之前完全一致。
 
 **apt 到不了的地方，还有一条源码编译的路。** 官方 apt 源的 `release/2.7` 通道在不少发行版上
 只喂到预发布：实测 noble / bookworm / jammy / plucky 是 `2.7~alpha1`，trixie 是 `2.7~beta1`，
@@ -726,7 +749,7 @@ REALITY 的密钥对和 shortId 自动生成；TLS 不填证书就生成自签�
 
 ```
   状态      运行中
-  版本      fanout v2.1.2
+  版本      fanout v2.1.3
   开机自启  enabled
 
   管理地址  http://1.2.3.4:8899/gwPuWHvaNr/

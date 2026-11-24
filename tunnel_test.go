@@ -23,6 +23,14 @@ func TestOvpnErrorLinePicksTheTellingLine(t *testing.T) {
 		{"域名解析不出", "RESOLVE: Cannot resolve host address: node.example:443\n", "节点域名解析不出来"},
 		{"端口没应答", "Connection timed out (errno=110)\n", "节点的端口没应答"},
 		{"节点已应答", "Peer Connection Initiated with [AF_INET]1.2.3.4:1194\n", "节点已应答，卡在后面的步骤"},
+		// 2.7 起 openvpn 会把对端的 TLS alert 记成 "… SSL alert: …"，
+		// 这比"握手没走完"具体：是节点主动拒了，不是包没到。
+		{"TLS alert", "TLS Read TLS SSL alert: fatal: handshake failure\n", "节点在 TLS 层直接拒绝（见原文）"},
+		// AEAD-only 那一档的两条反噬：算法谈不拢、节点坚持要压缩。
+		// 两句都以 OPTIONS ERROR 开头，不能被通用的"参数没被接受"抢先。
+		{"算法谈不拢", "OPTIONS ERROR: failed to negotiate cipher with server.  Add the server's cipher ('DES-EDE3-CBC') to --data-ciphers\n", "数据通道算法和节点谈不拢（开着 AEAD-only 就先关掉再试）"},
+		{"没有 fallback 就不连", "ERROR: failed to negotiate cipher with peer and --data-ciphers-fallback not enabled. No usable data channel cipher\n", "数据通道算法和节点谈不拢（开着 AEAD-only 就先关掉再试）"},
+		{"节点硬要压缩", "OPTIONS ERROR: server pushed compression settings that are not allowed and will result in a non-working connection.\n", "节点要求开压缩，AEAD-only 不让开"},
 		{"没有关键句", "Control Channel: TLSv1.3, cipher TLSv1.3\n", ""},
 		{"空日志", "", ""},
 	}

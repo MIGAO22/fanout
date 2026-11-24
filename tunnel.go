@@ -416,7 +416,13 @@ func (t *Tunnel) startOpenVPN(dir string, acc *WarpAccount) error {
 	// 一旦"探的是系统那份、跑的是编出来的那份"，openvpn 会当场 Unrecognized option 退出。
 	ovpnBin := openvpnBinary()
 	ovpnVer := parseOpenVPNVersion(probeVersion(ovpnBin, "--version"))
-	args = append(args, dataCipherArgs(ovpnVer)...)
+	// AEAD-only 那一档是设置里的开关：开了才放弃 CBC 与 fallback，好让 2.7 用上
+	// 内核 data channel offload；关着就是原来的行为。
+	aeadOnly := connConf().AeadOnly && !ovpnConfigEnablesCompression(t.node().Config)
+	args = append(args, dataCipherArgs(ovpnVer, aeadOnly)...)
+	if aeadOnly {
+		args = append(args, compressionOffArgs(ovpnVer)...)
+	}
 	// 开着 WARP 时还要挡住服务器推送的 MTU：推送的优先级比命令行高，
 	// 而这三层数字是按外层封装算出来的（见 warpPathMTU）。
 	args = append(args, warpPullFilters(on, ovpnVer)...)
@@ -467,6 +473,14 @@ func (t *Tunnel) startOpenVPN(dir string, acc *WarpAccount) error {
 var ovpnOwnFaults = []struct{ needle, why string }{
 	{"message too long", "外层包超过链路 MTU"},
 	{"emsgsize", "外层包超过链路 MTU"},
+	// AEAD-only 开着时的两种"是我们这个选择造成的"，必须排在通用的
+	// "options error" 前面：那两句也都是 OPTIONS ERROR 开头，
+	// 只报"参数没被接受"会把人指向完全错误的方向。
+	// 关键句只取 "failed to negotiate cipher"：openvpn 对老节点和对我们表里
+	// 缺算法两种情况分别印 "…Configure --data-ciphers-fallback…" 和
+	// "…Add the server's cipher…"，只认其中一句就会漏掉一半。
+	{"failed to negotiate cipher", "数据通道算法和节点谈不拢（开着 AEAD-only 就先关掉再试）"},
+	{"pushed compression settings", "节点要求开压缩，AEAD-only 不让开"},
 	{"options error", "参数没被接受"},
 	{"unrecognized option", "参数没被接受"},
 }
@@ -479,6 +493,9 @@ var ovpnNodeFaults = []struct{ needle, why string }{
 	{"verify error", "节点证书校验不过"},
 	{"auth_failed", "节点拒绝了用户名/密码"},
 	{"authentication failed", "节点拒绝了用户名/密码"},
+	// openvpn 2.7 起会把 TLS alert 发给对端并记一句 "… SSL alert: …"。
+	// 这一句比"握手没走完"具体得多——是节点主动拒了握手，不是网络没到。
+	{"ssl alert:", "节点在 TLS 层直接拒绝（见原文）"},
 	{"tls_error", "TLS 握手没走完"},
 	{"tls handshake failed", "TLS 握手没走完"},
 	{"cannot resolve host address", "节点域名解析不出来"},
