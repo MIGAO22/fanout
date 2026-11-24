@@ -616,14 +616,20 @@ func apiWarp(m *Manager) http.HandlerFunc {
 		}
 		job, err := warpSet(m, on)
 		if err != nil {
-			// 前置条件不满足（没装 wireguard-tools、Cloudflare 够不着、注册失败）
-			// 时开关保持原样，这里把原话透给界面，别再套一层"操作失败"
+			// 前置条件不满足（注册记录没加载、这台机器的发行版认不出、
+			// 装不了 wireguard-tools）时开关保持原样，这里把原话透给界面，
+			// 别再套一层"操作失败"
 			writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
 			return
 		}
 		msg := "中转已关闭，正在把出口逐条接回直连"
 		if on {
 			msg = "中转已开启，正在把出口逐条接进 Cloudflare"
+			// 缺 wg 时作业的第一步就是装它：这句话得说在前面，
+			// 不然那几十秒看起来就像开关没生效
+			if warpProbeDeps().Steps != nil {
+				msg = "正在装 " + wireguardPkg + "，装好后逐条把出口接进 Cloudflare"
+			}
 		}
 		out := map[string]any{"ok": true, "enabled": warpOn(), "message": msg}
 		if job == nil {

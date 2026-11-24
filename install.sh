@@ -164,15 +164,17 @@ if [[ ${#need_cmd[@]} -gt 0 ]]; then
 fi
 
 # wireguard-tools 是可选依赖：只有把出口总览页的「WARP 中转」拨开才用得上
-# （判据就是有没有 wg 这条命令，见 warpReady）。装不上不该让整次安装失败，
-# 但要说清失败的结果，否则用户到界面上才发现，只会当成程序的 bug。
+# （判据就是有没有 wg 这条命令，见 warpProbeDeps）。装不上不该让整次安装失败，
+# 但现在也不用它兜底了——拨开关时 fanout 自己会用包管理器补装（见 warpEnsureTools），
+# 这里顺手装上只是让人少等那几十秒。
 if ! command -v wg >/dev/null; then
   if [[ -n "$MGR" ]]; then
     echo "      WARP 中转要用 wireguard-tools，顺手装上（不开中转可以不管它）"
     install_pkgs "$MGR" wireguard-tools \
-      || echo "      wireguard-tools 没装上：中转开关会显示不可用，其它功能不受影响"
+      || echo "      wireguard-tools 没装上：拨开中转开关时程序会自己再试一次，其它功能不受影响"
   else
-    echo "      没有 wg：要用 WARP 中转请手动装 wireguard-tools（apt/apk install wireguard-tools）"
+    echo "      没有 wg：拨开 WARP 中转开关时程序会试着装；这台机器认不出包管理器，"
+    echo "      自动装大概率也会失败，届时请手动安装 wireguard-tools"
   fi
 fi
 

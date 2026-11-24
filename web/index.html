@@ -450,6 +450,10 @@ html[data-theme="dark"] select.inp{background-image:url("data:image/svg+xml;char
 .wbar .ss b{font-weight:600;color:var(--text-2)}
 .wbar .ss b.ok{color:var(--ok)}
 .wbar .ss b.warn{color:var(--warn)}
+/* 自动装依赖时把真正要跑的命令摊开：一句"会自动装"不如让人看见是哪几条 */
+.wbar .ss code{font-family:var(--mono);font-size:11px;color:var(--text-2);
+  background:var(--surface-2);border:1px solid var(--border);border-radius:var(--r-xs);
+  padding:1px 5px;word-break:break-all}
 .wbar .mm{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
 .wbar .ver{font-family:var(--mono);font-size:11px;color:var(--text-3);
   background:var(--surface-2);border:1px solid var(--border);border-radius:var(--r-xs);padding:2px 7px}

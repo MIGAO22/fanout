@@ -301,6 +301,75 @@ func warpBudget(base time.Duration, on bool) time.Duration {
 	return base + warpExtraBudget
 }
 
+// wireguardPkg 是给 `wg` 这条命令提供文件的包名。各家族的名字恰好一致
+// （RHEL 系它在 EPEL 里），所以不用按发行版改名。
+const wireguardPkg = "wireguard-tools"
+
+// wireguardInstallPlan 把发行版身份换成"该跑哪几条命令把 wg 装上"。
+//
+// 只装工具、不碰内核：设备是内核建的（ip link add type wireguard），
+// 内核真没有的话 netns 里那条命令的报错本来就写得很清楚，这里装什么都救不了。
+// 也只点这一个包，不顺手把机器上的包全升一遍——那会连带升内核、重启无关服务。
+func wireguardInstallPlan(osRelease string, have func(string) bool) ([][]string, string, error) {
+	switch family := distroFamily(parseOSRelease(osRelease)); family {
+	case "deb":
+		if !have("apt-get") {
+			return nil, "deb", fmt.Errorf("认出来是 Debian/Ubuntu 系，但机器上没有 apt-get，装不了 %s", wireguardPkg)
+		}
+		return [][]string{
+			{"apt-get", "update", "-qq"},
+			{"apt-get", "install", "-y", wireguardPkg},
+		}, "deb", nil
+	case "rpm":
+		// RHEL 8+ 只有 dnf，CentOS 7 那批只有 yum，参数一致
+		switch {
+		case have("dnf"):
+			return [][]string{{"dnf", "-y", "install", wireguardPkg}}, "rpm", nil
+		case have("yum"):
+			return [][]string{{"yum", "-y", "install", wireguardPkg}}, "rpm", nil
+		}
+		return nil, "rpm", fmt.Errorf("认出来是 RHEL/CentOS/Fedora 系，但机器上没有 dnf 或 yum，装不了 %s", wireguardPkg)
+	case "alpine":
+		if !have("apk") {
+			return nil, "alpine", fmt.Errorf("认出来是 Alpine，但机器上没有 apk，装不了 %s", wireguardPkg)
+		}
+		// busybox 的 apk 没有 --needed 那套，--no-cache 免得把索引留在磁盘上
+		return [][]string{{"apk", "add", "--no-cache", wireguardPkg}}, "alpine", nil
+	case "arch":
+		if !have("pacman") {
+			return nil, "arch", fmt.Errorf("认出来是 Arch 系，但机器上没有 pacman，装不了 %s", wireguardPkg)
+		}
+		return [][]string{{"pacman", "-Sy", "--noconfirm", "--needed", wireguardPkg}}, "arch", nil
+	case "suse":
+		if !have("zypper") {
+			return nil, "suse", fmt.Errorf("认出来是 openSUSE 系，但机器上没有 zypper，装不了 %s", wireguardPkg)
+		}
+		return [][]string{{"zypper", "--non-interactive", "install", "-y", wireguardPkg}}, "suse", nil
+	}
+	return nil, "", fmt.Errorf("认不出这台机器的发行版（%s 里没有已支持的 ID），装不了 %s：请手动安装后再拨开关",
+		osReleasePath, wireguardPkg)
+}
+
+// wireguardInstallHint 给"包管理器说它没有这个包"补一句下一步。
+//
+// 包管理器在这件事上的报错是没用的：Unable to find a match: wireguard-tools
+// 后面什么都不说，用户只能自己猜。而这里最常见的两种原因其实有固定解法。
+func wireguardInstallHint(family, out string) string {
+	s := strings.ToLower(out)
+	switch family {
+	case "rpm":
+		if strings.Contains(s, "unable to find a match") || strings.Contains(s, "no package") ||
+			strings.Contains(s, "nothing to do") {
+			return "RHEL/CentOS 系通常是没接 EPEL：先跑 dnf install epel-release（CentOS 7 用 yum）再拨开关"
+		}
+	case "deb":
+		if strings.Contains(s, "unable to locate package") || strings.Contains(s, "no installation candidate") {
+			return "多半是 apt 索引太旧：在服务器上跑一次 apt-get update 再拨开关"
+		}
+	}
+	return ""
+}
+
 // warpSetupInput 是配 WireGuard 需要知道的东西。
 type warpSetupInput struct {
 	Dev      string

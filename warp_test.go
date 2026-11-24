@@ -642,3 +642,139 @@ func TestWarpAccountEndpointIsIPOnly(t *testing.T) {
 		t.Errorf("端口非法：%d", acc.Port)
 	}
 }
+
+// haveAllTools 是什么命令都有的那台机器：装包计划只该看发行版身份，
+// 不该被"这台恰好没装 apt"影响。
+func haveAllTools(string) bool { return true }
+
+// 自动装依赖这件事现在写在程序里，所以计划本身要钉死：认错发行版就是在
+// 人家机器上跑错的包管理器，漏掉非交互参数就是让命令停在"Do you want to
+// continue? [Y/n]"上——界面表现为"装依赖中"卡死，而没人看得见那个提问。
+func TestWireguardInstallPlanPerDistro(t *testing.T) {
+	cases := []struct {
+		name, osRel, family, last string
+		have                      func(string) bool
+	}{
+		{"debian", "ID=debian\n", "deb", "apt-get install -y wireguard-tools", haveAllTools},
+		{"ubuntu", "ID=ubuntu\nID_LIKE=debian\n", "deb", "apt-get install -y wireguard-tools", haveAllTools},
+		// CentOS 7 只有 yum：计划里 dnf 排在前面是对的（RHEL 8+ 没 yum 了），
+		// 所以这条要按"机器上真只有 yum"来测。
+		{"centos7", "ID=centos\nID_LIKE=\"rhel centos fedora\"\n", "rpm", "yum -y install wireguard-tools",
+			func(n string) bool { return n == "yum" }},
+		{"rocky", "ID=rocky\nID_LIKE=\"rhel centos fedora\"\n", "rpm", "dnf -y install wireguard-tools", haveAllTools},
+		{"alpine", "ID=alpine\n", "alpine", "apk add --no-cache wireguard-tools", haveAllTools},
+		{"arch", "ID=arch\n", "arch", "pacman -Sy --noconfirm --needed wireguard-tools", haveAllTools},
+		{"suse", "ID=opensuse-leap\n", "suse", "zypper --non-interactive install -y wireguard-tools", haveAllTools},
+	}
+	for _, c := range cases {
+		steps, family, err := wireguardInstallPlan(c.osRel, c.have)
+		if err != nil {
+			t.Errorf("%s: %v", c.name, err)
+			continue
+		}
+		if family != c.family {
+			t.Errorf("%s: 家族认成 %q，想要 %q", c.name, family, c.family)
+		}
+		if len(steps) == 0 {
+			t.Errorf("%s: 一条命令都没有", c.name)
+			continue
+		}
+		last := strings.Join(steps[len(steps)-1], " ")
+		if last != c.last {
+			t.Errorf("%s: 装包那条是 %q，想要 %q", c.name, last, c.last)
+		}
+	}
+}
+
+// 只点 wireguard-tools 这一个包：顺手把机器上的包全升一遍会连带升内核、
+// 重启无关服务，那不是"拨开一个开关"该做的事。
+func TestWireguardInstallPlanDoesNotUpgradeEverything(t *testing.T) {
+	for _, osRel := range []string{"ID=debian\n", "ID=fedora\n", "ID=arch\n", "ID=alpine\n"} {
+		steps, _, err := wireguardInstallPlan(osRel, haveAllTools)
+		if err != nil {
+			t.Fatalf("%s: %v", osRel, err)
+		}
+		for _, argv := range steps {
+			joined := strings.Join(argv, " ")
+			if strings.Contains(joined, " upgrade ") || strings.Contains(joined, " full-upgrade") ||
+				strings.HasSuffix(joined, " update") || strings.HasSuffix(joined, " -Sy") {
+				t.Errorf("%s: 这条不像只装一个包：%q", osRel, joined)
+			}
+		}
+	}
+}
+
+// 认得出发行版却没有对应的包管理器：报错要点名是哪一半缺，
+// 不能让人以为 wg 命令本身坏了。
+func TestWireguardInstallPlanMissingPkgManager(t *testing.T) {
+	only := func(n string) bool { return n == "curl" }
+	steps, family, err := wireguardInstallPlan("ID=debian\n", only)
+	if err == nil {
+		t.Fatal("没有 apt-get 却给出了装包计划")
+	}
+	if steps != nil {
+		t.Errorf("失败时还返回了命令：%v", steps)
+	}
+	if family != "deb" {
+		t.Errorf("家族应为 deb，得到 %q", family)
+	}
+	if !strings.Contains(err.Error(), "apt-get") || !strings.Contains(err.Error(), wireguardPkg) {
+		t.Errorf("报错没说要装什么、缺什么：%q", err)
+	}
+}
+
+// 认不出的发行版（OpenWrt 这类）要指回手动安装：这里最坏的表现是
+// 界面说"会自动装"，而程序其实不知道该跑什么。
+func TestWireguardInstallPlanUnknownDistro(t *testing.T) {
+	steps, family, err := wireguardInstallPlan("ID=openwrt\nNAME=\"OpenWrt\"\n", haveAllTools)
+	if err == nil {
+		t.Fatal("OpenWrt 不该被当成能自动装")
+	}
+	if family != "" || steps != nil {
+		t.Errorf("认不出时不该给出家族或命令：%q %v", family, steps)
+	}
+	if !strings.Contains(err.Error(), "手动安装") {
+		t.Errorf("报错该留一句手动方案：%q", err)
+	}
+}
+
+// 包管理器说"没有这个包"时那句报错是没用的：得补上最常见的下一步。
+func TestWireguardInstallHint(t *testing.T) {
+	cases := []struct {
+		family, out, want string
+		deny              string
+	}{
+		{"rpm", "Error: Unable to find a match: wireguard-tools", "epel", "apt-get"},
+		{"deb", "E: Unable to locate package wireguard-tools", "apt-get update", "epel"},
+		{"deb", "E: Package 'wireguard-tools' has no installation candidate", "apt-get update", ""},
+		// 真故障不该被翻成"你去接个源"：那会让人把时间花在没坏的地方。
+		{"deb", "dpkg: error processing archive /var/cache/apt/archives/x.deb", "", ""},
+		{"rpm", "Segmentation fault (core dumped)", "", ""},
+	}
+	for _, c := range cases {
+		got := wireguardInstallHint(c.family, c.out)
+		if c.want != "" && !strings.Contains(strings.ToLower(got), c.want) {
+			t.Errorf("%s/%q 该提示 %q，得到 %q", c.family, c.out, c.want, got)
+		}
+		if c.want == "" && got != "" {
+			t.Errorf("%s/%q 不该提示什么，得到 %q", c.family, c.out, got)
+		}
+		if c.deny != "" && strings.Contains(got, c.deny) {
+			t.Errorf("%s/%q 不该提到 %q：%q", c.family, c.out, c.deny, got)
+		}
+	}
+}
+
+// 包名各家族一致，所以计划里出现的包名必须是同一个常量：
+// 写花一个字母，表现是"装完了却还是找不到 wg"，而那句话看着像程序的 bug。
+func TestWireguardPlanUsesTheSamePackageName(t *testing.T) {
+	for _, osRel := range []string{"ID=debian\n", "ID=fedora\n", "ID=alpine\n"} {
+		steps, _, err := wireguardInstallPlan(osRel, haveAllTools)
+		if err != nil {
+			t.Fatalf("%s: %v", osRel, err)
+		}
+		if !strings.Contains(strings.Join(steps[len(steps)-1], " "), wireguardPkg) {
+			t.Errorf("%s: 最后一条没装 %q：%v", osRel, wireguardPkg, steps)
+		}
+	}
+}

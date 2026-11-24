@@ -165,16 +165,19 @@ type ClientBinStatus struct {
 	// 可以替换。所以这里给的是"上报给 Cloudflare 的客户端版本"和最新稳定号，
 	// 按钮做的是按最新号重新注册（换密钥、换接入），而不是升级程序。
 	// 把这件事写成"升级 WARP"是骗人的，字段和文案都得照真实动作来。
-	WarpEnabled  bool   `json:"warp_enabled"` // 中转开关
-	WarpReady    bool   `json:"warp_ready"`   // 有条件跑（有 wg 命令、记录可写）
-	WarpWhy      string `json:"warp_reason,omitempty"`
-	WarpVersion  string `json:"warp_version,omitempty"` // 当前上报的版本号
-	WarpLatest   string `json:"warp_latest,omitempty"`  // 官方 apt 源的最新稳定号
-	WarpUpdate   bool   `json:"warp_has_update"`        // 上报号比官方号旧
-	WarpCount    int    `json:"warp_count"`             // 已注册的出口数
-	WarpStale    int    `json:"warp_stale"`             // 其中按旧号注册的
-	WarpCanApply bool   `json:"warp_can_apply,omitempty"`
-	WarpCheckErr string `json:"warp_check_error,omitempty"` // 问官方源失败，不影响其它字段
+	WarpEnabled bool   `json:"warp_enabled"` // 中转开关
+	WarpReady   bool   `json:"warp_ready"`   // 有条件跑（wg 在，或装得上）
+	WarpWhy     string `json:"warp_reason,omitempty"`
+	// WarpNeedTools：wg 还不在，开启中转时第一步会把它装上。
+	WarpNeedTools bool   `json:"warp_need_tools"`
+	WarpPkgCmd    string `json:"warp_pkg_cmd,omitempty"`
+	WarpVersion   string `json:"warp_version,omitempty"` // 当前上报的版本号
+	WarpLatest    string `json:"warp_latest,omitempty"`  // 官方 apt 源的最新稳定号
+	WarpUpdate    bool   `json:"warp_has_update"`        // 上报号比官方号旧
+	WarpCount     int    `json:"warp_count"`             // 已注册的出口数
+	WarpStale     int    `json:"warp_stale"`             // 其中按旧号注册的
+	WarpCanApply  bool   `json:"warp_can_apply,omitempty"`
+	WarpCheckErr  string `json:"warp_check_error,omitempty"` // 问官方源失败，不影响其它字段
 }
 
 // xrayAssetForArch 把 GOARCH 换成 Xray-core release 的资产名。
@@ -302,7 +305,9 @@ func clientBinStatus(askLatest bool) *ClientBinStatus {
 		st.Reason = why
 	}
 	st.WarpEnabled, st.WarpVersion = warpOn(), warpReportVersion()
-	st.WarpReady, st.WarpWhy = warpReady()
+	wp := warpProbeDeps()
+	st.WarpReady, st.WarpWhy = wp.Ready, wp.Reason
+	st.WarpNeedTools, st.WarpPkgCmd = wp.Steps != nil, wp.Cmd
 	if warpSvc != nil {
 		for _, a := range warpSvc.all() {
 			st.WarpCount++
@@ -912,9 +917,29 @@ func describeSteps(steps [][]string) string {
 // 必须在母机命名空间里跑：请求线程有可能已经被某条隧道的 dialer 带进 netns，
 // 在那里面刷镜像源会走 VPN，甚至直接不通（见 netnsguard.go）。
 func runUpgradeSteps(steps [][]string) error {
+	return runUpgradeStepsWithin(steps, 0)
+}
+
+// runUpgradeStepsWithin 是 runUpgradeSteps 带总时限的版本。
+//
+// budget 为 0 时每条命令各按 runPackageCmd 的 10 分钟算（升级 openvpn 那种
+// 没人盯着进度的场景）；非 0 时所有命令共用这段时间——拨 WARP 开关的人是在
+// 等一个结果，"每条各 10 分钟"合起来就不是他能等的时间了。
+func runUpgradeStepsWithin(steps [][]string, budget time.Duration) error {
 	return inMainNetns(func() error {
+		deadline := time.Time{}
+		if budget > 0 {
+			deadline = time.Now().Add(budget)
+		}
 		for _, argv := range steps {
-			out, err := runPackageCmd(argv)
+			left := budget
+			if budget > 0 {
+				left = time.Until(deadline)
+				if left <= 0 {
+					return fmt.Errorf("%s 没跑：装包总时限 %v 用完了", strings.Join(argv, " "), budget)
+				}
+			}
+			out, err := runPackageCmdWithin(argv, left)
 			if err != nil {
 				return fmt.Errorf("%s 失败: %v\n%s", strings.Join(argv, " "), err, tailLines(out, 8))
 			}
@@ -926,10 +951,17 @@ func runUpgradeSteps(steps [][]string) error {
 // runPackageCmd 跑一条包管理器命令。非交互环境变量是关键：Ubuntu 的
 // needrestart 和 dpkg 在无人值守时提问，答案没人给，命令会一直挂到超时。
 func runPackageCmd(argv []string) (string, error) {
+	return runPackageCmdWithin(argv, 0)
+}
+
+func runPackageCmdWithin(argv []string, budget time.Duration) (string, error) {
 	if len(argv) == 0 {
 		return "", fmt.Errorf("空命令")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	if budget <= 0 {
+		budget = 10 * time.Minute
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), budget)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
 	cmd.Env = append(os.Environ(),

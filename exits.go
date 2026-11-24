@@ -44,12 +44,16 @@ type Exit struct {
 // WarpOverview 是中转开关本身的状态，显示在出口总览的头部。
 type WarpOverview struct {
 	Enabled bool   `json:"enabled"`
-	Ready   bool   `json:"ready"`   // 这台机器有没有条件跑中转
-	Reason  string `json:"reason"`  // 没条件时的原话，界面直接印出来
-	Version string `json:"version"` // 注册时上报给 Cloudflare 的客户端版本
-	Count   int    `json:"count"`   // 已注册的 WARP 账号数
-	Live    int    `json:"live"`    // 其中此刻握手新鲜的出口数
-	Stale   int    `json:"stale"`   // 按旧客户端版本注册的账号数，非 0 说明"更新"没做完
+	Ready   bool   `json:"ready"`  // 这台机器有没有条件跑中转
+	Reason  string `json:"reason"` // 没条件时的原话，界面直接印出来
+	// NeedTools 说清"Ready 是怎么来的"：wg 还没装，但包管理器认得出来，
+	// 拨开开关时第一步就把它装上。界面据此把"不可用"换成一句会动手的说明。
+	NeedTools bool   `json:"need_tools"`
+	PkgCmd    string `json:"pkg_cmd"` // 将执行的那几条装包命令，摊开给用户看
+	Version   string `json:"version"` // 注册时上报给 Cloudflare 的客户端版本
+	Count     int    `json:"count"`   // 已注册的 WARP 账号数
+	Live      int    `json:"live"`    // 其中此刻握手新鲜的出口数
+	Stale     int    `json:"stale"`   // 按旧客户端版本注册的账号数，非 0 说明"更新"没做完
 }
 
 // PoolMemberView 是组内一条出口的界面视图。

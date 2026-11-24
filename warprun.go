@@ -337,20 +337,103 @@ func warpLatestVersion() (string, error) {
 	return "", lastErr
 }
 
-// warpReady 判断这台机器有没有条件跑 WARP。
+// warpDeps 是"这台机器现在离能跑 WARP 还差什么"的完整答案。
+type warpDeps struct {
+	Ready  bool       // 现在能跑，或者点一下开关就能跑起来
+	Reason string     // 完全跑不了时的原话，界面直接印
+	Steps  [][]string // 还缺 wireguard-tools 时要跑的装包命令；nil 表示不缺
+	Cmd    string     // Steps 的人话形式，界面把"将执行什么命令"摊开给用户看
+}
+
+// warpProbeDeps 查中转的前置条件。
 //
-// 只查 wireguard-tools：`ip link add type wireguard` 能不能成取决于内核带没带
-// 那个模块，而单独探测模块要么碰 modprobe 要么在母机上建个真设备，
-// 代价比收益大——真不行的话建设备那条命令的报错本来就写得很清楚。
-func warpReady() (bool, string) {
-	switch {
-	case warpSvc == nil:
-		return false, "WARP 注册记录还没就绪（工作目录不可写？）"
-	case !hasCmd("wg"):
-		return false, "本机没有 wireguard-tools，装一个再来：apt install wireguard-tools（Alpine 是 apk add wireguard-tools）"
-	default:
-		return true, ""
+// 缺 wireguard-tools 不再算"这台机器跑不了"：装了 fanout 就有责任把它要用的
+// 东西配上，让人自己 SSH 上去 apt install 是半成品。所以只要包管理器认得出来，
+// 这里就报 Ready，把 Steps 交出去，由开启流程的第一步把它装上。
+//
+// 不探测内核模块：ip link add type wireguard 能不能成，单独探测要么碰 modprobe
+// 要么在母机上建个真设备，代价比收益大——真不行的话建设备那条命令的报错写得很清楚。
+func warpProbeDeps() warpDeps {
+	if warpSvc == nil {
+		return warpDeps{Reason: "WARP 注册记录还没就绪（工作目录不可写？）"}
 	}
+	if hasCmd("wg") {
+		return warpDeps{Ready: true}
+	}
+	steps, _, err := wireguardInstallPlan(readWarpOSRelease(), hasCmd)
+	if err != nil {
+		return warpDeps{Reason: fmt.Sprintf("%s：本机没有 wg 命令，%v", wireguardPkg, err)}
+	}
+	return warpDeps{Ready: true, Steps: steps, Cmd: describeSteps(steps)}
+}
+
+// readWarpOSRelease 读发行版身份。读不到时返回空串，
+// wireguardInstallPlan 会把它归成"认不出这台机器"，那条路是有意的。
+func readWarpOSRelease() string {
+	blob, err := os.ReadFile(osReleasePath)
+	if err != nil {
+		return ""
+	}
+	return string(blob)
+}
+
+const (
+	// warpInstallWait 是"翻开开关"那条路上装包的时限：用户在界面前台等，
+	// 但作业进度在跑，给足到能让一次慢镜像源走完。
+	warpInstallWait = 5 * time.Minute
+	// warpInstallQuick 是建出口时顺手补装的时限。这里不能久等：
+	// 出口卡在 starting 不动，用户看不出是在装包还是节点坏了。
+	warpInstallQuick = 90 * time.Second
+	// warpInstallCooloff 是装失败后的冷却。源不通时每条出口的每次重连
+	// 都去撞一遍 apt，会把整台机器拖成一片红，而多撞几次并不会好。
+	warpInstallCooloff = 3 * time.Minute
+)
+
+var (
+	warpToolsMu    sync.Mutex
+	warpToolsTried time.Time
+	warpToolsWhy   error
+)
+
+// warpEnsureTools 缺 wg 时把 wireguard-tools 装上，装上之后才算成。
+//
+// 三个入口共用：开启中转时作业里的第一步、按新版本重新注册时同样的第一步、
+// 以及建出口之前的顺手补装（机器重启、或者有人把包卸了，开关还开着，
+// 只能在那里补）。装完不重启服务——wg 是每条命令现找的可执行文件。
+//
+// 同一时刻只装一次，失败后冷却一段时间再试。和 openvpn 的升级共用那把锁：
+// dpkg 锁只有一把，两个 apt-get 同时跑只会互相撞死。
+func warpEnsureTools(budget time.Duration) error {
+	if hasCmd("wg") {
+		return nil
+	}
+	warpToolsMu.Lock()
+	defer warpToolsMu.Unlock()
+	if hasCmd("wg") { // 等锁期间别人可能刚装完
+		return nil
+	}
+	if time.Now().Before(warpToolsTried.Add(warpInstallCooloff)) {
+		return warpToolsWhy
+	}
+	warpToolsTried = time.Now()
+	steps, family, err := wireguardInstallPlan(readWarpOSRelease(), hasCmd)
+	if err == nil {
+		openvpnApplyMu.Lock()
+		err = runUpgradeStepsWithin(steps, budget)
+		openvpnApplyMu.Unlock()
+		if err == nil && !hasCmd("wg") {
+			err = fmt.Errorf("%s 说装完了，却还是找不到 wg 命令", family)
+		}
+		if err != nil {
+			if h := wireguardInstallHint(family, err.Error()); h != "" {
+				err = fmt.Errorf("%v\n%s", err, h)
+			}
+		} else {
+			log.Printf("fanout: WARP 中转需要 %s，已用包管理器装好", wireguardPkg)
+		}
+	}
+	warpToolsWhy = err
+	return err
 }
 
 // warpForTunnel 在拉起 openvpn 之前把 WARP 架进这条出口的 netns。
@@ -363,6 +446,12 @@ func warpForTunnel(t *Tunnel) (*WarpAccount, error) {
 		// 开关是开的却拿不到注册记录，这时候把出口按直连拉起来最坏：
 		// 界面显示"中转已开启"，实际一条流量都没进 Cloudflare。宁可连不上。
 		return nil, fmt.Errorf("WARP 注册记录没能加载（工作目录不可写？），中转开着时不建出口")
+	}
+	// 开关开着、包却被卸了（或这台机器只跑过 f 更新、从没重装过依赖）：在这里补一次。
+	// 不补的话每条出口都会以 "exec: wg: file not found" 失败，
+	// 而那句话在界面上看起来就像 fanout 自己的 bug。
+	if err := warpEnsureTools(warpInstallQuick); err != nil {
+		return nil, fmt.Errorf("WARP 中转需要 %s，装它没成功: %w", wireguardPkg, err)
 	}
 	acc, err := warpSvc.ensure(t.Slot, warpReportVersion())
 	if err != nil {
@@ -569,60 +658,100 @@ func warpSet(m *Manager, on bool) (*Job, error) {
 		}
 		return nil, fmt.Errorf("中转已经是关闭状态")
 	}
-	list := m.Tunnels()
-	if on {
-		if ok, why := warpReady(); !ok {
-			return nil, fmt.Errorf("%s", why)
-		}
-		// 先把第一个账号注册出来再动开关：注册不通（没装 wireguard-tools、
-		// 内核不带模块、Cloudflare 够不着）时直接拒绝，开关保持原样。
-		// 翻开了才发现中转架不起来，等于把所有出口一起推进黑洞。
-		if len(list) > 0 {
-			if _, err := warpSvc.ensure(list[0].Slot, warpReportVersion()); err != nil {
-				return nil, err
-			}
-		}
+	d := warpProbeDeps()
+	if !d.Ready {
+		return nil, fmt.Errorf("%s", d.Reason)
 	}
+	// 装包只在开启时要做：关闭只是拆设备、退注册，用不上 wg。
+	needTools := on && d.Steps != nil
+	list := m.Tunnels()
+	// 注册预检得排在装工具之后、动任何一条出口之前，所以只能跟着进作业里。
+	// 开关先翻上去、预检没过再退回原样，为的是让失败有地方看：
+	// 一句 409 的原话在界面上闪一下就没了，作业里那一步红着一直在。
+	preflight := on && len(list) > 0
 	if err := setWarp(WarpSettings{Enabled: on, ClientVersion: cur.ClientVersion}); err != nil {
 		return nil, err
 	}
 
-	labels := make([]string, 0, len(list))
+	labels := make([]string, 0, len(list)+2)
+	if needTools {
+		labels = append(labels, "装 "+wireguardPkg)
+	}
+	if preflight {
+		labels = append(labels, "注册第一条出口的 WARP 账号")
+	}
 	for _, t := range list {
 		labels = append(labels, fmt.Sprintf("出口 %d · %s", t.Slot, t.host()))
 	}
 	if len(labels) == 0 {
-		return nil, nil // 没有出口要重连，开关已经改完
+		return nil, nil // 没出口要重连、也没东西要装，开关已经改完
 	}
 	verb := "关闭"
 	if on {
 		verb = "开启"
 	}
-	job := m.jobs.New(verb+" WARP 中转（"+strconv.Itoa(len(labels))+" 条出口逐条重连）", labels)
+	sum := verb + " WARP 中转"
+	switch {
+	case len(list) > 0:
+		sum += "（" + strconv.Itoa(len(list)) + " 条出口逐条重连）"
+	case needTools:
+		sum += "（先装 " + wireguardPkg + "）"
+	}
+	job := m.jobs.New(sum, labels)
 	timeout := warpSettle(on)
+	revert := func(why string) {
+		if err := setWarp(WarpSettings{Enabled: cur.Enabled, ClientVersion: cur.ClientVersion}); err != nil {
+			log.Printf("fanout: 回滚 WARP 开关失败: %v", err)
+		}
+		log.Printf("fanout: WARP 中转没能开启：%s", why)
+	}
 
 	go func() {
+		at := 0
+		if needTools {
+			job.Set(at, "running", "正在用包管理器装 "+wireguardPkg)
+			if err := warpEnsureTools(warpInstallWait); err != nil {
+				job.Set(at, "failed", err.Error())
+				revert(err.Error())
+				job.Finish()
+				return
+			}
+			job.Set(at, "ok", "wg 已就位")
+			at++
+		}
+		if preflight {
+			i := at
+			job.Set(i, "running", "正在向 Cloudflare 注册")
+			// 注册不通（够不着 Cloudflare、被判定滥用）时一条出口都别动，
+			// 开关退回原样。翻开了才发现中转架不起来，等于把所有出口推进黑洞。
+			if _, err := warpSvc.ensure(list[0].Slot, warpReportVersion()); err != nil {
+				job.Set(i, "failed", err.Error())
+				revert(err.Error())
+				job.Finish()
+				return
+			}
+			job.Set(i, "ok", "接入点已拿到")
+			at++
+		}
 		failed := 0
 		for i, t := range list {
-			job.Set(i, "running", "正在重连")
+			job.Set(at+i, "running", "正在重连")
 			m.reconnect(t, t.host())
 			if ok, why := warpWait(t, timeout); ok {
-				job.Set(i, "ok", "出口 IP "+t.exitIP())
+				job.Set(at+i, "ok", "出口 IP "+t.exitIP())
 			} else {
 				failed++
-				job.Set(i, "failed", why)
+				job.Set(at+i, "failed", why)
 			}
 		}
 		if !on {
 			// 关到底把注册一起退掉：留着就是 Cloudflare 那边一堆没人用的设备。
 			warpSvc.dropAll()
 		}
-		if failed == len(list) && on {
+		if on && len(list) > 0 && failed == len(list) {
 			// 全都回不来，说明这台机器现在跑不了中转。把开关原样退回，
 			// 比留着一堆"显示已连通、其实一步都走不出去"的出口好。
-			if err := setWarp(WarpSettings{Enabled: false, ClientVersion: cur.ClientVersion}); err != nil {
-				log.Printf("fanout: 回滚 WARP 开关失败: %v", err)
-			}
+			revert("所有出口都没能连上")
 		}
 		job.Finish()
 		log.Printf("fanout: WARP 中转已%s，%d 条出口中有 %d 条没连上", verb, len(list), failed)
@@ -637,37 +766,55 @@ func warpSet(m *Manager, on bool) (*Job, error) {
 // 机器上也没有属于 fanout 的 WARP 二进制可以替换——把这件事写成"升级客户端"
 // 是骗人的，按钮和说明都得照这个说法来。
 func warpReregister(m *Manager) (*Job, error) {
-	if ok, why := warpReady(); !ok {
-		return nil, fmt.Errorf("%s", why)
+	d := warpProbeDeps()
+	if !d.Ready {
+		return nil, fmt.Errorf("%s", d.Reason)
 	}
 	if !warpOn() {
 		return nil, fmt.Errorf("中转还没打开，开了才谈得上重新注册")
 	}
 	list := m.Tunnels()
-	labels := make([]string, 0, len(list))
+	if len(list) == 0 {
+		return nil, fmt.Errorf("现在没有出口，没有可重新注册的线路")
+	}
+	// 开关开着却缺 wg（只跑过 f 更新的机器就这样）：先把它装上，
+	// 否则下面每条出口都会以 "exec: wg: file not found" 红一遍。
+	needTools := d.Steps != nil
+	labels := make([]string, 0, len(list)+1)
+	if needTools {
+		labels = append(labels, "装 "+wireguardPkg)
+	}
 	for _, t := range list {
 		labels = append(labels, fmt.Sprintf("出口 %d · %s", t.Slot, t.host()))
 	}
-	if len(labels) == 0 {
-		return nil, fmt.Errorf("现在没有出口，没有可重新注册的线路")
-	}
-	job := m.jobs.New("按最新客户端版本重新注册 WARP（"+strconv.Itoa(len(labels))+" 条出口）", labels)
+	job := m.jobs.New("按最新客户端版本重新注册 WARP（"+strconv.Itoa(len(list))+" 条出口）", labels)
 	timeout := warpSettle(true)
 
 	go func() {
+		at := 0
+		if needTools {
+			job.Set(at, "running", "正在用包管理器装 "+wireguardPkg)
+			if err := warpEnsureTools(warpInstallWait); err != nil {
+				job.Set(at, "failed", err.Error())
+				job.Finish()
+				return
+			}
+			job.Set(at, "ok", "wg 已就位")
+			at++
+		}
 		for i, t := range list {
-			job.Set(i, "running", "正在重新注册")
+			job.Set(at+i, "running", "正在重新注册")
 			warpSvc.drop(t.Slot)
 			acc, err := warpSvc.ensure(t.Slot, warpReportVersion())
 			if err != nil {
-				job.Set(i, "failed", err.Error())
+				job.Set(at+i, "failed", err.Error())
 				continue
 			}
 			m.reconnect(t, t.host())
 			if ok, why := warpWait(t, timeout); ok {
-				job.Set(i, "ok", "Cloudflare 接入 "+acc.Endpoint)
+				job.Set(at+i, "ok", "Cloudflare 接入 "+acc.Endpoint)
 			} else {
-				job.Set(i, "failed", why)
+				job.Set(at+i, "failed", why)
 			}
 		}
 		job.Finish()
@@ -678,11 +825,9 @@ func warpReregister(m *Manager) (*Job, error) {
 // warpOverview 是主界面那个开关旁边要说的全部话。
 func warpOverview() WarpOverview {
 	v := WarpOverview{Enabled: warpOn(), Version: warpReportVersion()}
-	if ok, why := warpReady(); ok {
-		v.Ready = true
-	} else {
-		v.Reason = why
-	}
+	d := warpProbeDeps()
+	v.Ready, v.Reason = d.Ready, d.Reason
+	v.NeedTools, v.PkgCmd = d.Steps != nil, d.Cmd
 	if warpSvc != nil {
 		want := warpReportVersion()
 		for _, a := range warpSvc.all() {

@@ -117,6 +117,9 @@ function agoFrom(iso){
   return relTime(iso);
 }
 function num(v){ const n = Number(v); return isFinite(n) ? n : 0; }
+// 后端的 describeSteps 用 " && " 把几条命令串起来。界面只报最后那条真正装包的：
+// 把 apt-get update -qq 也带上，320 宽上这一行要占十一行，而它不是有用的信息。
+function lastStep(cmd){ const p = String(cmd || '').split(' && '); return p[p.length - 1] || ''; }
 
 /* ───────────── 状态 ───────────── */
 
@@ -530,8 +533,14 @@ function renderWarpBar(){
   sw.checked = !!w.enabled;
   sw.disabled = !w.ready || warpBusy();
   const badge = $('#wbarBadge');
-  badge.className = 'badge ' + (!w.ready ? 'bad' : w.enabled ? 'ok' : 'idle');
-  badge.textContent = !w.ready ? '不可用' : w.enabled ? '已开启' : '未开启';
+  // 缺 wireguard-tools 时开关照样能拨——后端会把它装上。这时候标"未开启"
+  // 而不是"不可用"：说不可用是在让人去找终端，而这里没有需要他做的事。
+  // 已经开着却还没装好，才需要单独一个状态，否则那几十秒看着像开关没生效。
+  const st = !w.ready ? ['bad', '不可用']
+    : w.need_tools ? (w.enabled ? ['warn', '装依赖中'] : ['idle', '未开启'])
+    : w.enabled ? ['ok', '已开启'] : ['idle', '未开启'];
+  badge.className = 'badge ' + st[0];
+  badge.textContent = st[1];
   $('#wbarVer').hidden = !w.version;
   $('#wbarVer').textContent = w.version || '';
   $('#wbarSub').innerHTML = warpSub(w);
@@ -539,6 +548,14 @@ function renderWarpBar(){
 
 function warpSub(w){
   if(!w.ready) return esc(w.reason || '这台机器跑不了中转');
+  if(w.need_tools){
+    // 只报真正装包那一条：apt-get update -qq 是它的铺垫，写全了在 320 宽上
+    // 要占十一行，而这一行下面还有开关和出口卡片。
+    const cmd = '<code>' + esc(lastStep(w.pkg_cmd)) + '</code>';
+    return w.enabled
+      ? '正在装 wireguard-tools：' + cmd
+      : '拨开开关会自动装 wireguard-tools：' + cmd;
+  }
   if(!w.enabled) return '关闭时出口直接从节点走。开启后每条出口先经 Cloudflare WARP 再到节点，'
     + '出口 IP 仍由节点决定。';
   const cls = !w.count ? '' : w.live >= w.count ? 'ok' : 'warn';
@@ -559,13 +576,17 @@ $('#wbarSw').onchange = async e => {
   const sw = e.currentTarget;
   const on = sw.checked;
   const n = (view.exits || []).length;
+  const w = view.warp || {};
   const tail = n
     ? '\n\n现有 ' + n + ' 条出口会逐条断开重连（一条一条来，不会同时抢节点），'
       + '出口 IP 还是节点的，只是中间多绕一层 Cloudflare。'
     : '\n\n现在没有出口，开关只对之后新建的出口生效。';
-  if(!confirm('开启 WARP 中转？' + tail
-      + (on ? '\n前提是本机装了 wireguard-tools，并且够得着 Cloudflare 的注册接口。'
-            : '\n关闭会把 fanout 名下的 WARP 注册一并退掉。'))) {
+  // 缺依赖时别再说"请先装"：这一步是 fanout 自己做的，说清楚要等多久就行。
+  const pre = !on ? '\n\n关闭会把 fanout 名下的 WARP 注册一并退掉。'
+    : w.need_tools ? '\n\n本机还没有 wireguard-tools，第一步会用包管理器装上（'
+        + w.pkg_cmd + '），源不慢的话几十秒。'
+    : '\n\n前提是本机够得着 Cloudflare 的注册接口。';
+  if(!confirm((on ? '开启' : '关闭') + ' WARP 中转？' + tail + pre)) {
     sw.checked = !on;
     return;
   }
@@ -1968,6 +1989,8 @@ function paintWarpBin(c, checked){
   apply.hidden = !canApply;
   const lines = [];
   if(!c.warp_ready && c.warp_reason) lines.push(c.warp_reason);
+  else if(c.warp_need_tools)
+    lines.push('本机还没有 wireguard-tools，开启中转时会自动装：' + lastStep(c.warp_pkg_cmd) + '。');
   if(!c.warp_enabled) lines.push('中转未开启：这个号只在中转打开后用于注册。');
   else if(checked && c.warp_stale > 0)
     lines.push('有 ' + c.warp_stale + ' 条出口还按旧版本号注册着。');
