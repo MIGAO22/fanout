@@ -279,7 +279,7 @@ func (m *Manager) bringUpPersist(t *Tunnel, notify bool, persist bool) {
 			if persist {
 				return
 			}
-			t.setStatus("failed", oneLine(lastErr, 300))
+			t.setStatus("failed", oneLine(lastErr, 500))
 			if serr := m.saveState(); serr != nil {
 				log.Printf("保存状态失败: %v", serr)
 			}
@@ -290,7 +290,7 @@ func (m *Manager) bringUpPersist(t *Tunnel, notify bool, persist bool) {
 		// 下一轮别再拿它打头，否则会反复在同一批死节点上空转。
 		prefer = false
 		t.setStatus("starting", fmt.Sprintf("暂无可用节点，%.0f 秒后重试（%s）",
-			backoff.Seconds(), oneLine(lastErr, 160)))
+			backoff.Seconds(), oneLine(lastErr, 320)))
 		log.Printf("隧道 %d 一轮候选均失败，%.0f 秒后刷新节点重试", t.Slot, backoff.Seconds())
 		time.Sleep(backoff)
 		if !m.tunnelActive(t) {

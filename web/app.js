@@ -540,6 +540,7 @@ function renderWarpBar(){
   // 而不是"不可用"：说不可用是在让人去找终端，而这里没有需要他做的事。
   // 已经开着却还没装好，才需要单独一个状态，否则那几十秒看着像开关没生效。
   const st = !w.ready ? ['bad', '不可用']
+    : w.last_err && !w.enabled ? ['warn', '上次没开成']
     : w.need_tools ? (w.enabled ? ['warn', '装依赖中'] : ['idle', '未开启'])
     : w.enabled ? ['ok', '已开启'] : ['idle', '未开启'];
   badge.className = 'badge ' + st[0];
@@ -551,15 +552,19 @@ function renderWarpBar(){
 
 function warpSub(w){
   if(!w.ready) return esc(w.reason || '这台机器跑不了中转');
+  // 开关还关着、上次却没开成：这句比任何解释都该先看。作业里的失败几分钟后就淡出，
+  // 而没解决的事必须挂在人每次都会扫一眼的地方，否则下一轮描述又只剩"连不上节点"。
+  const fail = w.last_err && !w.enabled
+    ? '<b class="warn">上次没开成：' + esc(w.last_err) + '</b>　' : '';
   if(w.need_tools){
     // 只报真正装包那一条：apt-get update -qq 是它的铺垫，写全了在 320 宽上
     // 要占十一行，而这一行下面还有开关和出口卡片。
     const cmd = '<code>' + esc(lastStep(w.pkg_cmd)) + '</code>';
-    return w.enabled
+    return fail + (w.enabled
       ? '正在装 wireguard-tools：' + cmd
-      : '拨开开关会自动装 wireguard-tools：' + cmd;
+      : '拨开开关会自动装 wireguard-tools：' + cmd);
   }
-  if(!w.enabled) return '关闭时出口直接从节点走。开启后每条出口先经 Cloudflare WARP 再到节点，'
+  if(!w.enabled) return fail + '关闭时出口直接从节点走。开启后每条出口先经 Cloudflare WARP 再到节点，'
     + '出口 IP 仍由节点决定。';
   const cls = !w.count ? '' : w.live >= w.count ? 'ok' : 'warn';
   let s = '已注册 <b>' + num(w.count) + '</b> 条 · 已握手 <b class="' + cls + '">'

@@ -320,6 +320,71 @@ func TestWarpSetupKeepsNonIPDirectOutOfRoutes(t *testing.T) {
 	}
 }
 
+// 自检那套命令的底线：它必须只"试配置"，不改变任何流量的走向；名字要短到能
+// 在母机上认出来；而且必须留下收尾那条删除——自检失败时最容易漏的就是清理。
+func TestWarpProbeCommandsTouchNothingButTheDevice(t *testing.T) {
+	setup, cleanup := warpProbeCmds("/var/lib/fanout/fow1.wgkey", warpPeerPub, "162.159.193.2", 2408, 1420)
+	if len(setup) != 2 {
+		t.Fatalf("自检只该有两条（建设备、配密钥），得到 %v", setup)
+	}
+	add := strings.Join(setup[0], " ")
+	if add != "ip link add dev foarpprobe mtu 1420 type wireguard" {
+		t.Errorf("建设备那条 = %q", add)
+	}
+	if len(warpProbeDev) > 15 {
+		t.Errorf("设备名 %q 超过 15 字符，内核会直接拒绝", warpProbeDev)
+	}
+	wgset := strings.Join(setup[1], " ")
+	for _, want := range []string{"private-key /var/lib/fanout/fow1.wgkey", "peer " + warpPeerPub,
+		"endpoint 162.159.193.2:2408", "allowed-ips 0.0.0.0/0",
+		"persistent-keepalive " + strconv.Itoa(warpKeepalive)} {
+		if !strings.Contains(wgset, want) {
+			t.Errorf("自检的 wg set 缺 %q：%s", want, wgset)
+		}
+	}
+	// 不碰路由、不碰地址、不碰内核参数，也不把设备 up 起来：自检通过与否
+	// 都不该改变任何一条流量的走向。
+	for _, c := range append(setup, cleanup) {
+		joined := strings.Join(c, " ")
+		if strings.Contains(joined, " route ") || strings.Contains(joined, "addr add") ||
+			strings.Contains(joined, "link set") || strings.Contains(joined, "sysctl") ||
+			strings.Contains(joined, "iptables") {
+			t.Errorf("自检命令动了路由/地址/内核参数：%s", joined)
+		}
+	}
+	if got := strings.Join(cleanup, " "); got != "ip link del foarpprobe" {
+		t.Errorf("收尾那条 = %q", got)
+	}
+}
+
+// 界面上出现 "exit status 1" 而看不见原因，是这功能连错三轮的根子。
+// wireguardErrorHint 负责把内核/wg 的原话翻成一个下一步，认不出来时必须闭嘴。
+func TestWireguardErrorHintNamesTheActionableCause(t *testing.T) {
+	cases := []struct{ raw, want string }{
+		{`ip link add dev foarpprobe mtu 1420 type wireguard: Garbage instead of arguments "mtu ...".`, "升级"},
+		{"Unable to read key from file /var/lib/fanout/fow1.wgkey", "私钥"},
+		{"RTNETLINK answers: Operation not supported", "内核"},
+		{"Cannot find device \"fow1\"", "设备"},
+		{"SIOCSIFADDR: Permission denied", "权限"},
+		{"Error sending 'set device' message: Protocol error", "wireguard-tools"},
+		{"Bad peer public key", "公钥"},
+		{"", ""},
+		{"Some unrelated failure from ip route", ""},
+	}
+	for _, c := range cases {
+		got := wireguardErrorHint(c.raw)
+		if c.want == "" {
+			if got != "" {
+				t.Errorf("认不出的原话不该编原因：%q -> %q", c.raw, got)
+			}
+			continue
+		}
+		if !strings.Contains(got, c.want) {
+			t.Errorf("%q 的提示该含 %q，实际 %q", c.raw, c.want, got)
+		}
+	}
+}
+
 func TestWarpSplitPinsGateOntoWarp(t *testing.T) {
 	cmds := warpSplitCmds("fow7", "tun0", []string{"61.215.116.134", "210.167.4.5"})
 	if len(cmds) != 4 {

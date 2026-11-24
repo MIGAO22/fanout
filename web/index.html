@@ -446,7 +446,8 @@ html[data-theme="dark"] select.inp{background-image:url("data:image/svg+xml;char
   stroke-linecap:round;stroke-linejoin:round}
 .wbar .tx{min-width:0;flex:1}
 .wbar .tt{font-size:13px;font-weight:640;display:flex;align-items:center;gap:7px}
-.wbar .ss{font-size:11.5px;color:var(--text-3);margin-top:3px;line-height:1.5}
+/* 上次没开成那句会带 /var/lib/fanout/fow1.wgkey 这种长 token，不给断行就顶穿卡片 */
+.wbar .ss{font-size:11.5px;color:var(--text-3);margin-top:3px;line-height:1.5;word-break:break-word}
 .wbar .ss b{font-weight:600;color:var(--text-2)}
 .wbar .ss b.ok{color:var(--ok)}
 .wbar .ss b.warn{color:var(--warn)}

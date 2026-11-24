@@ -466,6 +466,109 @@ func warpEnsureTools(budget time.Duration) error {
 	return err
 }
 
+// warpRun 跑一条架桥命令，失败时把内核那句原话顶到报错最前面。
+//
+// 为什么不用 run()：它的报错是 `<完整命令>: exit status 1: <stderr>`，而
+// `wg set fow1 private-key … peer <44 字符> endpoint … allowed-ips …` 这条命令
+// 自己就快 200 字符，界面和日志的截断上限会先吃掉命令、把 stderr 留在外面——
+// 于是能看到的永远只有"连不上节点"，真原因一个字都不剩（v2.0.9 就是这么空转了一轮）。
+// 这里只回显程序名加前三个参数（够认出是哪一步、哪台设备），stderr 放最前，
+// 再按 wireguardErrorHint 补一句下一步。
+func warpRun(ns string, c []string) error {
+	argv := c
+	if ns != "" {
+		argv = append([]string{"netns", "exec", ns}, c...)
+	}
+	out, err := cmdCombined(exec.Command("ip", argv...))
+	if err == nil {
+		return nil
+	}
+	why := strings.TrimSpace(string(out))
+	if why == "" {
+		why = err.Error() // 程序压根没输出：没装、被信号杀掉，这种也只能报 exit status
+	}
+	// 先把内核那句压到 120 字，再拼提示——反过来的话长 stderr 会把"下一步"挤掉，
+	// 而那半句才是让人不用再回来问的部分。内核在这几步上的原话基本不超过 60 字。
+	why = oneLine(why, 120)
+	// 只对真正在碰 WireGuard 的那几条补提示：同一批命令里还有 ip route / ip addr,
+	// 它们报 "not supported" 跟内核有没有 WireGuard 无关，跟着说只会把人带偏。
+	isWG := c[0] == "wg"
+	for _, a := range c {
+		if a == "wireguard" {
+			isWG = true
+		}
+	}
+	if isWG {
+		if hint := wireguardErrorHint(why); hint != "" {
+			why += " —— " + hint
+		}
+	}
+	head := c
+	if len(head) > 3 {
+		head = head[:3] // 够认出是哪一步（ip link add / wg set fow1），后面的密钥不参与
+	}
+	tag := strings.Join(head, " ")
+	if ns != "" {
+		tag = ns + "：" + tag
+	}
+	return fmt.Errorf("%s: %s", tag, oneLine(why, 200))
+}
+
+// warpSelfTest 拿一条真实注册记录在母机上把 WARP 设备架一遍，然后立刻拆掉。
+//
+// 它存在的理由是"开关一翻，18 条出口一起掉线去撞同一堵墙"：这套链路里任何一步
+// 不成立（命令语法、内核没模块、wg 版本不认、密钥不对），原先都要等到逐条重连
+// 才暴露，而暴露出来的句子还会被截断——用户只能看到"连不上节点"。
+// 自检把它挪到还没动任何出口之前，并且因为命令短，内核那句原话能完整留在界面上。
+//
+// 它不验证"能不能通"：握手要等真实流量，那由每条出口自己的报错里那句
+// WARP 已握手 / 未握手 来说。
+func warpSelfTest(acc *WarpAccount) error {
+	if acc == nil {
+		return nil // 没有注册记录就没东西可试，交给后面的注册步骤报错
+	}
+	keyFile := warpSvc.keyFile(acc.devName())
+	if err := os.WriteFile(keyFile, []byte(acc.PrivKey+"\n"), 0600); err != nil {
+		return fmt.Errorf("写 WireGuard 私钥失败: %w", err)
+	}
+	mtu, _, _ := warpMTUs(true)
+	setup, cleanup := warpProbeCmds(keyFile, acc.PeerKey, acc.Endpoint, acc.Port, mtu)
+	defer runQuiet(cleanup[0], cleanup[1:]...)
+	runQuiet(cleanup[0], cleanup[1:]...) // 清残骸：不存在是常态，不该因此说自检失败
+	for _, c := range setup {
+		if err := warpRun("", c); err != nil {
+			step := "建 WireGuard 设备"
+			if c[0] == "wg" {
+				step = "配置 WireGuard 密钥与接入点"
+			}
+			return fmt.Errorf("%s：%v", step, err)
+		}
+	}
+	return nil
+}
+
+// warpLastErr 留着上一次"翻开开关却没成功"的原话。
+//
+// 为什么要单独留：这种失败只会出现在作业那一步的悬浮提示里，而作业几分钟后就淡出——
+// 用户重新截图、重新描述，又是"连不上节点"。把它钉在开关那一行下面，
+// 开关是关着的就说明它还没解决，界面就该一直说这件事。
+var warpLastErr = struct {
+	mu  sync.Mutex
+	msg string
+}{msg: ""}
+
+func warpFailNote(msg string) {
+	warpLastErr.mu.Lock()
+	warpLastErr.msg = msg
+	warpLastErr.mu.Unlock()
+}
+
+func warpFailText() string {
+	warpLastErr.mu.Lock()
+	defer warpLastErr.mu.Unlock()
+	return warpLastErr.msg
+}
+
 // warpForTunnel 在拉起 openvpn 之前把 WARP 架进这条出口的 netns。
 // 返回 nil 表示这个开关没开，调用方据此决定要不要改 MTU 和路由。
 func warpForTunnel(t *Tunnel) (*WarpAccount, error) {
@@ -513,7 +616,7 @@ func (t *Tunnel) setupWarp(acc *WarpAccount) error {
 		DirectIPs: t.netnsNameservers(),
 	}
 	for _, c := range warpSetupCmds(in) {
-		if err := run("ip", append([]string{"netns", "exec", ns}, c...)...); err != nil {
+		if err := warpRun(ns, c); err != nil {
 			return fmt.Errorf("%v（WARP 接入点 %s:%d）", err, acc.Endpoint, acc.Port)
 		}
 	}
@@ -698,9 +801,9 @@ func warpWait(t *Tunnel, timeout time.Duration) (bool, string) {
 			// WARP 那一跳不通时这句要排在最前面：它决定作业要不要继续逐条撞，
 			// 而排在后面会被截断吃掉，界面和 fail-fast 就都认不出来了。
 			if i := strings.Index(raw, "WARP 未握手"); i >= 0 {
-				return false, "还没连上：" + oneLine(raw[i:], 200)
+				return false, "还没连上：" + oneLine(raw[i:], 300)
 			}
-			if e := oneLine(raw, 200); e != "" {
+			if e := oneLine(raw, 420); e != "" {
 				return false, "还没连上：" + e + "（出口会继续自动重试）"
 			}
 			return false, "还没连上，出口会继续自动重试（WARP 那一跳不通时所有节点都会连不上）"
@@ -744,12 +847,15 @@ func warpSet(m *Manager, on bool) (*Job, error) {
 		return nil, err
 	}
 
-	labels := make([]string, 0, len(list)+2)
+	labels := make([]string, 0, len(list)+3)
 	if needTools {
 		labels = append(labels, "装 "+wireguardPkg)
 	}
 	if preflight {
 		labels = append(labels, "注册第一条出口的 WARP 账号")
+		// 自检排在任何一条出口被动之前：内核/语法/密钥这一类问题，
+		// 在这里报一次就够了，不必让 18 条出口各自掉线再各自撞一遍。
+		labels = append(labels, "自检：在母机上试架 WireGuard 设备")
 	}
 	for _, t := range list {
 		labels = append(labels, fmt.Sprintf("出口 %d · %s", t.Slot, t.host()))
@@ -774,6 +880,7 @@ func warpSet(m *Manager, on bool) (*Job, error) {
 		if err := setWarp(WarpSettings{Enabled: cur.Enabled, ClientVersion: cur.ClientVersion}); err != nil {
 			log.Printf("fanout: 回滚 WARP 开关失败: %v", err)
 		}
+		warpFailNote(oneLine(why, 200)) // 这句要常驻在开关下面，压到六行以内才不像在念经
 		log.Printf("fanout: WARP 中转没能开启：%s", why)
 	}
 
@@ -795,14 +902,27 @@ func warpSet(m *Manager, on bool) (*Job, error) {
 			job.Set(i, "running", "正在向 Cloudflare 注册")
 			// 注册不通（够不着 Cloudflare、被判定滥用）时一条出口都别动，
 			// 开关退回原样。翻开了才发现中转架不起来，等于把所有出口推进黑洞。
-			if _, err := warpSvc.ensure(list[0].Slot, warpReportVersion()); err != nil {
+			acc, err := warpSvc.ensure(list[0].Slot, warpReportVersion())
+			if err != nil {
 				job.Set(i, "failed", err.Error())
 				revert(err.Error())
 				job.Finish()
 				return
 			}
-			job.Set(i, "ok", "接入点已拿到")
-			at++
+			job.Set(i, "ok", "接入点 "+acc.Endpoint)
+			i++
+			job.Set(i, "running", "正在母机上试建设备并下发密钥")
+			if err := warpSelfTest(acc); err != nil {
+				// 这句是整个功能里最该被看见的一行：它说的不是"节点连不上"，
+				// 而是"这台机器的 WireGuard 配不起来"。命令短，所以内核原话
+				// 不会被截断吃掉。
+				job.Set(i, "failed", err.Error())
+				revert(err.Error())
+				job.Finish()
+				return
+			}
+			job.Set(i, "ok", "内核接受这套配置")
+			at = i + 1
 		}
 		failed := 0
 		aborted := ""
@@ -839,6 +959,9 @@ func warpSet(m *Manager, on bool) (*Job, error) {
 			// 全都回不来，说明这台机器现在跑不了中转。把开关原样退回，
 			// 比留着一堆"显示已连通、其实一步都走不出去"的出口好。
 			revert("所有出口都没能连上")
+		} else if on && (len(list) == 0 || failed < len(list)) {
+			// 有一条起来了（或本来就没有出口），上次那句失败就不该继续挂在开关下面
+			warpFailNote("")
 		}
 		job.Finish()
 		log.Printf("fanout: WARP 中转已%s，%d 条出口中有 %d 条没连上", verb, len(list), failed)
@@ -915,6 +1038,7 @@ func warpOverview() WarpOverview {
 	d := warpProbeDeps()
 	v.Ready, v.Reason = d.Ready, d.Reason
 	v.NeedTools, v.PkgCmd = d.Steps != nil, d.Cmd
+	v.LastErr = warpFailText()
 	if warpSvc != nil {
 		want := warpReportVersion()
 		for _, a := range warpSvc.all() {

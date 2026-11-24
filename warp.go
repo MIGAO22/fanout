@@ -490,6 +490,63 @@ func warpSetupCmds(in warpSetupInput) [][]string {
 	return cmds
 }
 
+// wireguardErrorHint 把配 WireGuard 时最常见的几句报错翻成一个下一步。
+//
+// 为什么要有它：`exit status 1` 后面那句 stderr 才是原因，可它要么长得看不懂
+// （Operation not supported），要么在界面上被截断吃掉。用户能看到的只有
+// "连不上节点"，于是每一轮都在猜。认不出来的原话一律返回空串——
+// 宁可少说一句，也不要在界面上编一个原因出来。
+func wireguardErrorHint(raw string) string {
+	s := strings.ToLower(raw)
+	switch {
+	case strings.Contains(s, "garbage instead of arguments"):
+		// 这句是工具自己的参数解析器说的，不是内核拒绝：mtu 写在了 type 后面（v2.0.9 那个坑）、
+		// 或这台的 wireguard-tools 太老不认 persistent-keepalive，都长这样。
+		return "这台机器上的 ip/wg 不认这套参数：升级 wireguard-tools 与 iproute2 后再拨开关"
+	case strings.Contains(s, "unable to read key"), strings.Contains(s, "bad private key"):
+		return "WireGuard 私钥文件读不到或内容不是合法密钥：把 WARP 中转关掉再拨一次，会重新注册"
+	case strings.Contains(s, "bad peer public key"):
+		return "WARP 服务端公钥没被接受"
+	case strings.Contains(s, "operation not supported"), strings.Contains(s, "not supported"):
+		return "这台机器的内核没有 WireGuard：先 modprobe wireguard，装不上就要补内核模块或升内核"
+	case strings.Contains(s, "cannot find device"), strings.Contains(s, "no such device"):
+		return "WireGuard 设备没建起来"
+	case strings.Contains(s, "permission denied"), strings.Contains(s, "operation not permitted"):
+		return "权限不够：root 之外还有 SELinux、capability 这一层"
+	case strings.Contains(s, "protocol error"), strings.Contains(s, "network is down"):
+		return "wg 与内核版本对不上：升级 wireguard-tools"
+	}
+	return ""
+}
+
+// warpProbeDev 是自检用的设备名：不碰路由、不碰 DNS，只问内核和 wg
+// "这套参数你到底接不接受"。名字短且固定，方便在母机上认出残骸。
+const warpProbeDev = "foarpprobe"
+
+// warpProbeCmds 生成自检的命令（不含执行）。
+//
+// 为什么在母机 netns 里做而不是复用某条出口的 netns：要验的只有"建设备 + 配密钥"
+// 这两步，路由一碰就牵扯到真出口。设备保持 DOWN、不加地址、不加路由，拆完就走，
+// 母机的转发行为一个字都不变。
+//
+// cleanup 既在开头跑一次（清上次崩在这里留下的残骸，失败忽略），也在结尾跑一次
+// ——自检失败更要收尾，否则母机上留一台名叫 foarpprobe 的设备，
+// 下次来看的人不知道该不该删。
+//
+// 这套命令刻意不含 route：自检通过与否都不该改变任何一条流量的走向。
+func warpProbeCmds(keyFile, peerKey, endpoint string, port, mtu int) (setup [][]string, cleanup []string) {
+	setup = [][]string{
+		{"ip", "link", "add", "dev", warpProbeDev, "mtu", strconv.Itoa(mtu), "type", "wireguard"},
+		{"wg", "set", warpProbeDev,
+			"private-key", keyFile,
+			"peer", peerKey,
+			"endpoint", net.JoinHostPort(endpoint, strconv.Itoa(port)),
+			"allowed-ips", "0.0.0.0/0",
+			"persistent-keepalive", strconv.Itoa(warpKeepalive)},
+	}
+	return setup, []string{"ip", "link", "del", warpProbeDev}
+}
+
 // warpSplitCmds 生成 tun0 起来之后把用户流量接进 Gate 的命令。
 //
 // 两条 /1 合起来就是默认路由，但优先级低于任何 /32——这是 def1 那套写法：

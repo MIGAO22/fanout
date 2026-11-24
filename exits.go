@@ -50,10 +50,14 @@ type WarpOverview struct {
 	// 拨开开关时第一步就把它装上。界面据此把"不可用"换成一句会动手的说明。
 	NeedTools bool   `json:"need_tools"`
 	PkgCmd    string `json:"pkg_cmd"` // 将执行的那几条装包命令，摊开给用户看
-	Version   string `json:"version"` // 注册时上报给 Cloudflare 的客户端版本
-	Count     int    `json:"count"`   // 已注册的 WARP 账号数
-	Live      int    `json:"live"`    // 其中此刻握手新鲜的出口数
-	Stale     int    `json:"stale"`   // 按旧客户端版本注册的账号数，非 0 说明"更新"没做完
+	// LastErr 是上一次"翻开开关却没成功"的原话。开关现在是关着的，就说明
+	// 这件事还没解决——它只待在作业里会在几分钟后消失，然后所有人重新报告
+	// 的都只是"连不上节点"。
+	LastErr string `json:"last_err,omitempty"`
+	Version string `json:"version"` // 注册时上报给 Cloudflare 的客户端版本
+	Count   int    `json:"count"`   // 已注册的 WARP 账号数
+	Live    int    `json:"live"`    // 其中此刻握手新鲜的出口数
+	Stale   int    `json:"stale"`   // 按旧客户端版本注册的账号数，非 0 说明"更新"没做完
 }
 
 // PoolMemberView 是组内一条出口的界面视图。
