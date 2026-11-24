@@ -205,7 +205,7 @@ func TestWarpRegistrationRequestBody(t *testing.T) {
 
 func TestWarpSetupCommandsOrder(t *testing.T) {
 	in := warpSetupInput{
-		Dev: "fow12", KeyFile: "/var/lib/fanout/fow12.wgkey",
+		Dev:     "fow12",
 		PeerKey: warpPeerPub, Endpoint: "162.159.192.6", Port: 2408,
 		TunIP: "172.16.0.2", MTU: 1420,
 		VethGw: "10.99.12.1", Veth: "fop12",
@@ -242,11 +242,20 @@ func TestWarpSetupCommandsOrder(t *testing.T) {
 		t.Errorf("第四条不是配隧道地址：%s", got)
 	}
 	wgset := strings.Join(cmds[4], " ")
-	for _, want := range []string{"private-key /var/lib/fanout/fow12.wgkey", "peer " + warpPeerPub,
+	// 私钥经管道递给 wg（见 warpKeyStdin）：命令行里既没有密钥也没有密钥文件路径，
+	// 磁盘上因此不留私钥，wg 也不再需要打开任何东西——现场那句
+	// `wg set fow1: fopen: Permission denied` 就是它打不开 fanout 写的私钥文件。
+	for _, want := range []string{"private-key " + warpKeyStdin, "peer " + warpPeerPub,
 		"endpoint 162.159.192.6:2408", "allowed-ips 0.0.0.0/0",
 		"persistent-keepalive " + strconv.Itoa(warpKeepalive)} {
 		if !strings.Contains(wgset, want) {
 			t.Errorf("wg set 缺 %q：%s", want, wgset)
+		}
+	}
+	for _, c := range cmds {
+		joined := strings.Join(c, " ")
+		if strings.Contains(joined, ".wgkey") || strings.Contains(joined, "/var/lib/fanout") {
+			t.Errorf("架设命令里不该再出现私钥文件：%s", joined)
 		}
 	}
 	if got := strings.Join(cmds[5], " "); got != "ip link set dev fow12 up" {
@@ -265,7 +274,7 @@ func TestWarpSetupCommandsOrder(t *testing.T) {
 // 而它发生在 netns 里、由 fanout 转述——上一次就是靠这句话才定位到，别再犯第二次。
 func TestGenericOptionsNeverFollowType(t *testing.T) {
 	in := warpSetupInput{
-		Dev: "fow3", KeyFile: "k", PeerKey: warpPeerPub,
+		Dev: "fow3", PeerKey: warpPeerPub,
 		Endpoint: "162.159.192.6", Port: 2408, TunIP: "172.16.0.2", MTU: 1390,
 		VethGw: "10.99.3.1", Veth: "fop3", DirectIPs: []string{"8.8.8.8"},
 	}
@@ -301,7 +310,7 @@ func TestGenericOptionsNeverFollowType(t *testing.T) {
 
 func TestWarpSetupKeepsNonIPDirectOutOfRoutes(t *testing.T) {
 	// resolv.conf 里出现域名或坏值时不能拼出 ip route add xxx/32，那会让整套装架失败
-	in := warpSetupInput{Dev: "fow1", KeyFile: "k", PeerKey: warpPeerPub,
+	in := warpSetupInput{Dev: "fow1", PeerKey: warpPeerPub,
 		Endpoint: "162.159.192.6", Port: 2408, TunIP: "172.16.0.2", MTU: 1420,
 		VethGw: "10.1.1.1", Veth: "fop1", DirectIPs: []string{"fd00::1", "not-an-ip", "1.1.1.1"}}
 	var routes []string
@@ -323,7 +332,7 @@ func TestWarpSetupKeepsNonIPDirectOutOfRoutes(t *testing.T) {
 // 自检那套命令的底线：它必须只"试配置"，不改变任何流量的走向；名字要短到能
 // 在母机上认出来；而且必须留下收尾那条删除——自检失败时最容易漏的就是清理。
 func TestWarpProbeCommandsTouchNothingButTheDevice(t *testing.T) {
-	setup, cleanup := warpProbeCmds("/var/lib/fanout/fow1.wgkey", warpPeerPub, "162.159.193.2", 2408, 1420)
+	setup, cleanup := warpProbeCmds(warpPeerPub, "162.159.193.2", 2408, 1420)
 	if len(setup) != 2 {
 		t.Fatalf("自检只该有两条（建设备、配密钥），得到 %v", setup)
 	}
@@ -335,7 +344,7 @@ func TestWarpProbeCommandsTouchNothingButTheDevice(t *testing.T) {
 		t.Errorf("设备名 %q 超过 15 字符，内核会直接拒绝", warpProbeDev)
 	}
 	wgset := strings.Join(setup[1], " ")
-	for _, want := range []string{"private-key /var/lib/fanout/fow1.wgkey", "peer " + warpPeerPub,
+	for _, want := range []string{"private-key " + warpKeyStdin, "peer " + warpPeerPub,
 		"endpoint 162.159.193.2:2408", "allowed-ips 0.0.0.0/0",
 		"persistent-keepalive " + strconv.Itoa(warpKeepalive)} {
 		if !strings.Contains(wgset, want) {
@@ -397,6 +406,26 @@ func TestWarpArgvNeverDoublesTheProgram(t *testing.T) {
 	}
 	if got := warpCmdTag("", linkCmd); got != "ip link add" {
 		t.Errorf("母机上的 tag = %q", got)
+	}
+}
+
+// 私钥只该进 wg 那一根管道：ip link / ip addr / ip route 读不到它，就别写过去。
+func TestWarpKeyOnlyGoesToWg(t *testing.T) {
+	priv := "yA7EpL6HvcV6Y2s4Yz3Q4rBp7W8p3BpB9p8v2nB1F3U="
+	if got := warpKeyFor([]string{"wg", "set", "fow1"}, priv); got != priv+"\n" {
+		t.Errorf("wg 那条该拿到密钥，得到 %q", got)
+	}
+	for _, c := range [][]string{
+		{"ip", "link", "add", "dev", "fow1", "mtu", "1420", "type", "wireguard"},
+		{"ip", "addr", "add", "172.16.0.2/32", "dev", "fow1"},
+		{"ip", "route", "replace", "default", "dev", "fow1"},
+	} {
+		if got := warpKeyFor(c, priv); got != "" {
+			t.Errorf("%v 不该拿到私钥：%q", c, got)
+		}
+	}
+	if got := warpKeyFor(nil, priv); got != "" {
+		t.Errorf("空命令不该拿到私钥：%q", got)
 	}
 }
 

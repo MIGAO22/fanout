@@ -87,9 +87,29 @@ func warpDevName(tag string, slot int) string {
 	return fmt.Sprintf("fow%s%d", tag, slot)
 }
 
-// warpKeyFileName 是私钥落盘的文件名。wg set 只认"从文件读私钥"，
-// 没有 shell 重定向可用，所以每条出口一个 0600 的小文件。
+// warpKeyFileName 是 v2.0.11 及之前私钥落盘用的文件名，现在只剩"把老机器上留下的
+// 私钥文件删掉"这一件事还认它——私钥本身改成了通过管道递给 wg（见 warpKeyStdin）。
 func warpKeyFileName(dev string) string { return dev + ".wgkey" }
+
+// warpKeyStdin 是喂给 wg 的"私钥文件路径"。
+//
+// `wg set … private-key <路径>` 里那个路径只是拿去 fopen 的，而 /proc/self/fd/0
+// 就是我们接在子进程标准输入上的那根管道——于是私钥一个字都不必落到磁盘上。
+//
+// 换掉落盘的直接原因是现场那句 `wg set fow1: fopen: Permission denied`：
+// fanout 自己以 root 写的 0600 文件，wg 却打不开（这台机器上有我们看不见的东西
+// 在拦文件访问，SELinux、挂载选项、面板的安全模块都可能）。继续猜哪种都白猜，
+// 少开一个文件就把这一整类都绕过去了，顺带也不再需要清理私钥残留。
+const warpKeyStdin = "/proc/self/fd/0"
+
+// warpKeyFor 决定这条命令要不要接私钥：只有 wg 那几条会去读它，
+// ip link / ip addr / ip route 没必要拿到密钥，就别把它们写进那根管道。
+func warpKeyFor(c []string, priv string) string {
+	if len(c) > 0 && c[0] == "wg" {
+		return priv + "\n"
+	}
+	return ""
+}
 
 // newWarpKeys 生成一对 X25519 密钥，base64 存下来。
 // 用标准库而不是额外拉 wireguard-go：fanout 只想要那 32 字节密钥，
@@ -433,9 +453,9 @@ func wireguardInstallHint(family, out string) string {
 
 // warpSetupInput 是配 WireGuard 需要知道的东西。
 type warpSetupInput struct {
-	Dev      string
-	KeyFile  string
-	PeerKey  string
+	Dev     string
+	PeerKey string
+	// 私钥不在这里：它经 warpKeyStdin 从管道递给 wg，不进命令行也不落盘。
 	Endpoint string
 	Port     int
 	TunIP    string
@@ -477,7 +497,7 @@ func warpSetupCmds(in warpSetupInput) [][]string {
 		[]string{"ip", "link", "add", "dev", in.Dev, "mtu", strconv.Itoa(in.MTU), "type", "wireguard"},
 		[]string{"ip", "addr", "add", in.TunIP + "/32", "dev", in.Dev},
 		[]string{"wg", "set", in.Dev,
-			"private-key", in.KeyFile,
+			"private-key", warpKeyStdin,
 			"peer", in.PeerKey,
 			"endpoint", net.JoinHostPort(in.Endpoint, strconv.Itoa(in.Port)),
 			"allowed-ips", "0.0.0.0/0",
@@ -503,8 +523,9 @@ func wireguardErrorHint(raw string) string {
 		// 这句是工具自己的参数解析器说的，不是内核拒绝：mtu 写在了 type 后面（v2.0.9 那个坑）、
 		// 或这台的 wireguard-tools 太老不认 persistent-keepalive，都长这样。
 		return "这台机器上的 ip/wg 不认这套参数：升级 wireguard-tools 与 iproute2 后再拨开关"
-	case strings.Contains(s, "unable to read key"), strings.Contains(s, "bad private key"):
-		return "WireGuard 私钥文件读不到或内容不是合法密钥：把 WARP 中转关掉再拨一次，会重新注册"
+	case strings.Contains(s, "unable to read key"), strings.Contains(s, "bad private key"),
+		strings.Contains(s, "failed to open key file"):
+		return "WireGuard 私钥没能递给 wg（它读标准输入这一步失败了）"
 	case strings.Contains(s, "bad peer public key"):
 		return "WARP 服务端公钥没被接受"
 	case strings.Contains(s, "operation not supported"), strings.Contains(s, "not supported"):
@@ -562,11 +583,11 @@ const warpProbeDev = "foarpprobe"
 // 下次来看的人不知道该不该删。
 //
 // 这套命令刻意不含 route：自检通过与否都不该改变任何一条流量的走向。
-func warpProbeCmds(keyFile, peerKey, endpoint string, port, mtu int) (setup [][]string, cleanup []string) {
+func warpProbeCmds(peerKey, endpoint string, port, mtu int) (setup [][]string, cleanup []string) {
 	setup = [][]string{
 		{"ip", "link", "add", "dev", warpProbeDev, "mtu", strconv.Itoa(mtu), "type", "wireguard"},
 		{"wg", "set", warpProbeDev,
-			"private-key", keyFile,
+			"private-key", warpKeyStdin,
 			"peer", peerKey,
 			"endpoint", net.JoinHostPort(endpoint, strconv.Itoa(port)),
 			"allowed-ips", "0.0.0.0/0",

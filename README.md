@@ -127,6 +127,14 @@
 命令怎么拼现在收进 `warpArgv`／`warpCmdTag` 两个纯函数，并钉住「整条命令不许出现 `ip ip`、`wg wg`」——
 这类"包装层重复"的错误以前只在真机上现形，现在在本机就红。
 
+**v2.0.12：私钥不再落盘，改从管道递给 `wg`。** 自检修好之后报回真因：
+`配置 WireGuard 密钥与接入点：wg set foarpprobe: fopen: Permission denied`。
+`wg set … private-key <路径>` 会去 `fopen` 那个路径，而它是 fanout 自己以 root 写的 0600 文件——
+这台机器上有我们看不见的东西在拦文件访问（SELinux、挂载选项、面板的安全模块都可能），
+继续猜是哪一种没有意义。现在私钥经 `/proc/self/fd/0` 从标准输入递进去：
+`wg` 不再需要打开任何东西，这一整类障碍一次绕开，私钥也不再留在磁盘上。
+只有 `wg` 那几条命令会拿到密钥（`warpKeyFor`），`ip link` / `ip addr` / `ip route` 那几根管道里没有它。
+
 这一层是拿内核的 WireGuard 直接架在每条出口的 netns 里的，不装也不跑官方 `warp-cli`：
 fanout 只要那 32 字节密钥和一条策略路由，多养一个 daemon 只会多一个会掉线的环节。
 
@@ -183,7 +191,7 @@ Xray 到 `/var/lib/fanout/bin/`，装了则跳过，入站交给面板管。
 > 才生效：`f` → `3) 重启`（或 `f restart`）。`install.sh` 现在重装会显式
 > `systemctl restart`——以前用 `enable --now`，对已运行的单元是空操作，
 > 于是新二进制在磁盘上、老进程还在服务老界面。
-> 想确认手上是哪一份：`fanout -version`，本仓库显示 `v2.0.11`，上游原版是 `v1.3.1`。
+> 想确认手上是哪一份：`fanout -version`，本仓库显示 `v2.0.12`，上游原版是 `v1.3.1`。
 
 > **发新版本。** 推一个 `v*` tag 就会触发 release workflow 出 amd64 / arm64
 > 两个包和 checksums；不打 tag 就没有 Release，`releases/latest/download/...`
@@ -658,7 +666,7 @@ REALITY 的密钥对和 shortId 自动生成；TLS 不填证书就生成自签�
 
 ```
   状态      运行中
-  版本      fanout v2.0.11
+  版本      fanout v2.0.12
   开机自启  enabled
 
   管理地址  http://1.2.3.4:8899/gwPuWHvaNr/

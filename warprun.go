@@ -185,16 +185,14 @@ func (s *warpService) dropAll() {
 	}
 }
 
-// removeKeyFile 删掉写过盘的私钥。删失败只记日志：文件是 0600，
-// 而且下次架设时会被覆盖，不至于因为一次 unlink 失败就把出口拆掉。
+// removeKeyFile 扫掉 v2.0.11 及之前留在磁盘上的私钥。现在私钥经管道递给 wg，
+// 不再落盘，但升级过来的机器上那些 0600 文件还在，撤销注册/换密钥时顺手删掉。
+// 删失败只记日志：一次 unlink 失败不该把出口拆掉。
 func (s *warpService) removeKeyFile(dev string) {
 	if err := os.Remove(filepath.Join(s.dir, warpKeyFileName(dev))); err != nil && !os.IsNotExist(err) {
 		log.Printf("fanout: 删除 WireGuard 私钥 %s 失败: %v", dev, err)
 	}
 }
-
-// keyFile 返回某条出口的私钥文件路径。
-func (s *warpService) keyFile(dev string) string { return filepath.Join(s.dir, warpKeyFileName(dev)) }
 
 // warpRegister 向 Cloudflare 注册一个免费 WireGuard 接入，同时返回本机密钥对。
 //
@@ -472,11 +470,18 @@ func warpEnsureTools(budget time.Duration) error {
 // `wg set fow1 private-key … peer <44 字符> endpoint … allowed-ips …` 这条命令
 // 自己就快 200 字符，界面和日志的截断上限会先吃掉命令、把 stderr 留在外面——
 // 于是能看到的永远只有"连不上节点"，真原因一个字都不剩（v2.0.9 就是这么空转了一轮）。
-// 这里只回显程序名加前三个参数（够认出是哪一步、哪台设备），stderr 放最前，
+// 这里只回显前三条参数（够认出是哪一步、哪台设备），stderr 放最前，
 // 再按 wireguardErrorHint 补一句下一步。
-func warpRun(ns string, c []string) error {
+//
+// stdin 非空时接到子进程的标准输入上：wg 的私钥就是这么递进去的（见 warpKeyStdin），
+// 于是命令行里没有密钥、磁盘上也不留密钥。
+func warpRun(ns, stdin string, c []string) error {
 	name, argv := warpArgv(ns, c)
-	out, err := cmdCombined(exec.Command(name, argv...))
+	cmd := exec.Command(name, argv...)
+	if stdin != "" {
+		cmd.Stdin = strings.NewReader(stdin)
+	}
+	out, err := cmdCombined(cmd)
 	if err == nil {
 		return nil
 	}
@@ -516,16 +521,12 @@ func warpSelfTest(acc *WarpAccount) error {
 	if acc == nil {
 		return nil // 没有注册记录就没东西可试，交给后面的注册步骤报错
 	}
-	keyFile := warpSvc.keyFile(acc.devName())
-	if err := os.WriteFile(keyFile, []byte(acc.PrivKey+"\n"), 0600); err != nil {
-		return fmt.Errorf("写 WireGuard 私钥失败: %w", err)
-	}
 	mtu, _, _ := warpMTUs(true)
-	setup, cleanup := warpProbeCmds(keyFile, acc.PeerKey, acc.Endpoint, acc.Port, mtu)
+	setup, cleanup := warpProbeCmds(acc.PeerKey, acc.Endpoint, acc.Port, mtu)
 	defer runQuiet(cleanup[0], cleanup[1:]...)
 	runQuiet(cleanup[0], cleanup[1:]...) // 清残骸：不存在是常态，不该因此说自检失败
 	for _, c := range setup {
-		if err := warpRun("", c); err != nil {
+		if err := warpRun("", warpKeyFor(c, acc.PrivKey), c); err != nil {
 			step := "建 WireGuard 设备"
 			if c[0] == "wg" {
 				step = "配置 WireGuard 密钥与接入点"
@@ -593,19 +594,15 @@ func (t *Tunnel) setupWarp(acc *WarpAccount) error {
 	_, peer := t.vethNames()
 	dev := acc.devName()
 
-	keyFile := warpSvc.keyFile(dev)
-	if err := os.WriteFile(keyFile, []byte(acc.PrivKey+"\n"), 0600); err != nil {
-		return fmt.Errorf("写 WireGuard 私钥失败: %w", err)
-	}
 	mtu, _, _ := warpMTUs(true)
 	in := warpSetupInput{
-		Dev: dev, KeyFile: keyFile, PeerKey: acc.PeerKey,
+		Dev: dev, PeerKey: acc.PeerKey,
 		Endpoint: acc.Endpoint, Port: acc.Port, TunIP: acc.TunIP, MTU: mtu,
 		VethGw: sub + ".1", Veth: peer,
 		DirectIPs: t.netnsNameservers(),
 	}
 	for _, c := range warpSetupCmds(in) {
-		if err := warpRun(ns, c); err != nil {
+		if err := warpRun(ns, warpKeyFor(c, acc.PrivKey), c); err != nil {
 			return fmt.Errorf("%v（WARP 接入点 %s:%d）", err, acc.Endpoint, acc.Port)
 		}
 	}
