@@ -135,6 +135,15 @@
 `wg` 不再需要打开任何东西，这一整类障碍一次绕开，私钥也不再留在磁盘上。
 只有 `wg` 那几条命令会拿到密钥（`warpKeyFor`），`ip link` / `ip addr` / `ip route` 那几根管道里没有它。
 
+**v2.0.13：挡住推送 MTU 的那个参数本身拼错了，openvpn 因此一个都没起来。** WireGuard 这次架好了，
+卡片上却是 `Options error: Unrecognized option or missing or extra parameter(s) in [CMD-LINE]:1: pull (2.7.9)`
+加一句「WARP 未握手」。查 openvpn 手册：`--pull` 是**不带任何参数**的选项，过滤器是另一个独立选项
+`--pull-filter <accept|ignore|reject> <名字前缀>`，而 v2.0.8 拼的是 `--pull filter ignore tun-mtu`——
+`pull` 后面多带三个参数，openvpn 认不出来就当场退出。于是每条出口、每个候选节点都死在启动，
+而「WARP 未握手」只是它的下游症状：openvpn 没跑起来，WireGuard 那条链路自然一个包都没见过。
+改成 `--pull-filter ignore tun-mtu` 等三条；那条测试原先是 `strings.Count(off, "--pull") != 3`，
+照着错误实现数的数，所以它一直绿着——现在改成逐条对齐 argv，并钉住「不许出现带参数的 `--pull`」。
+
 这一层是拿内核的 WireGuard 直接架在每条出口的 netns 里的，不装也不跑官方 `warp-cli`：
 fanout 只要那 32 字节密钥和一条策略路由，多养一个 daemon 只会多一个会掉线的环节。
 
@@ -191,7 +200,7 @@ Xray 到 `/var/lib/fanout/bin/`，装了则跳过，入站交给面板管。
 > 才生效：`f` → `3) 重启`（或 `f restart`）。`install.sh` 现在重装会显式
 > `systemctl restart`——以前用 `enable --now`，对已运行的单元是空操作，
 > 于是新二进制在磁盘上、老进程还在服务老界面。
-> 想确认手上是哪一份：`fanout -version`，本仓库显示 `v2.0.12`，上游原版是 `v1.3.1`。
+> 想确认手上是哪一份：`fanout -version`，本仓库显示 `v2.0.13`，上游原版是 `v1.3.1`。
 
 > **发新版本。** 推一个 `v*` tag 就会触发 release workflow 出 amd64 / arm64
 > 两个包和 checksums；不打 tag 就没有 Release，`releases/latest/download/...`
@@ -576,7 +585,8 @@ wireguard-tools」那句原话写在说明里。内核不带 WireGuard 也不是
   一超过链路能扛的大小就静默丢掉，而 openvpn 最吃大包的 TLS 握手正好卡在那儿——
   症状是「所有节点都连不上」，看着像 VPN Gate 全死了，其实是我们把包发大了。
   关掉中转时一个参数都不加，和没这个功能时一字不差。
-- 服务器推送的 MTU 会被挡掉（`--pull filter ignore tun-mtu/link-mtu/mssfix`，openvpn 2.4 起）。
+- 服务器推送的 MTU 会被挡掉（`--pull-filter ignore tun-mtu` / `link-mtu` / `mssfix`，openvpn 2.4 起；
+  `--pull` 本身不带参数，写成 `--pull filter ignore tun-mtu` 会让 openvpn 当场退出）。
   推送的优先级比命令行高，VPN Gate 上确实有节点推 `tun-mtu 1500`：一盖回来就是上一条那个
   黑洞。2.3 没有这个选项，所以按版本给——传错了是 `Unrecognized option` 当场退出，
   比 MTU 大了还糟。
@@ -666,7 +676,7 @@ REALITY 的密钥对和 shortId 自动生成；TLS 不填证书就生成自签�
 
 ```
   状态      运行中
-  版本      fanout v2.0.12
+  版本      fanout v2.0.13
   开机自启  enabled
 
   管理地址  http://1.2.3.4:8899/gwPuWHvaNr/

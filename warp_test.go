@@ -575,24 +575,43 @@ func TestWarpPullFilters(t *testing.T) {
 	if got := warpPullFilters(false, "2.6.8"); got != nil {
 		t.Errorf("关掉中转时不该加任何参数，得到 %v", got)
 	}
-	off := strings.Join(warpPullFilters(true, "2.6.8"), " ")
-	for _, k := range []string{"tun-mtu", "link-mtu", "mssfix"} {
-		if !strings.Contains(off, "ignore "+k) {
-			t.Errorf("没挡住服务器推送的 %s：%q", k, off)
+	off := warpPullFilters(true, "2.6.8")
+	joined := strings.Join(off, " ")
+	// 语法照 openvpn 手册：--pull-filter <accept|ignore|reject> <名字前缀>，
+	// 每条规则是独立的一个选项。断言写成"逐条对齐 argv"而不是拼一串子串，
+	// 因为上一版就是把 `--pull filter ignore tun-mtu` 当成合法写法——
+	// openvpn 认 `--pull` 不带参数，多带参数就回
+	// `Unrecognized option or missing or extra parameter(s) in [CMD-LINE]:1: pull`
+	// 并当场退出，而那条断言当初是照着这个错写法数 "--pull" 的个数的。
+	want := []string{"--pull-filter", "ignore", "tun-mtu",
+		"--pull-filter", "ignore", "link-mtu",
+		"--pull-filter", "ignore", "mssfix"}
+	if len(off) != len(want) {
+		t.Fatalf("参数条数 = %v，期望 %v", off, want)
+	}
+	for i := range want {
+		if off[i] != want[i] {
+			t.Fatalf("第 %d 个参数 = %q，期望 %q（整条 %q）", i, off[i], want[i], joined)
 		}
 	}
-	if strings.Count(off, "--pull") != 3 {
-		t.Errorf("每条 ignore 都要自带 --pull，得到 %q", off)
+	// 通用规则：这条链路上不许出现带参数的 --pull
+	for i, a := range off {
+		if a == "--pull" || a == "pull" {
+			t.Errorf("不该单独给 --pull（它不带参数）：%v", off)
+		}
+		if a == "--pull-filter" && (i+2 >= len(off) || off[i+1] != "ignore") {
+			t.Errorf("--pull-filter 后面该紧跟动作和名字：%v", off)
+		}
 	}
-	// 2.3 没有 --pull filter：传上去是 Unrecognized option 当场退出，
+	// 2.3 没有 --pull-filter：传上去是 Unrecognized option 当场退出，
 	// 那比 MTU 大了还糟——宁可不挡。
 	for _, ver := range []string{"2.3.20", "2.2.1", "", "读不出来"} {
 		if got := warpPullFilters(true, ver); got != nil {
-			t.Errorf("openvpn %q 不该给 --pull filter，得到 %v", ver, got)
+			t.Errorf("openvpn %q 不该给 --pull-filter，得到 %v", ver, got)
 		}
 	}
 	// 2.4 起才有，且发行版后缀（2.4.9-1ubuntu5）不能把版本读成不认识
-	for _, ver := range []string{"2.4.0", "2.4.9-1ubuntu5", "2.5.8", "2.6.20-1ubuntu1", "3.0.0"} {
+	for _, ver := range []string{"2.4.0", "2.4.9-1ubuntu5", "2.5.8", "2.6.20-1ubuntu1", "2.7.9", "3.0.0"} {
 		if warpPullFilters(true, ver) == nil {
 			t.Errorf("openvpn %s 该挡住推送的 MTU", ver)
 		}

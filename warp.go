@@ -357,8 +357,15 @@ func warpOpenVPNArgs(on bool, tunMTU int) []string {
 // 什么都传不动"——而 openvpn 最吃大包的 TLS 握手正好卡在这一步，于是每条出口、
 // 每个候选节点都以超时收场，看着像 VPN Gate 全死了。
 //
-// --pull filter 是 2.4 才有的选项，2.3 传上去会变成 Unrecognized option 直接退出，
+// --pull-filter 是 2.4 才有的选项，2.3 传上去会变成 Unrecognized option 直接退出，
 // 所以按版本给（和数据通道算法那套同一个理由）。关掉中转时返回空切片。
+//
+// 参数名只有一个连字符的位置要说清楚：openvpn 里 `--pull` 是**不带任何参数**的选项，
+// 过滤器是另一个选项 `--pull-filter <accept|ignore|reject> <名字前缀>`。
+// 写成 `--pull filter ignore tun-mtu` 会被当成"pull 后面多带了三个参数"，
+// openvpn 直接回 `Options error: Unrecognized option or missing or extra
+// parameter(s) in [CMD-LINE]:1: pull`，进程当场退出——现场那句就是这个，
+// 表现是"开了中转之后每条出口都连不上"，而 WARP 那一跳其实根本没被试过。
 func warpPullFilters(on bool, ver string) []string {
 	if !on {
 		return nil
@@ -369,7 +376,7 @@ func warpPullFilters(on bool, ver string) []string {
 	}
 	var out []string
 	for _, k := range []string{"tun-mtu", "link-mtu", "mssfix"} {
-		out = append(out, "--pull", "filter", "ignore", k)
+		out = append(out, "--pull-filter", "ignore", k)
 	}
 	return out
 }

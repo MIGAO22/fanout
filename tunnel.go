@@ -412,7 +412,7 @@ func (t *Tunnel) startOpenVPN(dir string, acc *WarpAccount) error {
 	}
 	args = append(args, warpOpenVPNArgs(on, tunMTU)...)
 	// ovpnBinary 和版本探测必须同一个入口：喂给 openvpn 的参数名是按版本挑的
-	// （2.4 叫 --ncp-ciphers、2.5+ 叫 --data-ciphers，--pull filter 也是 2.4 才有），
+	// （2.4 叫 --ncp-ciphers、2.5+ 叫 --data-ciphers，--pull-filter 也是 2.4 才有），
 	// 一旦"探的是系统那份、跑的是编出来的那份"，openvpn 会当场 Unrecognized option 退出。
 	ovpnBin := openvpnBinary()
 	ovpnVer := parseOpenVPNVersion(probeVersion(ovpnBin, "--version"))
