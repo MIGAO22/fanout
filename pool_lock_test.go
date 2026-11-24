@@ -27,6 +27,11 @@ func newTestPoolService(t *testing.T, mgr *Manager) (*PoolService, net.Listener)
 		run:     map[string]*poolRun{"p1": {ln: ln, policy: newPoolPolicy(p.Mode, p.RRStep), stat: map[string]*memberStat{}}},
 		probing: map[string]bool{},
 		stop:    make(chan struct{}),
+		// 补位的三本账要和 newPoolService 一起建：漏了的话 fillPool 一写就 panic，
+		// 测试红在无关的地方，看不出补位本身对不对。
+		fillDead: map[string]map[string]time.Time{},
+		fillBad:  map[string]time.Time{},
+		fillNote: map[string]string{},
 	}
 	notePoolPort(p.Port)
 	t.Cleanup(clearPoolPorts)

@@ -394,6 +394,8 @@ func (s *PoolService) resolveMembers(id string) []poolMember {
 			m.NS = t.nsName()
 			m.ExitIP = st.ExitIP
 			m.Up = st.Status == "up"
+			// 光有 Up 分不开"还在自救"和"自救用完了"，补位要看原话。
+			m.Status = st.Status
 		}
 		if pr != nil {
 			pr.mu.Lock()

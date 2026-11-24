@@ -76,16 +76,20 @@ const (
 
 	// ── 自动补齐（AutoFill）───────────────────────────────
 
-	// poolFillInterval 是补位巡检的节奏。比测速慢一倍是有意的：补位要起
-	// openvpn 进程、占槽位，属于这条链路上最贵的动作，不该跟着 UI 一起急。
-	poolFillInterval = 30 * time.Second
-
-	// poolFillDeadAfter 是"这条成员放弃了吗"的等待门槛。
+	// poolFillInterval 是补位巡检的节奏。
 	//
-	// fanout 本来就会自动换同区节点重连，VPN Gate 的掉线绝大多数几分钟内自愈。
-	// 一掉就补会和那条路径打架：两条出口同时抢一个地区，补出来的那条
-	// 其实根本不需要。等满这段时间还起不来，才认定这个位置真空了。
-	poolFillDeadAfter = 5 * time.Minute
+	// 10 秒而不是原来的 30 秒：用户要的是"节点挂了立刻换一条在线的"。
+	// 顶替优先复用已经在线的出口（poolReusePick），那一步只是改一份成员名单，
+	// 不起进程、不占连接预算，所以巡检再快也不贵；真正贵的"新建出口"是最后手段。
+	poolFillInterval = 10 * time.Second
+
+	// poolFillDeadAfter 是"这条成员还在自救，先别动它"的等待门槛。
+	//
+	// 只用在 starting（自动换节点重连进行中）这一种状态上：fanout 本来就会自动换节点，
+	// VPN Gate 的掉线大多数几十秒内自愈，一掉就补会让两条路径抢同一个位置。
+	// 已经 failed / stopped 的成员不等——那是重连一轮跑完仍没回来的确定信号，
+	// 再等下去只是让组里白空一个坑。
+	poolFillDeadAfter = 90 * time.Second
 
 	// poolFillSlotFloor 是补位必须留下的槽位余量。
 	// 自动补位是唯一会"自己开出口"的路径，不加水位的话某组连崩几轮
@@ -314,9 +318,13 @@ type poolMember struct {
 	// NS 是这条出口的网络命名空间，拨号要切进去。
 	NS string
 	// Slot/ExitIP 只为界面服务，选路不看。
-	Slot    int
-	ExitIP  string
-	Up      bool
+	Slot   int
+	ExitIP string
+	Up     bool
+	// Status 是这条出口的原始状态（up/starting/failed/stopped/""）。
+	// 补位要它而不能只看 Up：starting 是"还在自救"，failed 是"自救用完了"，
+	// 前者该等一会儿、后者立刻换人，两者在 Up 这一个布尔值里长得一样。
+	Status  string
 	Latency time.Duration // 实测 EWMA，0 表示还没有样本
 	Cooling bool          // 刚失败过，暂时不优先选它
 }
@@ -536,11 +544,14 @@ func poolGoneHosts(members []poolMember, firstDead map[string]time.Time, after t
 			live++
 			continue
 		}
-		if m.NS == "" {
+		// 连隧道都没有（NS 空）或者重连已经跑完一轮还是失败（failed/stopped）：
+		// 这就是"节点挂了"的确定信号，不必再等——等下去组里就白空一个坑。
+		if m.NS == "" || m.Status == "failed" || m.Status == "stopped" {
 			gone = append(gone, m.Host)
 			delete(firstDead, m.Host)
 			continue
 		}
+		// 剩下只有 starting：自动换节点还在试，给它 after 这么长时间自救。
 		first, ok := firstDead[m.Host]
 		if !ok {
 			firstDead[m.Host] = now
@@ -553,23 +564,34 @@ func poolGoneHosts(members []poolMember, firstDead map[string]time.Time, after t
 	return live, gone
 }
 
-// poolFillFollow 给每个补位名额指定"跟谁的地区"。
+// poolReusePick 从"此刻在线的出口"里挑要拿来顶替的名额。
 //
-// 返回的是失效成员的主机名而不是国家码：地区查得到查不到是调用方的事
-// （隧道可能已经被删了，只能回头从节点清单里查），纯函数这里只管配对。
-// 名额多于失效成员时（比如用户把目标数调大了），多出来的那些给空串，
-// 意思是"没有原来的地区可跟，任意地区都行"——再窄化成某个地区就成了凭空猜。
-func poolFillFollow(need int, gone []string) []string {
+// 顺序是有意的：没被任何组用着的先上。已经挂在别的组里的那条当然也能共用
+// （成员名单本来就允许重名），但能不动别人的保活就不动——那条挂了时要换人的
+// 是别的组，两个组同时盯着同一条出口只会互相抢。
+// 输入顺序保持稳定，方便界面和测试对着同一次结果。
+func poolReusePick(cands []poolFillCand, need int) []string {
 	if need <= 0 {
 		return nil
 	}
-	out := make([]string, 0, need)
-	for i := 0; i < need; i++ {
-		if i < len(gone) {
-			out = append(out, gone[i])
-			continue
+	var out []string
+	// 两轮：先收"没挂在任何组里"的（wantSpare=true），名额没满才收共用的。
+	for _, wantSpare := range []bool{true, false} {
+		for _, c := range cands {
+			if len(out) >= need {
+				return out
+			}
+			if c.Online && !c.Shared == wantSpare {
+				out = append(out, c.Host)
+			}
 		}
-		out = append(out, "")
 	}
 	return out
+}
+
+// poolFillCand 是一条可以拿来顶替的候选出口。
+type poolFillCand struct {
+	Host   string
+	Online bool // 此刻真的能用（隧道 up）
+	Shared bool // 已经在某个出口组的成员名单里
 }

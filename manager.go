@@ -155,34 +155,6 @@ func (m *Manager) SlotHeadroom() int {
 	return free
 }
 
-// MemberRegion 按主机名查一个组员该跟哪个地区。
-//
-// 两个来源按顺序问，各治一种缺失：
-// 掉线的那条隧道可能已经被停掉删掉了，只能从节点清单里查；
-// 反过来家宽节点说没就没（用户报的"节点没了"就是这一种），清单里查不到，
-// 但隧道自己身上还记着当初连的是哪个国家。只问清单的话，
-// 恰恰在最需要跟住地区的时候返回空串，补位补出来的是任意地区。
-// 两边都查不到才返回空串，调用方按任意地区处理。
-func (m *Manager) MemberRegion(host string) string {
-	if host == "" {
-		return ""
-	}
-	m.mu.RLock()
-	listed := m.nodeRegionLocked(host)
-	var remembered string
-	for _, t := range m.tunnels {
-		if t.host() == host {
-			remembered = t.node().CountryCode
-			break
-		}
-	}
-	m.mu.RUnlock()
-	if listed != "" {
-		return listed
-	}
-	return remembered
-}
-
 // nodeRegionLocked 从当前节点清单里查国家码。调用方必须已持 m.mu。
 func (m *Manager) nodeRegionLocked(host string) string {
 	for _, n := range m.nodes {

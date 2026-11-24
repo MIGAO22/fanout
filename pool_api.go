@@ -27,11 +27,6 @@ func apiPools(m *Manager) http.HandlerFunc {
 			"modes":     modes,
 			"rr_step":   poolDefaultRRStep,
 			"max_hosts": 32,
-			// 补位规则的阈值一并给界面：文案里要写"连续 5 分钟连不上才算死"、
-			// "槽位余量不足 2 个就不补"，硬编码在前端的话改了这边那边不知道。
-			"fill_dead_after_min": int(poolFillDeadAfter.Minutes()),
-			"fill_slot_floor":     poolFillSlotFloor,
-			"fill_max_size":       poolMaxSize,
 		})
 	}
 }

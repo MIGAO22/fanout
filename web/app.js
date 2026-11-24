@@ -737,9 +737,9 @@ function poolRow(p){
     : (p.up === 0 ? '<div class="errbox"><b>组内没有可用出口</b>连接会失败，不会退回母机直连</div>' : '');
 
   const fillTag = p.auto_fill
-    ? ' <span class="pt" title="掉线后自动挑新出口顶到这一条上">自动补齐 ' + p.size + ' 条</span>'
+    ? ' <span class="pt" title="掉线后先用在线出口顶上来，在线的不够才新建">自动补齐 ' + p.size + ' 条</span>'
     : '';
-  // 没补齐时后端会写一句原因（槽位水位不够 / 同地区没得挑）。
+  // 没补齐时后端会写一句原因（在线出口都用上了 / 槽位余量不够 / 挑不到节点）。
   // 只在还缺人的时候显示，补齐了就闭嘴，否则一个正常的组永远挂着灰字。
   const fillNote = (p.auto_fill && p.fill_note && p.up < p.size)
     ? '<div class="hint" style="margin:-2px 0 8px">' + esc(p.fill_note) + '</div>'

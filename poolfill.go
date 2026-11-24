@@ -55,7 +55,14 @@ func (s *PoolService) fillOnce() {
 }
 
 // fillPool 把一个组补回 Size 条可用成员。
-// 一次最多补 need 条，补不上就把原因写进 note 给界面看，不重试到成功为止。
+//
+// 两条路，按代价排：先把**此刻已经在线的出口**顶进来（只改成员名单，瞬时、
+// 不花连接预算），不够再新建出口（要起 openvpn、等 tun0、等出口 IP，几十秒起步，
+// 还要占槽位）。新建是最后手段，不是默认手段。
+//
+// 目标条数 `p.Size` 在这里只读不写：用户设的"维持可用条数"不会因为掉线、
+// 也不会因为补不满而变小。补不齐时把差多少、为什么写进 note 给界面看，
+// 下一轮接着试。
 func (s *PoolService) fillPool(p *Pool) {
 	now := time.Now()
 	// 失效计时取快照、算完再整体换回：poolGoneHosts 要就地增删这张表，
@@ -70,34 +77,101 @@ func (s *PoolService) fillPool(p *Pool) {
 		return
 	}
 
-	headroom := s.mgr.SlotHeadroom()
-	if headroom-need < poolFillSlotFloor {
-		s.setFillNote(p.ID, fmt.Sprintf(
-			"还差 %d 条，但槽位只剩 %d 个：自动补齐要留 %d 个余量，先不补", need, headroom, poolFillSlotFloor))
+	// 第一优先：复用在线出口。挑的时候避开本组成员、刚失败还在冷却的那批。
+	filled := 0
+	for _, host := range poolReusePick(s.fillCandidates(p.ID), need) {
+		if s.reuseOne(p, host, slotOf(gone, filled)) {
+			filled++
+		}
+	}
+	rest := need - filled
+	if rest <= 0 {
+		log.Printf("出口组 %s 用在线出口顶回 %d 条（目标 %d）", p.Name, filled, p.Size)
+		s.setFillNote(p.ID, "")
 		return
 	}
 
-	filled := 0
-	for i, follow := range poolFillFollow(need, gone) {
-		region := s.mgr.MemberRegion(follow)
-		picks, err := s.mgr.pickNodes(region, 1, s.fillAvoid(p.ID))
+	// 第二优先（最后手段）：新建出口。地区不限——用户要的是"数量立刻回来"，
+	// 不是"地区一模一样"；跟着死成员的地区挑，恰恰最容易挑到同一批一起挂的机房。
+	headroom := s.mgr.SlotHeadroom()
+	room := headroom - poolFillSlotFloor
+	if room < 0 {
+		room = 0
+	}
+	if room < rest {
+		s.setFillNote(p.ID, fmt.Sprintf(
+			"已顶回 %d 条，还差 %d 条：在线出口都用上了，新建受槽位限制（还能开 %d 个，要留 %d 个余量）",
+			filled, rest, room, poolFillSlotFloor))
+	}
+	created := 0
+	for i := 0; i < room; i++ {
+		picks, err := s.mgr.pickNodes("", 1, s.fillAvoid(p.ID))
 		if err != nil {
-			s.setFillNote(p.ID, fmt.Sprintf("还差 %d 条：%v", need-i, err))
+			s.setFillNote(p.ID, fmt.Sprintf("已顶回 %d 条，还差 %d 条：%v", filled+created, need-filled-created, err))
 			return
 		}
 		node := picks[0]
-		if !s.fillOne(p, node, slotOf(gone, i)) {
+		if !s.fillOne(p, node, slotOf(gone, filled+created)) {
 			s.markFillBad(node.HostName)
 			s.setFillNote(p.ID, fmt.Sprintf("补位没成：试了 %s，还是连不上（冷却 %d 分钟）",
 				node.HostName, int(poolFillPenalty.Minutes())))
 			continue
 		}
-		filled++
+		created++
 	}
-	if filled > 0 {
-		log.Printf("出口组 %s 自动补齐 %d 条成员（目标 %d）", p.Name, filled, p.Size)
+	if created > 0 {
+		log.Printf("出口组 %s 自动补齐 %d 条成员（在线顶替 %d 条 + 新建 %d 条，目标 %d）",
+			p.Name, filled+created, filled, created, p.Size)
 		s.setFillNote(p.ID, "")
 	}
+}
+
+// fillCandidates 列出此刻能拿来顶替的现有出口：在线、不在这个组里、不在冷却里。
+// Shared 标出它是否已经挂在某个组的成员名单上，供 poolReusePick 排序。
+func (s *PoolService) fillCandidates(id string) []poolFillCand {
+	inPool := map[string]bool{}
+	shared := map[string]bool{}
+	for _, p := range s.pools() {
+		for _, h := range p.Hosts {
+			shared[h] = true
+			if p.ID == id {
+				inPool[h] = true
+			}
+		}
+	}
+	s.mu.Lock()
+	cooling := map[string]bool{}
+	for h, until := range s.fillBad {
+		if now2 := time.Now(); now2.Before(until) {
+			cooling[h] = true
+		}
+	}
+	s.mu.Unlock()
+
+	var out []poolFillCand
+	for _, t := range s.mgr.Tunnels() {
+		h := t.host()
+		if h == "" || inPool[h] || cooling[h] {
+			continue
+		}
+		out = append(out, poolFillCand{Host: h, Online: t.status() == "up", Shared: shared[h]})
+	}
+	return out
+}
+
+// reuseOne 把一个已经在线的出口顶进组里，只改成员名单，不起新出口。
+//
+// 和 fillOne 一样先写回成员、再收尾旧的：反过来做的话中途写回失败，
+// 组里就同时少了两个人。
+func (s *PoolService) reuseOne(p *Pool, host, oldHost string) bool {
+	if err := s.swapMember(p.ID, oldHost, host); err != nil {
+		log.Printf("出口组 %s 顶替 %s 失败: %v", p.Name, host, err)
+		return false
+	}
+	s.forgetFillDead(p.ID, oldHost)
+	s.retireMember(oldHost)
+	log.Printf("出口组 %s：用在线的 %s 顶替了 %s", p.Name, host, orNone(oldHost))
+	return true
 }
 
 // fillOne 起一条新出口并等它真的能用，成功了才顶替进组里。
