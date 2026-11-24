@@ -1256,7 +1256,8 @@ html[data-theme="dark"] .scr{background:rgba(0,0,0,.62)}
               <label class="sw"><input type="checkbox" id="setAeadOnly"><span class="track"></span>
                 <span>数据通道只要 AEAD（放开内核 offload）</span></label>
               <div class="hint">openvpn 2.7 一带 CBC 兜底就自己禁用内核 data channel offload。
-                打开后走内核加解密、母机更省，代价是只支持老算法的节点连不上——Gate 上这批不少。
+                打开后走内核加解密、母机更省。只对节点配置里声明支持 AEAD 的出口生效——
+                VPN Gate 的节点大多写死 AES-128-CBC，那种出口继续按原来的算法连。
                 需要本机 openvpn ≥2.5，老版本上这个开关不起作用。</div>
             </div>
           </section>

@@ -416,9 +416,11 @@ func (t *Tunnel) startOpenVPN(dir string, acc *WarpAccount) error {
 	// 一旦"探的是系统那份、跑的是编出来的那份"，openvpn 会当场 Unrecognized option 退出。
 	ovpnBin := openvpnBinary()
 	ovpnVer := parseOpenVPNVersion(probeVersion(ovpnBin, "--version"))
-	// AEAD-only 那一档是设置里的开关：开了才放弃 CBC 与 fallback，好让 2.7 用上
-	// 内核 data channel offload；关着就是原来的行为。
-	aeadOnly := connConf().AeadOnly && !ovpnConfigEnablesCompression(t.node().Config)
+	// AEAD-only 那一档是设置里的开关，但只对"节点自己声明支持 AEAD"的出口生效：
+	// VPN Gate 的配置大多写死 data-ciphers AES-128-CBC，那种节点上硬上 AEAD
+	// 是一个都连不上，而不是慢一点。开压缩的节点同理（--allow-compression no 会冲突）。
+	aeadOnly := connConf().AeadOnly && ovpnConfigOffersAEAD(t.node().Config) &&
+		!ovpnConfigEnablesCompression(t.node().Config)
 	args = append(args, dataCipherArgs(ovpnVer, aeadOnly)...)
 	if aeadOnly {
 		args = append(args, compressionOffArgs(ovpnVer)...)

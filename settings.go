@@ -70,8 +70,10 @@ type ConnSettings struct {
 	//
 	// 开的代价与收益都很具体：openvpn 2.7 见到 --data-ciphers-fallback 就禁用
 	// 内核 data channel offload（它自己在日志里明说），去掉 fallback 才能拿到
-	// 内核加解密；代价是只讲 AES-256-CBC 的老节点直接连不上——VPN Gate 上这批
-	// 不少，所以默认关着，让要性能的人自己换。
+	// 内核加解密。但它只对"节点配置自己声明支持 AEAD"的出口生效——
+	// VPN Gate 那份 SoftEther 生成的配置直接写着 data-ciphers AES-128-CBC，
+	// 那种节点上硬上 AEAD 是一个都连不上，所以判断交给 ovpnConfigOffersAEAD，
+	// 开关本身不会把用户的节点池打没。
 	AeadOnly bool `json:"aead_only,omitempty"`
 }
 

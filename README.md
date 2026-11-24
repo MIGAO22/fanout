@@ -197,6 +197,12 @@ fanout 只要那 32 字节密钥和一条策略路由，多养一个 daemon 只�
   另外 AEAD-only 的两种反噬（算法谈不拢、节点硬要开压缩）都以 `OPTIONS ERROR:` 开头，
   专门排在通用的"参数没被接受"前面，否则报出来的原因是错的。
 
+**v2.1.4 把上一版的 AEAD-only 改成按节点收敛。** 发完 v2.1.3 去翻真机上的节点配置，
+才发现 VPN Gate 那份 .ovpn 是 SoftEther 自动生成的、里面写着
+`data-ciphers AES-128-CBC`：也就是说 v2.1.3 那个开关一打开，不是"少连几个老节点"，
+而是**一个节点都连不上**。现在多了一层判断——只有节点配置自己声明支持 AEAD 才换参数
+（实样、声明 GCM/CHACHA20、后面覆盖前面、注释里提到、没写算法五种情况各一条用例）。
+
 ## 原理
 
 每个节点跑在独立的 network namespace 里，netns 内启动官方 openvpn 客户端。
@@ -250,7 +256,7 @@ Xray 到 `/var/lib/fanout/bin/`，装了则跳过，入站交给面板管。
 > 才生效：`f` → `3) 重启`（或 `f restart`）。`install.sh` 现在重装会显式
 > `systemctl restart`——以前用 `enable --now`，对已运行的单元是空操作，
 > 于是新二进制在磁盘上、老进程还在服务老界面。
-> 想确认手上是哪一份：`fanout -version`，本仓库显示 `v2.1.3`，上游原版是 `v1.3.1`。
+> 想确认手上是哪一份：`fanout -version`，本仓库显示 `v2.1.4`，上游原版是 `v1.3.1`。
 
 > **发新版本。** 推一个 `v*` tag 就会触发 release workflow 出 amd64 / arm64
 > 两个包和 checksums；不打 tag 就没有 Release，`releases/latest/download/...`
@@ -455,13 +461,18 @@ Fedora Copr（`@OpenVPN/openvpn-release-2.7`，`dnf copr enable` 那条路），
 **2.7 还多了一层取舍：只要 AEAD 才拿得到内核 offload。** openvpn 2.7 只要看见
 `--data-ciphers-fallback` 就自己禁用 data channel offload（那句
 `Note: --data-ciphers-fallback … disables data channel offload` 是它自己打的），
-而 fallback 正是为了连上 VPN Gate 上那批只讲 AES-256-CBC 的老节点才给的。
+而 fallback 正是为了连上只讲 AES-256-CBC 的老节点才给的。
 所以「设置与连接 → 重试与面板」里有个**默认关着**的「数据通道只要 AEAD（放开内核 offload）」：
 打开后算法表只留 AES-256-GCM / AES-128-GCM / CHACHA20-POLY1305、不给 fallback、
-并补 `--allow-compression no`（同样是 offload 的前置条件），加解密就落到内核里；
-代价是只支持老算法的节点直接连不上。节点那份配置自己开了压缩时这条不生效——
-`--allow-compression no` 和它是冲突，openvpn 会直接退出而不是降级。
-2.4 及读不出版本时这个开关不起作用，行为与之前完全一致。
+并补 `--allow-compression no`（同样是 offload 的前置条件），加解密就落到内核里。
+
+**这一档按节点的能力自动收敛，不是一刀切。** 真机捞到的 VPN Gate 配置是
+SoftEther/PacketiX 自动生成的，里面直接写着 `data-ciphers AES-128-CBC`——
+服务端只会这一种。硬上一刀切会把用户的整个节点池关掉，报出来还是"连不上"。
+所以只有节点配置自己声明了 AEAD 才改参数；节点配置自己开了压缩的也不改
+（`--allow-compression no` 与它是冲突，openvpn 直接退出而不是降级）。
+实际效果就是：VPN Gate 上大多数出口不变，那些真跑 OpenVPN 且支持 AEAD 的节点才吃到内核加解密。
+2.4 及读不出版本时这个开关完全不起作用，行为与之前一致。
 
 **apt 到不了的地方，还有一条源码编译的路。** 官方 apt 源的 `release/2.7` 通道在不少发行版上
 只喂到预发布：实测 noble / bookworm / jammy / plucky 是 `2.7~alpha1`，trixie 是 `2.7~beta1`，
@@ -749,7 +760,7 @@ REALITY 的密钥对和 shortId 自动生成；TLS 不填证书就生成自签�
 
 ```
   状态      运行中
-  版本      fanout v2.1.3
+  版本      fanout v2.1.4
   开机自启  enabled
 
   管理地址  http://1.2.3.4:8899/gwPuWHvaNr/

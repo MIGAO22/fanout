@@ -57,6 +57,42 @@ func compressionOffArgs(ver string) []string {
 	return []string{"--allow-compression", "no"}
 }
 
+// ovpnConfigOffersAEAD 看节点那份 .ovpn 自己声明的数据通道算法里有没有 AEAD。
+//
+// 这一条决定了 AEAD-only 那个开关到底该不该对这条出口生效。原因在真机上量到的：
+// VPN Gate 的配置是 SoftEther/PacketiX 自动生成的，里面直接写着
+// `data-ciphers AES-128-CBC`（老一点的还配 `cipher AES-128-CBC`）——
+// 服务端只会这一种。这时候客户端硬上 AEAD-only 不是"少连几个节点"，
+// 是一个节点都连不上（openvpn 报 failed to negotiate cipher）。
+//
+// 所以判断保守：配置里没写算法、或者写来写去只有 CBC，都算"不支持"，
+// 那条出口继续走带 fallback 的原有参数。开关只在节点自己证明支持 AEAD 时才改行为。
+func ovpnConfigOffersAEAD(cfg string) bool {
+	seen := ""
+	for _, line := range strings.Split(cfg, "\n") {
+		f := strings.Fields(line)
+		if len(f) < 2 {
+			continue
+		}
+		switch strings.ToLower(strings.TrimPrefix(f[0], "--")) {
+		case "data-ciphers", "ncp-ciphers", "cipher":
+			// 取最后一条：配置里出现多次时后面的是生效的那条
+			seen = strings.ToLower(f[1])
+		}
+	}
+	if seen == "" {
+		return false
+	}
+	for _, c := range strings.FieldsFunc(seen, func(r rune) bool {
+		return r == ':' || r == ',' || r == ' '
+	}) {
+		if strings.Contains(c, "-gcm") || strings.Contains(c, "chacha20") {
+			return true
+		}
+	}
+	return false
+}
+
 // ovpnConfigEnablesCompression 看节点那份 .ovpn 自己有没有开数据通道压缩。
 //
 // 开着就不能再补 --allow-compression no：openvpn 把这当成配置冲突直接退出

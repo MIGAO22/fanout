@@ -442,6 +442,38 @@ func TestOvpnConfigEnablesCompression(t *testing.T) {
 	}
 }
 
+// AEAD-only 必须按节点的能力来决定，不能由开关一刀切。
+//
+// 真机捞到的 VPN Gate 配置（SoftEther/PacketiX 自动生成）里直接写着
+// `cipher AES-128-CBC` + `data-ciphers AES-128-CBC`——服务端只会这一种。
+// 一刀切的话打开开关就把用户的整个节点池关掉，报出来还是"连不上"。
+func TestOvpnConfigOffersAEAD(t *testing.T) {
+	gateSample := "dev tun\r\nproto tcp\r\nremote 126.187.75.122 1262\r\n" +
+		"#  cipher: [NULL-CIPHER] NULL AES-128-CBC AES-256-CBC BF-CBC\r\n" +
+		"#  data-ciphers: same as cipher\r\n" +
+		"cipher AES-128-CBC\r\ndata-ciphers AES-128-CBC\r\nauth SHA1\r\n" +
+		"resolv-retry infinite\r\nnobind\r\npersist-key\r\npersist-tun\r\nclient\r\n"
+	cases := []struct {
+		name string
+		cfg  string
+		want bool
+	}{
+		{"Gate 实样（只有 CBC）", gateSample, false},
+		{"声明了 GCM", "data-ciphers AES-256-GCM:AES-128-CBC\n", true},
+		{"声明了 CHACHA20", "data-ciphers CHACHA20-POLY1305\n", true},
+		{"只写 cipher 且是 AEAD", "--cipher AES-128-GCM\n", true},
+		{"后面那条覆盖前面的", "data-ciphers AES-256-GCM\ndata-ciphers AES-128-CBC\n", false},
+		{"注释里提 AEAD 不算", "# data-ciphers AES-256-GCM\n", false},
+		{"压根没写算法（保守）", "dev tun\nproto udp\nremote a 1194\n", false},
+		{"空配置", "", false},
+	}
+	for _, c := range cases {
+		if got := ovpnConfigOffersAEAD(c.cfg); got != c.want {
+			t.Errorf("%s: = %v, 想 %v", c.name, got, c.want)
+		}
+	}
+}
+
 // 这几个解析函数是「检查更新」里 openvpn 那个版本号的唯一出处，而各家包管理器的
 // 输出形状差得很远。夹具按真机输出抄，改坏了要在这里红，而不是在界面上
 // 显示一个"2.6.11-1"被截断成"openvpn.x86_64"这种荒唐数字。
