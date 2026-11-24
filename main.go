@@ -83,6 +83,18 @@ func main() {
 		log.Printf("节点链接后端: %s", p.Describe())
 	}
 
+	// WARP 的注册记录必须在恢复隧道之前就位：中转开着时每条出口起来都要先
+	// 拿账号架 WireGuard，读不到记录就只能重新注册——同一条出口在 Cloudflare
+	// 那边留下一串没人认领的账号，比慢启动严重得多（见 warprun.go 的 warpService）。
+	if ws, err := newWarpService(*workDir); err != nil {
+		log.Printf("WARP 注册记录加载失败（中转将不可用）: %v", err)
+	} else {
+		warpSvc = ws
+		if n := len(ws.all()); n > 0 {
+			log.Printf("已载入 %d 条 WARP 注册记录", n)
+		}
+	}
+
 	mgr := NewManager(*maxSlots, *workDir)
 	log.Printf("正在拉取节点列表...")
 	if n, err := mgr.RefreshNodes(); err != nil {
@@ -139,6 +151,9 @@ func main() {
 	mux.HandleFunc("/api/jobs", apiJobs(mgr))
 	mux.HandleFunc("/api/jobs/dismiss", apiJobDismiss(mgr))
 	mux.HandleFunc("/api/exits", apiExits(mgr))
+	// WARP 中转：开关在出口总览页，重新注册在内置客户端卡片
+	mux.HandleFunc("/api/warp", apiWarp(mgr))
+	mux.HandleFunc("/api/client/warp/apply", apiClientWarpApply(mgr))
 	mux.HandleFunc("/api/stats", apiHostStats)
 	mux.HandleFunc("/api/xui", apiXUIStatus)
 	mux.HandleFunc("/api/xui/inbounds", apiXUIInbounds(mgr))
@@ -571,6 +586,81 @@ func apiClientOpenVPNSource(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "message": msg})
+}
+
+// apiWarp 是出口总览页那个中转开关的后端。
+//
+// GET 只回状态，供界面渲染开关该摆在哪儿；POST ?on=1|0 才动手。切换要把已有出口
+// 逐条重连，是几十秒到几分钟的活儿，所以返回作业 id 让界面自己轮进度，
+// 而不是把这个 HTTP 请求挂那么久——中间断了用户既不知道成败，也重试不了。
+func apiWarp(m *Manager) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if warpSvc == nil {
+			writeJSON(w, http.StatusServiceUnavailable,
+				map[string]string{"error": "WARP 注册记录没加载起来（工作目录不可写？）"})
+			return
+		}
+		if r.Method != http.MethodPost {
+			writeJSON(w, http.StatusOK, warpOverview())
+			return
+		}
+		var on bool
+		switch r.URL.Query().Get("on") {
+		case "1", "true":
+			on = true
+		case "0", "false":
+			on = false
+		default:
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "on 只能是 1 或 0"})
+			return
+		}
+		job, err := warpSet(m, on)
+		if err != nil {
+			// 前置条件不满足（没装 wireguard-tools、Cloudflare 够不着、注册失败）
+			// 时开关保持原样，这里把原话透给界面，别再套一层"操作失败"
+			writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
+			return
+		}
+		msg := "中转已关闭，正在把出口逐条接回直连"
+		if on {
+			msg = "中转已开启，正在把出口逐条接进 Cloudflare"
+		}
+		out := map[string]any{"ok": true, "enabled": warpOn(), "message": msg}
+		if job == nil {
+			out["message"] = "现在没有出口要重连，开关已生效"
+		} else {
+			out["job"] = job.ID()
+		}
+		writeJSON(w, http.StatusOK, out)
+	}
+}
+
+// apiClientWarpApply 是内置客户端那张卡上「更新 WARP」的按钮。
+// 它做的是按最新客户端版本重新注册各条出口，不替换任何二进制——
+// fanout 用内核 WireGuard 直连 Cloudflare，机器上本来就没有属于它的 WARP 程序。
+func apiClientWarpApply(m *Manager) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "用 POST"})
+			return
+		}
+		if warpSvc == nil {
+			writeJSON(w, http.StatusServiceUnavailable,
+				map[string]string{"error": "WARP 注册记录没加载起来（工作目录不可写？）"})
+			return
+		}
+		job, err := warpReregister(m)
+		if err != nil {
+			writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok":  true,
+			"job": job.ID(),
+			"message": "正在按最新客户端版本重新注册 WARP：每条出口会换一对密钥、" +
+				"拿到一个新的 Cloudflare 接入，出口 IP 不变",
+		})
+	}
 }
 
 // apiExits 返回主界面需要的一切：出口以及挂在它上面的入站。

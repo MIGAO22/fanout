@@ -363,8 +363,22 @@ func (m *Manager) tryNode(t *Tunnel) (string, error) {
 	if err := t.setupNetns(); err != nil {
 		return "", err
 	}
-	if err := t.startOpenVPN(m.workDir); err != nil {
+	// WARP 中转必须在 openvpn 之前架好：隧道一起来就会抢默认路由，
+	// 那时再改路由已经晚了。开关没开时这里是空操作，链路和以前完全一样。
+	acc, err := warpForTunnel(t)
+	if err != nil {
 		return "", err
+	}
+	if err := t.startOpenVPN(m.workDir, acc); err != nil {
+		return "", err
+	}
+	if acc != nil {
+		// tun0 通了才谈得上把用户流量接进节点。这一步失败要当"这个节点没连上"
+		// 处理：漏掉它的话流量停在 Cloudflare，拿到的出口 IP 是 WARP 的，
+		// 界面显示已连通、实际根本没走节点——比连不上更难查。
+		if err := t.warpSplit(acc); err != nil {
+			return "", err
+		}
 	}
 	if t.getListener() == nil {
 		if err := t.serve(); err != nil {

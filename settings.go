@@ -26,6 +26,9 @@ type WebSettings struct {
 	// SubToken 是订阅地址里的口令。订阅要免登录才能被客户端拉取，
 	// 所以这串就是它唯一的门槛，等同于密码，不要外传。
 	SubToken string `json:"sub_token,omitempty"`
+	// Warp 是"出口流量先过一层 Cloudflare WARP"。用指针的理由和 ResidentialOnly
+	// 一样：老配置文件里没这个字段，nil 表示没配过（按关闭处理）。
+	Warp *WarpSettings `json:"warp,omitempty"`
 	// Conn 是连接层的可调参数：健康检查节奏、重连退避、面板写入合并之类。
 	// 这些原来全是写死的常量，但 VPN Gate 的质量随地区和时间差很多，
 	// 同一套阈值在美国 VPS 和家用宽带上不可能都合适，只能交给使用者。
@@ -115,6 +118,60 @@ func (c ConnSettings) normalized() ConnSettings {
 
 // connConf 取当前连接层参数（已夹过界）。
 func connConf() ConnSettings { return getWebSettings().Conn.normalized() }
+
+// WarpSettings 是 WARP 中转的配置。
+type WarpSettings struct {
+	// Enabled 是总开关。开着之后每条出口的 netns 里默认路由进 Cloudflare，
+	// 用户流量再经 openvpn 送到节点——即"母机 → WARP → 出口节点"。
+	Enabled bool `json:"enabled"`
+	// ClientVersion 是注册时上报给 Cloudflare 的客户端版本号，空=fanout 内置那个。
+	// 对端按这个号下发接入配置，官方发了新版而这里还报旧号，
+	// 有被判成过期客户端、拿不到接入点的风险。
+	ClientVersion string `json:"client_version,omitempty"`
+}
+
+// normalized 把填歪的版本号退回内置值。上报一个不像版本号的字符串没有任何意义，
+// 只会让 Cloudflare 那边的下发结果变得无法预期。
+func (w WarpSettings) normalized() WarpSettings {
+	if _, ok := warpVersionParts(w.ClientVersion); !ok {
+		w.ClientVersion = ""
+	}
+	return w
+}
+
+// warpConf 取当前 WARP 配置（已夹过界）。
+func warpConf() WarpSettings { return getWebSettings().warp().normalized() }
+
+// warpOn 返回中转开关是否打开。没配过时是关闭：这层链路会把出口
+// 吊在 Cloudflare 上，没经过用户同意不该默认替他改路由。
+func warpOn() bool { return warpConf().Enabled }
+
+// warpReportVersion 返回注册时该上报的版本号。
+func warpReportVersion() string {
+	if v := warpConf().ClientVersion; v != "" {
+		return v
+	}
+	return warpClientVersion
+}
+
+// setWarp 改 WARP 配置并落盘。改版本号不影响已经注册好的账号——
+// 想按新号重新注册要走内置客户端那张卡的"更新"。
+func setWarp(w WarpSettings) error {
+	w = w.normalized()
+	webSettingsMu.Lock()
+	webSettingsCur.Warp = &w
+	webSettingsMu.Unlock()
+	return saveWebSettings()
+}
+
+// warp 取出 WARP 配置。指针为 nil 表示老的设置文件里根本没这一项，
+// 按零值（关闭 + 用内置版本号）处理。
+func (s WebSettings) warp() WarpSettings {
+	if s.Warp == nil {
+		return WarpSettings{}
+	}
+	return *s.Warp
+}
 
 // residentialOnly 返回"只用家宽"是否开启。没配过时默认开：
 // fanout 存在的意义就是把家宽扇成出口，机房 IP 对用户没价值。

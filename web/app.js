@@ -480,6 +480,16 @@ function exitCard(e){
     ? '<span class="auth">鉴权</span>'
     : '<span class="auth anon">无鉴权</span>';
 
+  // 只有中转真的架起来了才占一行。标签写「中转」而不是「出口」：这串是
+  // Cloudflare 的接入点，对外暴露的身份还是上面那个出口 IP，两者混不得。
+  const warp = e.warp_ip
+    ? '<div class="wipline' + (e.warp_live ? '' : ' dead') + '"><span class="lbl">中转</span>'
+      + '<span class="copyable" data-copy="' + esc(e.warp_ip) + '" title="复制 Cloudflare 接入点">'
+      + esc(e.warp_ip) + '</span>'
+      + '<span class="badge ' + (e.warp_live ? 'ok' : 'warn') + '">'
+      + (e.warp_live ? '已握手' : '未握手') + '</span></div>'
+    : '';
+
   return '<article class="card ' + st + '">'
     + '<div class="hd">'
     +   '<span class="orb ' + st + '" title="' + (STATUS[st] || st) + '"></span>'
@@ -495,6 +505,7 @@ function exitCard(e){
     + '<div class="ip"><span class="lbl">出口</span>'
     +   '<span class="copyable" data-copy="' + esc(e.exit_ip || '') + '" title="复制出口 IP">'
     +     ip + '</span></div>'
+    + warp
     + '<div class="meta">' + slot + since + speed + '</div>'
     + '<div class="sock">'
     +   '<span class="ep">' + ICON.server + '<span>' + esc(ep) + '</span>' + auth + '</span>'
@@ -507,6 +518,68 @@ function exitCard(e){
     + err
     + '</article>';
 }
+
+// 出口总览页那条状态栏。数据全来自 /api/exits 的 warp 字段：握手与否是后端
+// 进 netns 读 WireGuard 实况得到的，这里不自己判断，也不把注册值当在线值。
+function renderWarpBar(){
+  const bar = $('#wbar');
+  if(!bar) return;
+  const w = view.warp || {};
+  bar.classList.toggle('on', !!w.enabled);
+  const sw = $('#wbarSw');
+  sw.checked = !!w.enabled;
+  sw.disabled = !w.ready || warpBusy();
+  const badge = $('#wbarBadge');
+  badge.className = 'badge ' + (!w.ready ? 'bad' : w.enabled ? 'ok' : 'idle');
+  badge.textContent = !w.ready ? '不可用' : w.enabled ? '已开启' : '未开启';
+  $('#wbarVer').hidden = !w.version;
+  $('#wbarVer').textContent = w.version || '';
+  $('#wbarSub').innerHTML = warpSub(w);
+}
+
+function warpSub(w){
+  if(!w.ready) return esc(w.reason || '这台机器跑不了中转');
+  if(!w.enabled) return '关闭时出口直接从节点走。开启后每条出口先经 Cloudflare WARP 再到节点，'
+    + '出口 IP 仍由节点决定。';
+  const cls = !w.count ? '' : w.live >= w.count ? 'ok' : 'warn';
+  let s = '已注册 <b>' + num(w.count) + '</b> 条 · 已握手 <b class="' + cls + '">'
+    + num(w.live) + '</b>/' + num(w.count) + ' · 客户端 <b>' + esc(w.version || '—') + '</b>';
+  if(w.stale > 0) s += '，<b class="warn">' + num(w.stale) + ' 条还按旧版本号注册着</b>';
+  return s;
+}
+
+// 开关在作业跑完之前不给再按：半途翻第二次，等于把还在逐条重连的出口
+// 又推进另一套路由里，最后哪条都没个确定状态。
+function warpBusy(){
+  return (jobs || []).some(j => j.status === 'running'
+    && (j.summary || '').indexOf('WARP') >= 0);
+}
+
+$('#wbarSw').onchange = async e => {
+  const sw = e.currentTarget;
+  const on = sw.checked;
+  const n = (view.exits || []).length;
+  const tail = n
+    ? '\n\n现有 ' + n + ' 条出口会逐条断开重连（一条一条来，不会同时抢节点），'
+      + '出口 IP 还是节点的，只是中间多绕一层 Cloudflare。'
+    : '\n\n现在没有出口，开关只对之后新建的出口生效。';
+  if(!confirm('开启 WARP 中转？' + tail
+      + (on ? '\n前提是本机装了 wireguard-tools，并且够得着 Cloudflare 的注册接口。'
+            : '\n关闭会把 fanout 名下的 WARP 注册一并退掉。'))) {
+    sw.checked = !on;
+    return;
+  }
+  sw.disabled = true;
+  try{
+    const r = await api('/api/warp?on=' + (on ? 1 : 0), {method:'POST'});
+    toast(r.message || ('中转已' + (on ? '开启' : '关闭')), 'ok');
+  }catch(err){
+    toast(err.message, 'bad');
+    sw.checked = !on;   // 后端拒绝时开关保持原样，界面跟着退回去
+  }
+  sw.disabled = false;
+  poll();
+};
 
 function renderExits(){
   const list = $('#list');
@@ -942,6 +1015,7 @@ async function poll(){
     // 链接由 xray-cf-lite 的订阅体系发，fanout 这边导不出来
     $('#exportAll').hidden = isXCL();
     renderExits();
+    renderWarpBar();
     renderPools();
     renderOrphans();
     renderKPI();
@@ -1789,6 +1863,19 @@ function clientNote(msg){
   if(!n) return;
   n.textContent = msg || '';
   n.hidden = !msg;
+  const d = $('#cliWarpDiv');
+  if(d) d.hidden = true;   // 分隔线跟着 WARP 那一段走，见 warpNote
+}
+
+// WARP 的说明单独占一段：它讲的是"重新注册"而不是"升级二进制"，
+// 和上面 openvpn 那条不是一个话题，挤在同一行里两边都读不下去。
+function warpNote(msg){
+  const n = $('#cliWarpNote');
+  if(!n) return;
+  n.textContent = msg || '';
+  n.hidden = !msg;
+  const d = $('#cliWarpDiv');
+  if(d) d.hidden = !msg;
 }
 
 // checked 表示这份状态带比对结果；没比对时不能显示"已是最新"，
@@ -1855,7 +1942,37 @@ function paintClientBin(c, checked){
   // 这行只在有话非说不可时装满：认不出家族、没有包管理器、索引没刷动，
   // 或者官方已经 2.7.9 而 apt 最高只给到 2.6.x——后者不说就成了"明明有新版却说没有"
   clientNote(checked ? [c.openvpn_reason, c.openvpn_note, srcNote].filter(Boolean).join('\n') : '');
+  paintWarpBin(c, checked);
   if(c.check_error) toast('问最新版失败: ' + c.check_error, 'bad');
+  if(c.warp_check_error) toast('问 WARP 最新版失败: ' + c.warp_check_error, 'bad');
+}
+
+// WARP 那颗胶囊上的号是"注册时上报给 Cloudflare 的客户端版本"，不是本机某个
+// 二进制的版本号：fanout 用内核 WireGuard 直连，机器上没有属于它的 warp 客户端。
+// 所以基准取自官方 apt 源的包索引（Cloudflare 没发 WARP 的 GitHub release），
+// 按钮做的是重新注册，说成"升级客户端"就是骗人的。
+function paintWarpBin(c, checked){
+  const pill = $('#cliWarp');
+  if(!pill) return;
+  pill.textContent = c.warp_version || '未知';
+  // 号相同却还有旧注册时不能写「→ 同一个号」——那是"升级到自己"。
+  // 后端在这两种情况下都会把 has_update 置真（版本号落后，或手上的注册落后）。
+  $('#cliWarpLatest').textContent = !checked || !c.warp_latest ? ''
+    : c.warp_latest !== c.warp_version ? ' → ' + c.warp_latest
+    : c.warp_has_update ? ' · ' + num(c.warp_stale) + ' 条待重注册' : ' · 已是最新';
+  const apply = $('#cliWarpApply');
+  // 重连作业跑着的时候不给第二次入口：按钮点下去是按当前各条出口逐条重连的，
+  // 半途再来一次只会让两边互相踩。
+  const canApply = !!(checked && c.warp_can_apply && c.warp_has_update && c.warp_latest && !warpBusy());
+  if(canApply) $('#cliWarpApplyVer').textContent = c.warp_latest;
+  apply.hidden = !canApply;
+  const lines = [];
+  if(!c.warp_ready && c.warp_reason) lines.push(c.warp_reason);
+  if(!c.warp_enabled) lines.push('中转未开启：这个号只在中转打开后用于注册。');
+  else if(checked && c.warp_stale > 0)
+    lines.push('有 ' + c.warp_stale + ' 条出口还按旧版本号注册着。');
+  if(canApply) lines.push('按钮换的是上报的版本号和每条出口的密钥对，不下载任何二进制；出口 IP 不变。');
+  warpNote(lines.join('\n'));
 }
 
 // 检查更新：只有这一步会打 GitHub 的 API、叫一次本机的包管理器
@@ -1898,6 +2015,31 @@ $('#cliApply').onclick = async e => {
   }
   b.innerHTML = label;   // 文案里的版本号由下面的重读覆盖
   loadClientBin();
+};
+
+// 按最新客户端版本重新注册 WARP：换上报的版本号，每条出口换一对密钥、
+// 拿一个新的 Cloudflare 接入点。确认框里必须写明不下载任何二进制——
+// fanout 用内核 WireGuard，机器上根本没有属于它的 warp 客户端可"升级"。
+$('#cliWarpApply').onclick = async e => {
+  const d = binState || {};
+  if(!confirm('按 ' + ($('#cliWarpApplyVer').textContent || d.warp_latest || '最新版')
+      + ' 重新注册 WARP？\n\n现有 ' + num(d.warp_count) + ' 条出口会逐条断开重连，'
+      + '每条换一对密钥、向 Cloudflare 要一个新的接入点；节点和出口 IP 都不变。\n\n'
+      + '这一步不下载、也不替换任何二进制（fanout 用内核 WireGuard，不跑 warp-cli）。')) return;
+  const b = e.currentTarget;
+  const label = b.innerHTML;
+  b.disabled = true;
+  b.textContent = '已开始逐条重新注册…';
+  try{
+    const r = await api('/api/client/warp/apply', {method:'POST'});
+    toast(r.message || '已开始重新注册', 'ok');
+  }catch(err){
+    toast(err.message, 'bad');
+    b.innerHTML = label;
+    b.disabled = false;
+  }
+  loadClientBin();
+  poll();
 };
 
 // 升级 openvpn：命令由本机发行版决定，确认框里把原文摊开再点。

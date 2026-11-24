@@ -345,7 +345,7 @@ func (t *Tunnel) teardownNetns() {
 //     进程既不退出也不报错，fanout 只能干等满就绪超时才换下一个候选。
 //   - 没有 --keepalive：志愿者节点最常见的失效方式是"TCP 还连着但不再转发"，
 //     没有心跳就没人发现，这条出口在界面上一直是绿的，实际全在超时。
-func ovpnTuning(budget time.Duration) []string {
+func ovpnTuning(budget time.Duration, mssfix int) []string {
 	// 握手窗口必须显著小于总预算，否则一个卡在半程的节点会把整轮候选都拖住。
 	hand := int((budget / 3).Seconds())
 	if hand < 5 {
@@ -372,14 +372,18 @@ func ovpnTuning(budget time.Duration) []string {
 		// 第一个往往是先挂的那个；随机化让多次尝试落在不同地址上。
 		"--remote-random",
 		// 隧道 MTU 比物理链路小，不夹 MSS 的话大包静默丢失，
-		// 表现是"能连上但网页打不开"。
-		"--mssfix", "1380",
+		// 表现是"能连上但网页打不开"。开 WARP 时外层又多 encapsulate 了一层，
+		// 这个数由 warpPathMTU 一起给（见 warp.go）。
+		"--mssfix", strconv.Itoa(mssfix),
 	}
 }
 
 // startOpenVPN 在 netns 内拉起 openvpn，并等待 tun0 拿到地址。
 // 就绪与否以"tun0 上有了 IPv4"为准——这是 SOCKS5 能出网的真正前提。
-func (t *Tunnel) startOpenVPN(dir string) error {
+//
+// acc 非空表示这条出口的默认路由已经进了 WARP：连接预算要加上那一跳的开销，
+// 否则好好的节点会因为多走一跳被判成超时而白白换掉；MTU 和路由参数也要跟着变。
+func (t *Tunnel) startOpenVPN(dir string, acc *WarpAccount) error {
 	ns := t.nsName()
 	cfgPath := filepath.Join(dir, ns+".ovpn")
 	if err := os.WriteFile(cfgPath, []byte(t.node().Config), 0600); err != nil {
@@ -390,7 +394,9 @@ func (t *Tunnel) startOpenVPN(dir string) error {
 		return fmt.Errorf("写凭据失败: %w", err)
 	}
 
-	budget := time.Duration(connConf().ConnectBudget) * time.Second
+	on := acc != nil
+	budget := warpBudget(time.Duration(connConf().ConnectBudget)*time.Second, on)
+	_, _, mssfix := warpPathMTU(on)
 
 	logPath := filepath.Join(dir, ns+".log")
 	args := []string{
@@ -401,12 +407,13 @@ func (t *Tunnel) startOpenVPN(dir string) error {
 		"--verb", "3",
 		"--log", logPath,
 	}
+	args = append(args, warpOpenVPNArgs(on)...)
 	// ovpnBinary 和上面那个版本探测必须同一个入口：喂给 dataCipherArgs 的参数名
 	// 是按版本挑的（2.4 叫 --ncp-ciphers，2.5+ 叫 --data-ciphers），
 	// 一旦"探的是系统那份、跑的是编出来的那份"，openvpn 会当场 Unrecognized option 退出。
 	ovpnBin := openvpnBinary()
 	args = append(args, dataCipherArgs(parseOpenVPNVersion(probeVersion(ovpnBin, "--version")))...)
-	args = append(args, ovpnTuning(budget)...)
+	args = append(args, ovpnTuning(budget, mssfix)...)
 	cmd := exec.Command("ip", append([]string{"netns", "exec", ns, ovpnBin}, args...)...)
 
 	// 自己 Wait 并把结果送进 channel：既回收了子进程不留僵尸，

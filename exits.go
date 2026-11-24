@@ -31,6 +31,25 @@ type Exit struct {
 	SocksUser string        `json:"socks_user"`
 	SocksPass string        `json:"socks_pass"`
 	Inbounds  []ExitInbound `json:"inbounds"`
+	// WarpIP 是这条出口此刻真正连着的 Cloudflare 接入点，WarpLive 表示
+	// WireGuard 握手还新鲜。两个都是空/假值时界面不显示这一项——
+	// 没开中转本来就不该有话要说。
+	//
+	// 注意它和 ExitIP 是两件事：ExitIP 是流量的终点（节点看到的来源），
+	// WarpIP 只是中间那一跳。开中转后 ExitIP 仍然是节点的出口，不变。
+	WarpIP   string `json:"warp_ip,omitempty"`
+	WarpLive bool   `json:"warp_live"`
+}
+
+// WarpOverview 是中转开关本身的状态，显示在出口总览的头部。
+type WarpOverview struct {
+	Enabled bool   `json:"enabled"`
+	Ready   bool   `json:"ready"`   // 这台机器有没有条件跑中转
+	Reason  string `json:"reason"`  // 没条件时的原话，界面直接印出来
+	Version string `json:"version"` // 注册时上报给 Cloudflare 的客户端版本
+	Count   int    `json:"count"`   // 已注册的 WARP 账号数
+	Live    int    `json:"live"`    // 其中此刻握手新鲜的出口数
+	Stale   int    `json:"stale"`   // 按旧客户端版本注册的账号数，非 0 说明"更新"没做完
 }
 
 // PoolMemberView 是组内一条出口的界面视图。
@@ -82,6 +101,9 @@ type ExitsView struct {
 	PanelInfo string `json:"panel_info"`
 	// PublicIP 是母机公网 IPv4，前端用它当 SOCKS5/分享链接的连接地址
 	PublicIP string `json:"public_ip"`
+	// Warp 是中转开关的状态。这个接口每几秒就被轮询一次，所以它只能由
+	// 本地状态算出来：里面没有任何网络请求，读 WireGuard 那几步都有缓存。
+	Warp WarpOverview `json:"warp"`
 }
 
 // inboundCache 给入站列表做很短的缓存。界面每几秒轮询一次，
@@ -151,6 +173,23 @@ func (m *Manager) ExitsOf() ExitsView {
 			ExitIP: st.ExitIP, Status: st.Status, Err: st.Err, Since: st.Since,
 			SocksUser: cred.User, SocksPass: cred.Pass,
 		})
+	}
+
+	// 中转开着才去读 WireGuard 实况：关掉时那是一次都不该付的空 fork。
+	// 读的是内核里真正在用的接入点，而不是注册时存下的那个（见 warpStatus）。
+	view.Warp = warpOverview()
+	if view.Warp.Enabled {
+		for i, t := range tunnels {
+			if view.Exits[i].Status != "up" {
+				continue
+			}
+			st := warpStatus(t.nsName(), warpDevName(instTag, t.Slot))
+			view.Exits[i].WarpIP = st.Endpoint
+			view.Exits[i].WarpLive = st.Live
+			if st.Live {
+				view.Warp.Live++
+			}
+		}
 	}
 
 	view.Pools = poolViews(tunnels)

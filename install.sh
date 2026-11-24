@@ -163,6 +163,19 @@ if [[ ${#need_cmd[@]} -gt 0 ]]; then
   }
 fi
 
+# wireguard-tools 是可选依赖：只有把出口总览页的「WARP 中转」拨开才用得上
+# （判据就是有没有 wg 这条命令，见 warpReady）。装不上不该让整次安装失败，
+# 但要说清失败的结果，否则用户到界面上才发现，只会当成程序的 bug。
+if ! command -v wg >/dev/null; then
+  if [[ -n "$MGR" ]]; then
+    echo "      WARP 中转要用 wireguard-tools，顺手装上（不开中转可以不管它）"
+    install_pkgs "$MGR" wireguard-tools \
+      || echo "      wireguard-tools 没装上：中转开关会显示不可用，其它功能不受影响"
+  else
+    echo "      没有 wg：要用 WARP 中转请手动装 wireguard-tools（apt/apk install wireguard-tools）"
+  fi
+fi
+
 echo "[2/6] 获取程序"
 # SELF_REPO 是本仓库自己的身份，REPO 决定「去哪拿预编译包」和「以后从哪自更新」。
 # 认不出来源时必须停手，绝不能退回上游：上游二进制没有这里的界面重写和连接层加固，

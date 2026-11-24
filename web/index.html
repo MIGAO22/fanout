@@ -433,6 +433,34 @@ html[data-theme="dark"] select.inp{background-image:url("data:image/svg+xml;char
 .sock .ico{width:25px;height:25px}
 .sock .ico svg{width:13px;height:13px}
 
+/* WARP 中转。开关摆在出口总览页——它改变的是每条出口的链路，
+   属于"看出口时顺手要能拨"的东西，不该藏进设置里。 */
+.wbar{display:flex;align-items:center;gap:11px;flex-wrap:wrap;
+  background:var(--surface);border:1px solid var(--border);border-radius:var(--r-lg);
+  padding:11px 14px;margin-bottom:var(--sp-4);box-shadow:var(--sh-1)}
+.wbar .wi{width:29px;height:29px;flex:none;border-radius:var(--r-sm);display:grid;place-items:center;
+  background:var(--surface-2);color:var(--text-3);border:1px solid var(--border);
+  transition:background var(--t-fast),color var(--t-fast),border-color var(--t-fast)}
+.wbar.on .wi{background:var(--accent-soft);color:var(--accent);border-color:var(--accent-ring)}
+.wbar .wi svg{width:15px;height:15px;stroke:currentColor;fill:none;stroke-width:1.9;
+  stroke-linecap:round;stroke-linejoin:round}
+.wbar .tx{min-width:0;flex:1}
+.wbar .tt{font-size:13px;font-weight:640;display:flex;align-items:center;gap:7px}
+.wbar .ss{font-size:11.5px;color:var(--text-3);margin-top:3px;line-height:1.5}
+.wbar .ss b{font-weight:600;color:var(--text-2)}
+.wbar .ss b.ok{color:var(--ok)}
+.wbar .ss b.warn{color:var(--warn)}
+.wbar .mm{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.wbar .ver{font-family:var(--mono);font-size:11px;color:var(--text-3);
+  background:var(--surface-2);border:1px solid var(--border);border-radius:var(--r-xs);padding:2px 7px}
+
+/* 卡片里那一跳：它是中间 hop，不是出口，字号要比出口 IP 小一档 */
+.wipline{margin-top:7px;display:flex;align-items:center;gap:7px;flex-wrap:wrap;
+  font-family:var(--mono);font-size:12.5px;font-weight:560}
+.wipline .lbl{font-family:var(--font);font-size:10.5px;font-weight:600;color:var(--text-3);
+  letter-spacing:.05em;text-transform:uppercase}
+.wipline.dead{opacity:.6}
+
 .chips{display:flex;flex-wrap:wrap;gap:5px;margin-top:11px}
 .chip{display:inline-flex;align-items:center;gap:5px;height:23px;padding:0 8px;
   border:1px solid var(--border-2);border-radius:var(--r-full);background:var(--surface);
@@ -643,7 +671,7 @@ html[data-theme="dark"] .scr{background:rgba(0,0,0,.62)}
   align-items:center;gap:9px}
 .set-card>.h svg{width:15px;height:15px;stroke:var(--accent);fill:none;stroke-width:1.9;
   stroke-linecap:round;stroke-linejoin:round}
-.set-card>.h h3{margin:0;font-size:13px;font-weight:640}
+.set-card>.h h3{margin:0;font-size:13px;font-weight:640;flex:none;white-space:nowrap}
 .set-card>.h .sub{margin-left:auto;font-size:11px;color:var(--text-3)}
 /* 卡片标题右侧那排版本胶囊：窄屏放不下会叠成两行，行间得留点缝 */
 .set-card>.h .sub:has(.verpill){display:flex;flex-wrap:wrap;gap:6px;justify-content:flex-end}
@@ -859,6 +887,22 @@ html[data-theme="dark"] .scr{background:rgba(0,0,0,.62)}
 
       <div class="jobs" id="jobs"></div>
 
+      <!-- WARP 中转：状态与开关都摆在这儿，每条出口的接入点写在它自己的卡片上 -->
+      <section class="wbar" id="wbar">
+        <span class="wi"><svg viewBox="0 0 24 24"><path d="M12 2 4 6v6c0 5 3.4 8.6 8 10 4.6-1.4 8-5 8-10V6z"/>
+          <path d="m9 12 2 2 4-4"/></svg></span>
+        <div class="tx">
+          <div class="tt">WARP 中转 <span class="badge idle" id="wbarBadge">读取中</span></div>
+          <div class="ss" id="wbarSub">正在读取中转状态…</div>
+        </div>
+        <div class="mm">
+          <span class="ver" id="wbarVer" hidden></span>
+          <label class="sw" title="开启后每条出口的流量先经 Cloudflare WARP 再到节点">
+            <input type="checkbox" id="wbarSw"><span class="track"></span>
+          </label>
+        </div>
+      </section>
+
       <section class="sec-head">
         <h2>出口 <span class="n" id="ecount">0</span></h2>
         <div class="seg" id="filters">
@@ -1063,6 +1107,7 @@ html[data-theme="dark"] .scr{background:rgba(0,0,0,.62)}
               <span class="sub">
                 <span class="verpill">Xray <b id="cliXray">-</b><span id="cliXrayLatest"></span></span>
                 <span class="verpill">openvpn <b id="cliOvpn">-</b><span id="cliOvpnLatest"></span></span>
+                <span class="verpill">WARP <b id="cliWarp">-</b><span id="cliWarpLatest"></span></span>
               </span>
             </div>
             <div class="b">
@@ -1082,6 +1127,10 @@ html[data-theme="dark"] .scr{background:rgba(0,0,0,.62)}
                     <path d="M7 10l5 5 5-5M12 15V3"/></svg>
                   升级 openvpn 到 <span id="cliOvpnApplyVer"></span>
                 </button>
+                <button class="btn primary" id="cliWarpApply" hidden>
+                  <svg viewBox="0 0 24 24"><path d="M21 12a9 9 0 1 1-3-6.7L21 8"/><path d="M21 3v5h-5"/></svg>
+                  按 <span id="cliWarpApplyVer"></span> 重新注册 WARP
+                </button>
                 <button class="btn" id="cliOvpnRepoOff" hidden>
                   <svg viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5"/></svg>
                   撤销官方源
@@ -1098,6 +1147,8 @@ html[data-theme="dark"] .scr{background:rgba(0,0,0,.62)}
               </div>
               <div class="hint" id="cliOvpnJob" hidden style="white-space:pre-wrap"></div>
               <div class="hint" id="cliOvpnNote" hidden style="white-space:pre-wrap"></div>
+              <div class="divider" id="cliWarpDiv" hidden></div>
+              <div class="hint" id="cliWarpNote" hidden style="white-space:pre-wrap"></div>
             </div>
           </section>
         </div>

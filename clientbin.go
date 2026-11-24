@@ -159,6 +159,22 @@ type ClientBinStatus struct {
 	OvpnSrcVer    string `json:"openvpn_source_ver,omitempty"`
 	OvpnSrcBin    string `json:"openvpn_source_bin,omitempty"`
 	OvpnApt       string `json:"openvpn_apt,omitempty"`
+
+	// WARP 中转这一行。fanout 不跑官方 warp-cli——它在每条出口的 netns 里
+	// 用内核 WireGuard 直连 Cloudflare，机器上没有属于 fanout 的 WARP 二进制
+	// 可以替换。所以这里给的是"上报给 Cloudflare 的客户端版本"和最新稳定号，
+	// 按钮做的是按最新号重新注册（换密钥、换接入），而不是升级程序。
+	// 把这件事写成"升级 WARP"是骗人的，字段和文案都得照真实动作来。
+	WarpEnabled  bool   `json:"warp_enabled"` // 中转开关
+	WarpReady    bool   `json:"warp_ready"`   // 有条件跑（有 wg 命令、记录可写）
+	WarpWhy      string `json:"warp_reason,omitempty"`
+	WarpVersion  string `json:"warp_version,omitempty"` // 当前上报的版本号
+	WarpLatest   string `json:"warp_latest,omitempty"`  // 官方 apt 源的最新稳定号
+	WarpUpdate   bool   `json:"warp_has_update"`        // 上报号比官方号旧
+	WarpCount    int    `json:"warp_count"`             // 已注册的出口数
+	WarpStale    int    `json:"warp_stale"`             // 其中按旧号注册的
+	WarpCanApply bool   `json:"warp_can_apply,omitempty"`
+	WarpCheckErr string `json:"warp_check_error,omitempty"` // 问官方源失败，不影响其它字段
 }
 
 // xrayAssetForArch 把 GOARCH 换成 Xray-core release 的资产名。
@@ -285,8 +301,28 @@ func clientBinStatus(askLatest bool) *ClientBinStatus {
 	if !st.Updatable {
 		st.Reason = why
 	}
+	st.WarpEnabled, st.WarpVersion = warpOn(), warpReportVersion()
+	st.WarpReady, st.WarpWhy = warpReady()
+	if warpSvc != nil {
+		for _, a := range warpSvc.all() {
+			st.WarpCount++
+			if a.Version != st.WarpVersion {
+				// 手上有旧号注册的线路：说明上次「更新」没走完，界面要能看出来
+				st.WarpStale++
+			}
+		}
+	}
+	st.WarpCanApply = st.WarpReady && st.WarpEnabled && st.WarpCount > 0
 	if !askLatest {
 		return st
+	}
+	// WARP 的最新版只问官方 apt 源：cloudflare 没有发 WARP 的 GitHub release，
+	// 拿 apt 索引里的 Version 当基准是唯一实测读得到、又不依赖签名密钥的路子。
+	if lv, err := warpLatestVersion(); err != nil {
+		st.WarpCheckErr = err.Error()
+	} else {
+		st.WarpLatest = lv
+		st.WarpUpdate = warpVersionLess(st.WarpVersion, lv) || st.WarpStale > 0
 	}
 	// 先问本机包管理器，再打 GitHub：openvpn 的答案不依赖 GitHub，额度用尽时
 	// 这张卡至少还有一半是活的。
