@@ -19,12 +19,12 @@ import (
 	"time"
 )
 
-// updateRepo 是检查更新和自更新的目标仓库。
+// updateRepo 是检查更新和自更新的目标仓库，默认就是本仓库。
 //
-// 默认指向上游。衍生版本必须在构建时用 -X main.updateRepo=自己的仓库 覆盖掉，
-// 否则「更新」会把重写过的界面静默换回上游的二进制——版本号和代码都对不上，
-// 用户却看不出发生了什么。
-var updateRepo = "byJoey/fanout"
+// 这里绝不能留上游：上游最新 release 只有 v1.3.x，一次「更新」就会把界面重写
+// 和连接层加固整份覆盖回原版，版本号还看着正常，用户根本发现不了。
+// 构建时仍可用 -X main.updateRepo= 指到别处（CI 传的就是 GITHUB_REPOSITORY）。
+var updateRepo = "MIGAO22/fanout"
 
 // updateRepoName 优先用环境变量，方便源码安装的人不改代码也能指到自己仓库。
 func updateRepoName() string {

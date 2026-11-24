@@ -481,6 +481,12 @@ function exitCard(e){
   const speed = e.node_speed ? '<span class="it">' + ICON.bolt + num(e.node_speed) + ' Mbps</span>' : '';
   const slot = '<span class="it">#' + e.slot + '</span>';
 
+  // 标的是节点自己的本事，不是此刻在跑什么算法：VPN Gate 那批节点写死
+  // AES-128-CBC，一个标记都不会亮；亮了才说明这条值得吃 AEAD-only 那档。
+  const aead = e.aead
+    ? '<span class="badge acc" title="节点声明支持 AEAD：打开设置里的「数据通道只要 AEAD」后，这条会走 GCM/ChaCha20 并放开内核 data channel offload">AEAD</span>'
+    : '';
+
   const ep = (view.public_ip || location.hostname || '') + ':' + e.port;
   const auth = e.socks_user
     ? '<span class="auth">鉴权</span>'
@@ -512,7 +518,7 @@ function exitCard(e){
     +   '<span class="copyable" data-copy="' + esc(e.exit_ip || '') + '" title="复制出口 IP">'
     +     ip + '</span></div>'
     + warp
-    + '<div class="meta">' + slot + since + speed + '</div>'
+    + '<div class="meta">' + slot + since + speed + aead + '</div>'
     + '<div class="sock">'
     +   '<span class="ep">' + ICON.server + '<span>' + esc(ep) + '</span>' + auth + '</span>'
     +   '<button class="ico" data-copysock="' + e.slot + '" title="复制 SOCKS5 地址">'
@@ -717,7 +723,7 @@ function poolRow(p){
   const st = poolState(p);
   const mem = (p.members || []).map(m => {
     const ok = m.status === 'up';
-    const bits = [m.status, m.exit_ip, m.latency_ms ? m.latency_ms + 'ms' : '', m.cooling ? '冷却中' : '']
+    const bits = [m.status, m.exit_ip, m.latency_ms ? m.latency_ms + 'ms' : '', m.cooling ? '冷却中' : '', m.aead ? '支持 AEAD' : '']
       .filter(Boolean).join(' · ');
     return '<span class="chip' + (ok ? '' : ' off') + '" title="' + esc(m.host + ' · ' + bits) + '">'
       + '<span class="p">' + esc(m.status === 'up' ? 'OK' : (m.status === 'missing' ? '没了' : m.status)) + '</span>'

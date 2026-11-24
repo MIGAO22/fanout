@@ -8,6 +8,19 @@ import (
 	"testing"
 )
 
+// 更新来源必须是本仓库。上游最新 release 还停在 v1.3.x，指错地方时界面上
+// 「检查更新」只会显示"已是最新"，而菜单里点一次更新就把界面重写和连接层
+// 加固整份换回原版二进制——版本号看着正常，没人会发现自己被降级了。
+func TestUpdateRepoDefaultsToFork(t *testing.T) {
+	if updateRepo != "MIGAO22/fanout" {
+		t.Errorf("默认更新源是 %q，衍生版本不能指向上游", updateRepo)
+	}
+	t.Setenv("FANOUT_UPDATE_REPO", "someone/else")
+	if got := updateRepoName(); got != "someone/else" {
+		t.Errorf("FANOUT_UPDATE_REPO 没被采纳，得到 %q", got)
+	}
+}
+
 func TestVersionLess(t *testing.T) {
 	cases := []struct {
 		cur, latest string

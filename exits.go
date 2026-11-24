@@ -39,6 +39,10 @@ type Exit struct {
 	// WarpIP 只是中间那一跳。开中转后 ExitIP 仍然是节点的出口，不变。
 	WarpIP   string `json:"warp_ip,omitempty"`
 	WarpLive bool   `json:"warp_live"`
+	// Aead 说这条出口当前绑的节点在配置里自己声明了 AEAD，且没硬要开压缩——
+	// 也就是设置里那个 AEAD-only 开关对它真的有用。界面只给 true 的那几条挂标记：
+	// VPN Gate 那批 SoftEther 生成的配置写死 AES-128-CBC，全铺标记等于没有标记。
+	Aead bool `json:"aead"`
 }
 
 // WarpOverview 是中转开关本身的状态，显示在出口总览的头部。
@@ -68,6 +72,8 @@ type PoolMemberView struct {
 	ExitIP    string `json:"exit_ip"`
 	LatencyMs int64  `json:"latency_ms"` // 0 表示还没有样本
 	Cooling   bool   `json:"cooling"`
+	// Aead 同 Exit.Aead：组员那条隧道的节点吃不吃 AEAD-only，只进 chip 的悬浮说明。
+	Aead bool `json:"aead"`
 }
 
 // PoolView 是一个出口组在界面上的一行。
@@ -180,6 +186,7 @@ func (m *Manager) ExitsOf() ExitsView {
 			Region: st.Node.CountryCode, Country: nodeLabel(st.Node),
 			ExitIP: st.ExitIP, Status: st.Status, Err: st.Err, Since: st.Since,
 			SocksUser: cred.User, SocksPass: cred.Pass,
+			Aead: nodeSupportsAEAD(st.Node.Config),
 		})
 	}
 
@@ -267,12 +274,14 @@ func poolViews(tunnels []*Tunnel) []PoolView {
 				live[m.Host] = true
 			}
 			status := "missing"
+			aead := false
 			if t := byHost[m.Host]; t != nil {
 				status = t.status()
+				aead = nodeSupportsAEAD(t.node().Config)
 			}
 			pv.Members = append(pv.Members, PoolMemberView{
 				Host: m.Host, Slot: m.Slot, Status: status, ExitIP: m.ExitIP,
-				LatencyMs: m.Latency.Milliseconds(), Cooling: m.Cooling,
+				LatencyMs: m.Latency.Milliseconds(), Cooling: m.Cooling, Aead: aead,
 			})
 		}
 		out = append(out, pv)

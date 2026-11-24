@@ -340,6 +340,5 @@ echo
 echo "  输入 f 打开管理菜单"
 echo
 echo "  ────────────────────────────────"
-echo "  本项目  https://github.com/MIGAO22/fanout"
-echo "  上游    https://github.com/byJoey/fanout"
+echo "  项目/更新来源  https://github.com/MIGAO22/fanout"
 echo

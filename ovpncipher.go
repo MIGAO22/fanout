@@ -106,11 +106,28 @@ func ovpnConfigEnablesCompression(cfg string) bool {
 			continue
 		}
 		switch strings.ToLower(strings.TrimPrefix(f[0], "--")) {
-		case "comp-lzo", "comp-lz4", "comp-noadapt", "compress", "allow-compression":
+		case "comp-lzo", "allow-compression":
+			// 明确写 no 是关。把它算成"开着压缩"会把最理想的节点——自己就写了
+			// allow-compression no 的那批——判成不支持 AEAD；而我们随后补的
+			// --allow-compression no 与之同值，重复给不会触发冲突。
+			if len(f) < 2 || strings.ToLower(f[1]) != "no" {
+				return true
+			}
+		case "comp-lz4", "comp-noadapt", "compress":
+			// comp-lz4 没有 "no" 这个写法，出现就是开；compress 必须带算法名。
 			return true
 		}
 	}
 	return false
+}
+
+// nodeSupportsAEAD 是"这条出口的节点吃不吃 AEAD-only"的唯一定义。
+//
+// 拉隧道和给界面标记都读它：两处各写一遍的话，徽标会变成"界面说支持、
+// 实际参数没变"那种骗人的东西。压缩那一半不是可选优化——节点推了压缩时
+// --allow-compression no 会让 openvpn 直接退出，只能整条放弃。
+func nodeSupportsAEAD(cfg string) bool {
+	return ovpnConfigOffersAEAD(cfg) && !ovpnConfigEnablesCompression(cfg)
 }
 
 // parseVersionParts 把 "2.6.8" 拆成主/次版本。多出来的段（-ubuntu1、.1）忽略。

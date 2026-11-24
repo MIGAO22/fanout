@@ -419,8 +419,7 @@ func (t *Tunnel) startOpenVPN(dir string, acc *WarpAccount) error {
 	// AEAD-only 那一档是设置里的开关，但只对"节点自己声明支持 AEAD"的出口生效：
 	// VPN Gate 的配置大多写死 data-ciphers AES-128-CBC，那种节点上硬上 AEAD
 	// 是一个都连不上，而不是慢一点。开压缩的节点同理（--allow-compression no 会冲突）。
-	aeadOnly := connConf().AeadOnly && ovpnConfigOffersAEAD(t.node().Config) &&
-		!ovpnConfigEnablesCompression(t.node().Config)
+	aeadOnly := connConf().AeadOnly && nodeSupportsAEAD(t.node().Config)
 	args = append(args, dataCipherArgs(ovpnVer, aeadOnly)...)
 	if aeadOnly {
 		args = append(args, compressionOffArgs(ovpnVer)...)

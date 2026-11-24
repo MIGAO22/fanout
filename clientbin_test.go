@@ -427,6 +427,11 @@ func TestOvpnConfigEnablesCompression(t *testing.T) {
 	}{
 		{"dev tun\nproto tcp\nremote a 443\n", false},
 		{"dev tun\ncomp-lzo yes\n", true},
+		// 明确写 no 是关压缩，不该被算成"开着"
+		{"dev tun\ncomp-lzo no\n", false},
+		{"dev tun\nallow-compression no\n", false},
+		// 光写选项名不带值 = yes
+		{"dev tun\ncomp-lzo\n", true},
 		{"dev tun\n  COMP-LZ4 yes\n", true},
 		{"dev tun\n--comp-noadapt\n", true},
 		{"dev tun\nallow-compression asym\n", true},
@@ -469,6 +474,27 @@ func TestOvpnConfigOffersAEAD(t *testing.T) {
 	}
 	for _, c := range cases {
 		if got := ovpnConfigOffersAEAD(c.cfg); got != c.want {
+			t.Errorf("%s: = %v, 想 %v", c.name, got, c.want)
+		}
+	}
+}
+
+// 界面上那个 AEAD 标记和拉隧道时给的参数必须来自同一个判断，否则会出现
+// "卡片上亮着标记、开关打开却什么都没变"。压缩那一半不是装饰：节点自己开了
+// 压缩时补 --allow-compression no 会让 openvpn 当成冲突直接退出。
+func TestNodeSupportsAEAD(t *testing.T) {
+	cases := []struct {
+		name string
+		cfg  string
+		want bool
+	}{
+		{"Gate 实样（只有 CBC）", "cipher AES-128-CBC\r\ndata-ciphers AES-128-CBC\r\n", false},
+		{"声明 GCM 且没开压缩", "data-ciphers AES-256-GCM:AES-128-CBC\ncomp-lzo no\n", true},
+		{"声明 GCM 但节点开了压缩", "data-ciphers AES-256-GCM\ncomp-lzo yes\n", false},
+		{"空配置", "", false},
+	}
+	for _, c := range cases {
+		if got := nodeSupportsAEAD(c.cfg); got != c.want {
 			t.Errorf("%s: = %v, 想 %v", c.name, got, c.want)
 		}
 	}

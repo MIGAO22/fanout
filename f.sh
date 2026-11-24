@@ -249,13 +249,6 @@ EOF
   echo -e "  ${G}已禁用 IPv6（重启后依然生效）${N}"
 }
 
-show_links() {
-  echo
-  echo -e "  项目    ${B}https://github.com/MIGAO22/fanout${N}"
-  echo
-  echo -e "  ${D}用着有问题、或者想要什么功能，去仓库提 issue。${N}"
-}
-
 # 老版本把 -web 写死在服务文件里，和 settings.json 互相拽回旧值。
 # 更新时把端口搬进配置再从服务文件里摘掉，之后只认一处。
 migrate_port_to_settings() {
@@ -281,9 +274,9 @@ do_update() {
     *) echo -e "  ${R}不支持的架构 ${arch}${N}"; return ;;
   esac
 
-  echo -e "\n  当前 $("$BIN" -version 2>/dev/null || echo '-')"
+  echo -e "\n  当前 $("$BIN" -version 2>/dev/null || echo '-')  来源 ${REPO}"
   tmp=$(mktemp -d)
-  echo "  正在下载最新版（来源 ${REPO}）..."
+  echo "  正在下载最新版..."
   if ! curl -fsSL "https://github.com/${REPO}/releases/latest/download/fanout-linux-${goarch}.tar.gz" \
        -o "$tmp/f.tar.gz"; then
     echo -e "  ${R}下载失败${N}"; rm -rf "$tmp"; return
@@ -291,6 +284,14 @@ do_update() {
   tar xzf "$tmp/f.tar.gz" -C "$tmp"
   svc_stop
   install -m 755 "$tmp/fanout" "$BIN"
+  # 菜单脚本一起换掉，否则这个脚本删掉的选项在已装机器上会一直留着。
+  # 必须先 install 到别处再 mv：正在跑的就是 /usr/local/bin/f，就地 truncate
+  # 同一个 inode 会让 bash 后面的读取错位，菜单跑到一半散架。
+  if [[ -f "$tmp/f.sh" ]]; then
+    install -m 755 "$tmp/f.sh" /usr/local/bin/f.new.$$ \
+      && mv -f /usr/local/bin/f.new.$$ /usr/local/bin/f \
+      && echo "  菜单脚本已同步，下次运行 f 生效"
+  fi
   migrate_port_to_settings
   svc_start
   rm -rf "$tmp"
@@ -334,7 +335,6 @@ menu() {
     echo "   9) 改访问路径   10) 开机自启开关"
     echo
     echo "  11) 更新         12) 卸载"
-    echo "  13) 交流群 / 反馈"
     echo "   0) 退出"
     echo -e "${D}  ─────────────────────────────${N}"
     read -rp "  选择: " choice
@@ -359,7 +359,6 @@ menu() {
         fi
         pause ;;
       11) do_update; pause ;;
-      13) show_links; pause ;;
       12) do_uninstall; pause ;;
       0) exit 0 ;;
       *) ;;
