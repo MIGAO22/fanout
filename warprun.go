@@ -606,6 +606,15 @@ func (t *Tunnel) setupWarp(acc *WarpAccount) error {
 			return fmt.Errorf("%v（WARP 接入点 %s:%d）", err, acc.Endpoint, acc.Port)
 		}
 	}
+	// 节点地址要在 openvpn 出发之前就钉好：隧道没连着时健康检查会把默认路由撤掉
+	// （不让用户流量只走到 Cloudflare 就出去），这条 /32 是 openvpn 剩下的唯一一条路。
+	// 留到 tun0 起来之后再装的话，换节点时新地址没人认识，openvpn 会当场
+	// "Network is unreachable" 退出，隧道再也起不来——rc1 在真机上就是这么死的。
+	for _, c := range warpGatePinCmds(dev, warpGateIPsOf(t)) {
+		if err := warpRun(ns, "", c); err != nil {
+			return fmt.Errorf("钉住节点地址失败: %v", err)
+		}
+	}
 	return nil
 }
 
@@ -620,22 +629,53 @@ func (t *Tunnel) netnsNameservers() []string {
 	return warpNameservers(string(blob))
 }
 
-// warpSplit 在 tun0 起来之后把用户流量接进 Gate。
-// 失败必须往上传：漏掉这一步的话流量停在 Cloudflare，
-// 出口 IP 变成 WARP 的而不是节点的，用户以为中转生效了、实际根本没走 Gate。
-func (t *Tunnel) warpSplit(acc *WarpAccount) error {
-	ns := t.nsName()
+// warpGateIPsOf 汇总这条隧道要钉在 WARP 上的节点地址。
+func warpGateIPsOf(t *Tunnel) []string {
 	n := t.node()
 	ips := warpGateIPs(n.Config, n.IP)
 	for _, name := range warpGateNames(n.Config) {
 		ips = append(ips, warpResolveGate(name)...)
 	}
-	for _, c := range warpSplitCmds(acc.devName(), "tun0", ips) {
-		if err := run("ip", append([]string{"netns", "exec", ns}, c...)...); err != nil {
+	return ips
+}
+
+// warpSplit 在 tun0 起来之后把用户流量接进 Gate。
+// 失败必须往上传：漏掉这一步的话流量停在 Cloudflare，
+// 出口 IP 变成 WARP 的而不是节点的，用户以为中转生效了、实际根本没走 Gate。
+func (t *Tunnel) warpSplit(acc *WarpAccount) error {
+	for _, c := range warpSplitCmds(acc.devName(), "tun0", warpGateIPsOf(t)) {
+		if err := run("ip", append([]string{"netns", "exec", t.nsName()}, c...)...); err != nil {
 			return fmt.Errorf("WARP 分流失败: %w", err)
 		}
 	}
 	return nil
+}
+
+// warpGuardTunnel 是健康检查里那一遍对齐：openvpn 自己重连会把装在 tun0 上的
+// 分流路由一起带走，而 tunnel 状态却还挂着上一次连上的那个出口 IP。
+// 返回做了什么（空串表示不用动），调用方据此记一行日志。
+func (t *Tunnel) warpGuardTunnel(acc *WarpAccount) string {
+	ns, dev := t.nsName(), acc.devName()
+	out, err := cmdCombined(exec.Command("ip", "netns", "exec", ns, "ip", "-o", "route", "show"))
+	if err != nil {
+		// netns 没了/读不到：这条隧道正在别处被重建，这里什么都不做。
+		return ""
+	}
+	st := parseWarpRoutes(string(out), dev)
+	if !warpGuardNeeded(st) {
+		return ""
+	}
+	why := "补装 WARP 分流"
+	if !st.TunUp {
+		why = "切断 WARP 转发（隧道没连着）"
+	}
+	for _, c := range warpGuardCmds(dev, "tun0", warpGateIPsOf(t), st.TunUp) {
+		if err := warpRun(ns, "", c); err != nil {
+			log.Printf("fanout: 出口 %d %s 没做成: %v", t.Slot, why, err)
+			return ""
+		}
+	}
+	return why
 }
 
 // warpResolveGate 在母机侧把一个主机名解析成 IPv4。

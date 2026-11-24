@@ -407,6 +407,12 @@ func (m *Manager) tryNode(t *Tunnel) (string, error) {
 		}
 		return "", err
 	}
+	if acc != nil && warpExitIsTransitOnly(ip) {
+		// 分流没装上（或装了又被 openvpn 重连冲掉）时就会走到这里：探测确实出得去，
+		// 但出去的是 Cloudflare 而不是节点。把它当"这个节点没连上"处理，
+		// 让候选列表往下走，而不是记下这个 IP 从此一直显示成已连通。
+		return "", fmt.Errorf("出口只走到了 Cloudflare 中转（%s），没走节点 %s", ip, t.host())
+	}
 	return ip, nil
 }
 

@@ -603,13 +603,14 @@ func warpProbeCmds(peerKey, endpoint string, port, mtu int) (setup [][]string, c
 	return setup, []string{"ip", "link", "del", warpProbeDev}
 }
 
-// warpSplitCmds 生成 tun0 起来之后把用户流量接进 Gate 的命令。
+// warpGatePinCmds 把节点（Gate）的地址钉在 WireGuard 设备上。
 //
-// 两条 /1 合起来就是默认路由，但优先级低于任何 /32——这是 def1 那套写法：
-// openvpn 推的 redirect-gateway 会被 --route-nopull 挡掉（见 startOpenVPN），
-// Gate 自己的地址必须钉在 WARP 上，否则控制通道被路由进 tun0，
-// 隧道自己吃自己。
-func warpSplitCmds(dev, tun string, gateIPs []string) [][]string {
+// 这两件事都靠它：开着中转时 openvpn 必须经 Cloudflare 才连得上节点；
+// 而隧道没连着的时候 netns 里会被撤掉默认路由（见 warpGuardCmds），
+// 那条 /32 就是 openvpn 唯一还能用的路——没有它，换节点时 openvpn 连新地址
+// 都会 "Network is unreachable"，隧道永远起不来。
+// 所以这批路由必须在 openvpn 启动之前就装好，不能等到 tun0 起来之后。
+func warpGatePinCmds(dev string, gateIPs []string) [][]string {
 	var cmds [][]string
 	for _, ip := range gateIPs {
 		if parsed := net.ParseIP(ip); parsed == nil || parsed.To4() == nil {
@@ -617,9 +618,140 @@ func warpSplitCmds(dev, tun string, gateIPs []string) [][]string {
 		}
 		cmds = append(cmds, []string{"ip", "route", "replace", ip + "/32", "dev", dev})
 	}
+	return cmds
+}
+
+// warpSplitCmds 生成 tun0 起来之后把用户流量接进 Gate 的命令。
+//
+// 两条 /1 合起来就是默认路由，但优先级低于任何 /32——这是 def1 那套写法：
+// openvpn 推的 redirect-gateway 会被 --route-nopull 挡掉（见 startOpenVPN），
+// Gate 自己的地址必须钉在 WARP 上，否则控制通道被路由进 tun0，
+// 隧道自己吃自己。
+func warpSplitCmds(dev, tun string, gateIPs []string) [][]string {
+	cmds := warpGatePinCmds(dev, gateIPs)
+	// 两条 /1 用 replace 而不是 add：这一步会被健康检查反复补装（见 warpGuardCmds），
+	// add 第二次就回 File exists，于是"路由其实是对的"被当成失败。
 	return append(cmds,
-		[]string{"ip", "route", "add", "0.0.0.0/1", "dev", tun},
-		[]string{"ip", "route", "add", "128.0.0.0/1", "dev", tun})
+		[]string{"ip", "route", "replace", "0.0.0.0/1", "dev", tun},
+		[]string{"ip", "route", "replace", "128.0.0.0/1", "dev", tun})
+}
+
+// warpGuardCmds 把一条 netns 的转发状态对齐到隧道的实际状态。
+//
+// 为什么需要它：分流路由是装在 tun0 上的，而 openvpn 每次自己重连（节点的端口没应答、
+// 连接被掐、认证重试）都会重建 tun0——路由跟着接口一起没了，而 fanout 只在 tryNode
+// 里装过一次。真机上量到的结果就是：netns 里只剩 `default dev fowN`，用户流量原路
+// 走 Cloudflare 出去，SOCKS 照常能用，界面却说这条出口有问题。那种
+// "看着在走节点、其实只走了中转" 比连不上更难查。
+//
+// 两个方向都要管：
+//   - tun0 有地址：默认路由和两条 /1 都得在位（全用 replace，补装多少次都一样）
+//   - tun0 没地址：默认路由必须撤掉。隧道没连着就不许有流量出去——宁可让客户端
+//     立刻得到"连不上"，也不能让它静默换个 IP 上网。
+func warpGuardCmds(dev, tun string, gateIPs []string, tunUp bool) [][]string {
+	if !tunUp {
+		return [][]string{{"ip", "route", "del", "default"}}
+	}
+	cmds := [][]string{{"ip", "route", "replace", "default", "dev", dev}}
+	return append(cmds, warpSplitCmds(dev, tun, gateIPs)...)
+}
+
+// warpRouteState 是 `ip -o route show` 里能读出来的三件事。
+type warpRouteState struct {
+	TunUp    bool // tun0 有地址（内核那条直连路由在）
+	SplitOK  bool // 两条 /1 都在 tun0 上
+	DefOnDev bool // 默认路由走的是这台 WireGuard 设备
+}
+
+// parseWarpRoutes 解析路由表。用 `ip -o` 的输出（一条路由一行）。
+//
+// tun0 的判据是内核为它生成的那条 link 路由（`10.211.1.2 dev tun0 proto kernel scope link src …`），
+// 接口一没地址这行就消失，正是我们要的信号。
+func parseWarpRoutes(routeOut, dev string) warpRouteState {
+	var st warpRouteState
+	split := map[string]bool{}
+	for _, line := range strings.Split(routeOut, "\n") {
+		f := strings.Fields(line)
+		if len(f) < 2 {
+			continue
+		}
+		devAt := -1
+		for i, tok := range f {
+			if tok == "dev" && i+1 < len(f) {
+				devAt = i + 1
+				break
+			}
+		}
+		if devAt < 0 {
+			continue
+		}
+		switch {
+		case f[devAt] == "tun0" && has(f, "proto") && has(f, "kernel"):
+			st.TunUp = true
+		case f[devAt] == "tun0" && (f[0] == "0.0.0.0/1" || f[0] == "128.0.0.0/1"):
+			split[f[0]] = true
+		case f[0] == "default" && f[devAt] == dev:
+			st.DefOnDev = true
+		}
+	}
+	st.SplitOK = split["0.0.0.0/1"] && split["128.0.0.0/1"]
+	return st
+}
+
+func has(list []string, want string) bool {
+	for _, s := range list {
+		if s == want {
+			return true
+		}
+	}
+	return false
+}
+
+// warpGuardNeeded 判断这条 netns 的路由要不要动。
+//
+// 隧道连着而分流不全 → 要补装；隧道没连着而默认路由还指着 WireGuard 设备 → 要切断。
+// 其余情况一律不碰：健康检查每几十秒就会再来一遍，不需要每次都写路由。
+func warpGuardNeeded(st warpRouteState) bool {
+	if st.TunUp {
+		return !st.SplitOK || !st.DefOnDev
+	}
+	return st.DefOnDev
+}
+
+// warpCloudflareV4 是 Cloudflare 名下的 IPv4 段。
+//
+// 来源有两层，都核对过：官方公告的 anycast 段（https://www.cloudflare.com/ips/，
+// 页面最后更新 2023-09-28），以及 ARIN/RIPE/AFRINIC 上登记为 CLOUDFLARENET 的
+// 分配段。这里按分配段写——公告那份把 104.16.0.0/12 拆成了 /13 加 /14，
+// 于是 104.28.x 不在里面，而真机上漏出去的那两个出口 IP（104.28.247.68、
+// 104.28.215.69）恰恰是 104.28.x：whois 查出来 NetName 就是 CLOUDFLARENET。
+// 用公告那份会漏判，用分配这份不会。
+//
+// 判据的意义：WARP 的接入点和出口都在这几段里，所以"探测到的出口 IP 是 Cloudflare 的"
+// 基本等价于"流量只走到了中转，没走节点"。误报的代价是换节点重连，
+// 漏报的代价是客户端以为自己在日本、其实站在 Cloudflare 的数据中心——
+// 这个方向上宁可多判。
+var warpCloudflareV4 = []string{
+	"104.16.0.0/12", "172.64.0.0/13", "162.158.0.0/15", "198.41.128.0/17",
+	"108.162.192.0/18", "173.245.48.0/20", "141.101.64.0/18", "188.114.96.0/20",
+	"190.93.240.0/20", "103.21.244.0/22", "103.22.200.0/22", "103.31.4.0/22",
+	"131.0.72.0/22", "197.234.240.0/22",
+}
+
+// warpExitIsTransitOnly 说这个出口 IP 落在 Cloudflare 宣布的网段里。
+// 认不出来（空串、非 IPv4）时返回 false——判据只在明确命中时才拦，
+// 否则一个探测源抽风就能把好好的出口判死。
+func warpExitIsTransitOnly(ip string) bool {
+	parsed := net.ParseIP(ip)
+	if parsed == nil || parsed.To4() == nil {
+		return false
+	}
+	for _, c := range warpCloudflareV4 {
+		if _, net4, err := net.ParseCIDR(c); err == nil && net4.Contains(parsed) {
+			return true
+		}
+	}
+	return false
 }
 
 // warpGateHosts 抠出配置里所有服务器地址，IP 和主机名都要，按出现顺序去重。

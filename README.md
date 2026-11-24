@@ -144,6 +144,25 @@
 改成 `--pull-filter ignore tun-mtu` 等三条；那条测试原先是 `strings.Count(off, "--pull") != 3`，
 照着错误实现数的数，所以它一直绿着——现在改成逐条对齐 argv，并钉住「不许出现带参数的 `--pull`」。
 
+**v2.1.0 是在真机上测出来的，修的是「显示成功但其实没走节点」。** 拿用户的 VPS 量到三件事：
+
+1. **openvpn 自己重连会把分流路由一起带走。** 两条 `/1` 装在 `tun0` 上，而 openvpn 每次 `SIGUSR1`
+   重连都重建 `tun0`，路由跟着接口一起没了；fanout 只在连上那一刻装过一次。于是 netns 里只剩
+   `default dev fowN`，用户流量原路走 Cloudflare 出去——SOCKS 照常能用，实测拿到的出口 IP 是
+   `104.28.247.68`、`104.28.215.69`，界面却还挂着上次那个节点 IP。现在健康检查每轮都照
+   `ip -o route show` 对一次账：隧道连着就补装（全用 `replace`，补多少次都一样），
+   隧道没连着就把默认路由撤掉，宁可让客户端立刻得到"连不上"。
+2. **撤默认路由不能把 openvpn 自己也撤了。** 第一版（rc1）就是这么坏的：换节点时新地址没人认识，
+   openvpn 当场 `write UDPv4 []: Network is unreachable` 退出，隧道再也起不来。修法是把节点地址
+   那条 `/32` 提前到 openvpn 启动之前钉好（`warpGatePinCmds`）——它是隧道没连着时 openvpn
+   唯一还能用的路。rc2 上这类报错是 0 条。
+3. **出口 IP 落在 Cloudflare 名下就判成"只走到中转"。** 判据用 ARIN/RIPE 登记为 CLOUDFLARENET 的
+   分配段，而不是 cloudflare.com/ips 那份公告：公告把 `104.16.0.0/12` 拆成 `/13` 加 `/14`，
+   正好漏掉真机上漏出去的那两个 `104.28.x`（whois 查出来 NetName 就是 CLOUDFLARENET）。
+
+实测结果（Ubuntu 26.04、18 条出口、开着中转）：15 条逐个走 SOCKS 拿到节点侧出口 IP、3 条明确不通，
+**没有一条再报出 Cloudflare 的 IP**；rc1 那种连不回来的 deadlock 在 rc2 上归零。
+
 这一层是拿内核的 WireGuard 直接架在每条出口的 netns 里的，不装也不跑官方 `warp-cli`：
 fanout 只要那 32 字节密钥和一条策略路由，多养一个 daemon 只会多一个会掉线的环节。
 
@@ -200,7 +219,7 @@ Xray 到 `/var/lib/fanout/bin/`，装了则跳过，入站交给面板管。
 > 才生效：`f` → `3) 重启`（或 `f restart`）。`install.sh` 现在重装会显式
 > `systemctl restart`——以前用 `enable --now`，对已运行的单元是空操作，
 > 于是新二进制在磁盘上、老进程还在服务老界面。
-> 想确认手上是哪一份：`fanout -version`，本仓库显示 `v2.0.13`，上游原版是 `v1.3.1`。
+> 想确认手上是哪一份：`fanout -version`，本仓库显示 `v2.1.0`，上游原版是 `v1.3.1`。
 
 > **发新版本。** 推一个 `v*` tag 就会触发 release workflow 出 amd64 / arm64
 > 两个包和 checksums；不打 tag 就没有 Release，`releases/latest/download/...`
@@ -596,6 +615,10 @@ wireguard-tools」那句原话写在说明里。内核不带 WireGuard 也不是
   用户流量走 `0.0.0.0/1` + `128.0.0.0/1` 进 tun0。
 - 失败即闭合。Cloudflare 没握手时这条出口就是连不上，而不是悄悄从母机出去——
   后者界面看不出来，健康检查也看不出来（母机 IP 照样能出网），是最坏的一种「以为在保护」。
+- 反方向也闭合。openvpn 没连着时 netns 里的默认路由会被撤掉，用户流量不许只走到 Cloudflare
+  就出去（那等于界面说这条出口有问题、客户端却照常上网，只是换了个 IP）；探测到的出口 IP
+  落在 Cloudflare 名下时直接判成「只走到中转，没走节点」。节点地址那条 /32 提前钉好，
+  所以 openvpn 自己照样连得回来。
 
 **连不上时会说清是哪一种。** 同一条「没连上」背后可能是节点死了、认证被拒、证书过期、
 外层包发大了，也可能只是 WARP 那一跳根本没握手——以前出口卡片只有「连接中…」，
@@ -676,7 +699,7 @@ REALITY 的密钥对和 shortId 自动生成；TLS 不填证书就生成自签�
 
 ```
   状态      运行中
-  版本      fanout v2.0.13
+  版本      fanout v2.1.0
   开机自启  enabled
 
   管理地址  http://1.2.3.4:8899/gwPuWHvaNr/

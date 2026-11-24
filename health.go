@@ -109,6 +109,24 @@ func (m *Manager) healthSweep(fails map[int]int) {
 		why string
 	}
 	ch := make(chan verdict, len(tunnels))
+
+	// 开着 WARP 时先把每条 netns 的转发状态对齐一遍，再谈探测。
+	// 这一步管的是两种"界面和实际不一致"：openvpn 自己重连会把装在 tun0 上的
+	// 分流路由一起带走（流量原路走 Cloudflare 出去），而隧道没连着时默认路由
+	// 还指着 WireGuard 设备（客户端照样能上网，只是站在 Cloudflare 的数据中心）。
+	// 两种都要在探测之前修掉，否则探测拿到的出口 IP 说的不是节点。
+	if warpOn() && warpSvc != nil {
+		for _, t := range tunnels {
+			acc := warpSvc.get(t.Slot)
+			if acc == nil {
+				continue
+			}
+			if did := t.warpGuardTunnel(acc); did != "" {
+				log.Printf("fanout: 出口 %d (%s) %s", t.Slot, t.host(), did)
+			}
+		}
+	}
+
 	var wg sync.WaitGroup
 	// 并发上限：探测本身是子进程 + 走隧道出网，全放开了在 40 条出口时
 	// 会把母机 CPU 和隧道带宽一起打满，反而把好隧道挤掉线。
@@ -123,7 +141,16 @@ func (m *Manager) healthSweep(fails map[int]int) {
 			sem <- struct{}{}
 			defer func() { <-sem }()
 			got, err := m.probeTunnel(t)
-			ch <- verdict{t: t, ok: err == nil && got == t.exitIP(), why: tunnelProbeWhy(got, err)}
+			ok := err == nil && got == t.exitIP()
+			why := tunnelProbeWhy(got, err)
+			// 开着 WARP 时探测到的出口 IP 落在 Cloudflare 宣布的网段里，说的不是节点：
+			// 流量只走到了中转就出去了。这种必须算掉线（换节点重连），
+			// 不能只把 IP 显示成节点的那个——客户端会以为自己在日本，其实站在 Cloudflare。
+			if err == nil && warpOn() && warpExitIsTransitOnly(got) {
+				ok = false
+				why = "出口变成 " + got + "（只走到 Cloudflare 中转，没走节点）"
+			}
+			ch <- verdict{t: t, ok: ok, why: why}
 		}(t)
 	}
 	go func() { wg.Wait(); close(ch) }()

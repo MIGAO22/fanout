@@ -465,10 +465,10 @@ func TestWarpSplitPinsGateOntoWarp(t *testing.T) {
 	if got := strings.Join(cmds[0], " "); got != "ip route replace 61.215.116.134/32 dev fow7" {
 		t.Errorf("Gate 地址没钉在 WARP 上：%s", got)
 	}
-	if got := strings.Join(cmds[2], " "); got != "ip route add 0.0.0.0/1 dev tun0" {
+	if got := strings.Join(cmds[2], " "); got != "ip route replace 0.0.0.0/1 dev tun0" {
 		t.Errorf("用户流量没接进隧道：%s", got)
 	}
-	if got := strings.Join(cmds[3], " "); got != "ip route add 128.0.0.0/1 dev tun0" {
+	if got := strings.Join(cmds[3], " "); got != "ip route replace 128.0.0.0/1 dev tun0" {
 		t.Errorf("用户流量只接了一半：%s", got)
 	}
 	// 顺序不能反：先两条 /1 的话 Gate 的控制通道会先被吞进 tun0，隧道自己吃自己
@@ -571,6 +571,134 @@ func TestWarpOffChangesNothing(t *testing.T) {
 
 // 服务器推送的 MTU 优先级比命令行高：不挡回去，外层就超过链路扛得住的大小，
 // 症状是"每条出口、每个节点都超时"，看着像 VPN Gate 全死了。
+// 分流路由必须是 replace：健康检查会反复补装同两条 /1，add 第二次就回 File exists，
+// 于是"路由其实是对的"被当成失败。
+func TestWarpSplitRoutesAreIdempotent(t *testing.T) {
+	cmds := warpSplitCmds("fow1", "tun0", []string{"180.59.230.60", "8.8.8.8"})
+	if len(cmds) != 4 {
+		t.Fatalf("条数 = %v，想要两条 /32 加两条 /1", cmds)
+	}
+	for _, c := range cmds {
+		joined := strings.Join(c, " ")
+		if !strings.HasPrefix(joined, "ip route replace ") {
+			t.Errorf("分流必须幂等：%s", joined)
+		}
+		if strings.HasPrefix(joined, "ip route add ") {
+			t.Errorf("不许用 add（补装第二次会 File exists）：%s", joined)
+		}
+	}
+	last := strings.Join(cmds[len(cmds)-1], " ")
+	if last != "ip route replace 128.0.0.0/1 dev tun0" {
+		t.Errorf("最后一条 = %q", last)
+	}
+}
+
+// 这三段路由表是从真机（开着中转的 VPS）上抄下来的：第一条正常，
+// 第二条是 openvpn 重连之后（tun0 在、/1 没了），第三条是隧道根本没连着（tun0 没了、
+// 默认路由还指着 WireGuard 设备）。后两种都必须动，第一种一步都不许动。
+func TestParseWarpRoutesReadsTheFieldOutput(t *testing.T) {
+	good := `0.0.0.0/1 dev tun0 scope link 
+default dev fow1 scope link 
+8.8.8.8 via 10.99.1.1 dev fop1 
+10.99.1.0/30 dev fop1 proto kernel scope link src 10.99.1.2 
+10.211.1.14 dev tun0 proto kernel scope link src 10.211.1.13 
+128.0.0.0/1 dev tun0 scope link 
+162.159.192.3 via 10.99.1.1 dev fop1 
+180.59.230.60 dev fow1 scope link `
+	splitGone := `default dev fow13 scope link 
+8.8.8.8 via 10.99.13.1 dev fop13 
+10.99.13.0/30 dev fop13 proto kernel scope link src 10.99.13.2 
+10.211.1.2 dev tun0 proto kernel scope link src 10.211.1.1 
+162.159.192.2 via 10.99.13.1 dev fop13 
+182.20.60.214 dev fow13 scope link `
+	noTun := `default dev fow12 scope link 
+8.8.8.8 via 10.99.12.1 dev fop12 
+10.99.12.0/30 dev fop12 proto kernel scope link src 10.99.12.2 
+162.159.192.4 via 10.99.12.1 dev fop12 `
+
+	cases := []struct {
+		name, blob, dev string
+		want            warpRouteState
+		need            bool
+	}{
+		{"正常", good, "fow1", warpRouteState{TunUp: true, SplitOK: true, DefOnDev: true}, false},
+		{"重连后分流没了", splitGone, "fow13", warpRouteState{TunUp: true, DefOnDev: true}, true},
+		{"隧道没连着", noTun, "fow12", warpRouteState{TunUp: false, DefOnDev: true}, true},
+		{"全都没有", "", "fow9", warpRouteState{}, false},
+	}
+	for _, c := range cases {
+		got := parseWarpRoutes(c.blob, c.dev)
+		if got != c.want {
+			t.Errorf("%s 解析成 %+v，期望 %+v", c.name, got, c.want)
+		}
+		if n := warpGuardNeeded(got); n != c.need {
+			t.Errorf("%s 该不该动 = %v，期望 %v", c.name, n, c.need)
+		}
+	}
+}
+
+// 隧道没连着时 netns 里会被撤掉默认路由，那条 /32 是 openvpn 唯一还能用的路，
+// 所以钉节点地址必须在 openvpn 启动之前，而不是 tun0 起来之后。
+// rc1 在真机上就是因为这个顺序错了：换节点时新地址没人认识，
+// openvpn 当场 "write UDPv4 []: Network is unreachable" 退出，隧道再也起不来。
+func TestWarpGatePinsAreSeparateAndIPv4Only(t *testing.T) {
+	pins := warpGatePinCmds("fow1", []string{"182.20.60.214", "fd00::1", "bogus", "61.215.116.134"})
+	if len(pins) != 2 {
+		t.Fatalf("只该给 IPv4 下 /32，得到 %v", pins)
+	}
+	if got := strings.Join(pins[0], " "); got != "ip route replace 182.20.60.214/32 dev fow1" {
+		t.Errorf("钉节点那条 = %q", got)
+	}
+	if strings.Contains(strings.Join(pins[1], " "), "tun0") {
+		t.Errorf("钉节点不该碰 tun0（那时候它还不存在）：%v", pins)
+	}
+	// 分流命令必须以这批钉住开头：先让控制通道有路，再谈用户流量
+	split := warpSplitCmds("fow1", "tun0", []string{"182.20.60.214"})
+	if strings.Join(split[0], " ") != "ip route replace 182.20.60.214/32 dev fow1" {
+		t.Errorf("分流的第一条必须是钉住节点：%v", split)
+	}
+	if got := warpGatePinCmds("fow1", nil); got != nil {
+		t.Errorf("没有节点地址时不该拼出任何东西：%v", got)
+	}
+}
+
+// 补装和切断是两回事：隧道连着要把默认路由和两条 /1 都摆正；
+// 隧道没连着只撤默认路由——留着 /1 反而可能把流量留在一个不存在的接口上。
+func TestWarpGuardCmdsDifferByTunnelState(t *testing.T) {
+	open := warpGuardCmds("fow1", "tun0", []string{"180.59.230.60"}, true)
+	if strings.Join(open[0], " ") != "ip route replace default dev fow1" {
+		t.Errorf("第一条必须把默认路由摆回 WARP：%v", open[0])
+	}
+	joined := strings.Join([]string{strings.Join(open[len(open)-2], " "), strings.Join(open[len(open)-1], " ")}, " | ")
+	if !strings.Contains(joined, "0.0.0.0/1 dev tun0") || !strings.Contains(joined, "128.0.0.0/1 dev tun0") {
+		t.Errorf("补装要带上两条 /1：%s", joined)
+	}
+	closed := warpGuardCmds("fow1", "tun0", []string{"180.59.230.60"}, false)
+	if len(closed) != 1 || strings.Join(closed[0], " ") != "ip route del default" {
+		t.Fatalf("隧道没连着时只该撤默认路由，得到 %v", closed)
+	}
+	for _, c := range closed {
+		if j := strings.Join(c, " "); strings.Contains(j, "/1") || strings.Contains(j, "tun0") {
+			t.Errorf("切断时不该再碰 tun0 的路由：%s", j)
+		}
+	}
+}
+
+// 出口 IP 落在 Cloudflare 宣布的网段里 = 流量只走到了中转。这几条都是真机量到的。
+func TestWarpExitIsTransitOnly(t *testing.T) {
+	for _, ip := range []string{"104.28.247.68", "104.28.215.69", "162.159.192.3", "172.64.10.1", "198.41.128.9"} {
+		if !warpExitIsTransitOnly(ip) {
+			t.Errorf("%s 是 Cloudflare 的段，该判成只走了中转", ip)
+		}
+	}
+	for _, ip := range []string{"42.146.135.174", "113.145.249.52", "180.59.230.60", "202.224.30.208",
+		"104.32.0.1", "", "读不出来", "104.28.247.68,104.28.247.69"} {
+		if warpExitIsTransitOnly(ip) {
+			t.Errorf("%s 不该被判成中转出口", ip)
+		}
+	}
+}
+
 func TestWarpPullFilters(t *testing.T) {
 	if got := warpPullFilters(false, "2.6.8"); got != nil {
 		t.Errorf("关掉中转时不该加任何参数，得到 %v", got)
