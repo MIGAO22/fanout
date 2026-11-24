@@ -207,12 +207,12 @@ case "$ARCH" in
   *) echo "      不支持的架构: $ARCH" >&2; exit 1 ;;
 esac
 
-if [[ -f main.go ]] && command -v go >/dev/null; then
+if [[ -f cmd/fanout/main.go ]] && command -v go >/dev/null; then
   echo "      从源码编译"
   src_ver=$(git describe --tags --always --dirty 2>/dev/null || echo dev)
   go build -trimpath \
     -ldflags "-s -w -X main.version=${src_ver} -X main.updateRepo=${REPO}" \
-    -o "$BIN" .
+    -o "$BIN" ./cmd/fanout
 else
   echo "      下载预编译版本 (${GOARCH})"
   TMP=$(mktemp -d)

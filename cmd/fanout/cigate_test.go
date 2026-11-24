@@ -2,6 +2,7 @@ package main
 
 import (
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -16,9 +17,13 @@ import (
 // 判据写成测试而不是靠人 review workflow：手滑把 pipefail 删掉之后的症状是"CI 又绿了"，
 // 比红着更难发现。
 func TestWorkflowTestStepsPropagateFailure(t *testing.T) {
-	b, err := os.ReadFile(".github/workflows/test.yml")
+	root, found := testRepoRoot()
+	if !found {
+		t.Skip("往上找不到 go.mod（不在仓库里跑），跳过 workflow 判据比对")
+	}
+	b, err := os.ReadFile(filepath.Join(root, ".github", "workflows", "test.yml"))
 	if err != nil {
-		t.Skipf("读不到 test.yml（不在仓库根跑的），跳过: %v", err)
+		t.Fatalf("读不到 test.yml：%v，这道门不能静默跳过", err)
 	}
 	seen, gated := 0, 0
 	name, pipefail, tolerates := "(作业头)", false, false

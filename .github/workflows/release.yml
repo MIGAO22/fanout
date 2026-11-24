@@ -35,7 +35,7 @@ jobs:
           # 衍生版本必须从自己的仓库自更新，否则「更新」会把改动覆盖回上游二进制
           go build -trimpath \
             -ldflags "-s -w -X main.version=${VERSION} -X main.updateRepo=${GITHUB_REPOSITORY}" \
-            -o fanout .
+            -o fanout ./cmd/fanout
 
       - name: 打包
         run: |

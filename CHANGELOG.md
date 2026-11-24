@@ -4,6 +4,18 @@
 [byJoey/fanout](https://github.com/byJoey/fanout)；更早的过程在 git 历史和各个
 Release 页面里。
 
+## v2.1.6
+
+- **源码整体挪进 `cmd/fanout/`**：仓库根原来 88 项（75 个 `.go` 平铺在根目录），GitHub 首页要
+  滚很久才看到 README。`web/` 必须跟着一起挪——`go:embed` 的路径是相对源文件所在目录的，
+  只挪源码不挪资源，二进制里就没有界面了。`install.sh` 的源码探测、release / test workflow 的
+  构建包路径同步改成 `./cmd/fanout`；Release 资产名一个字没动，已装机器上的 `f update` 照常。
+- `TestOvpnSrcRecipeMirrorsWorkflow` 改成从工作目录往上找 `go.mod` 定仓库根，并且**读不到副本
+  就报错**。它原来是 `t.Skipf`：路径一错这条比对就静默不跑，而它防的是「用户在 VPS 上等十几分钟、
+  configure 才报 lzo enabled but missing」。
+- README「本地开发」里「非 Linux 也能跑纯逻辑用例」那句是错的——整个包在 Windows 上编译不过
+  （`hostdisk.go` 用 `unix.Statfs_t`），改成说明怎么把单个纯函数文件拷进临时 module 单跑。
+
 ## v2.1.5
 
 - **出口卡片给支持 AEAD 的节点挂一个 `AEAD` 标记**，出口组的组员 chip 悬浮说明里也写明。

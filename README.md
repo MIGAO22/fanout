@@ -422,22 +422,30 @@ f uninstall  # 卸载（服务、二进制、netns 和 /var/lib/fanout 全删）
 
 ## 本地开发
 
-程序只能在 Linux 上跑（netns + `setns`），Windows / macOS 上只能交叉编译：
+仓库根只有十来项：`cmd/fanout/` 是全部 Go 源码和前端资源（一个 `package main`），
+`worker/` 是 VPN Gate 反代的 Cloudflare Worker，`install.sh` / `f.sh` / `fanout.service`
+是装机与运维脚本，`.github/workflows/` 是 CI 与发版。程序只能在 Linux 上跑
+（netns + `setns`），Windows / macOS 上只能交叉编译：
 
 ```bash
-GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o fanout .
+GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o fanout ./cmd/fanout
 GOOS=linux GOARCH=amd64 go vet ./...
 go test ./...          # 需要 Linux 运行时，部分用例依赖 netns
 ```
 
-纯逻辑那批不碰 netns，非 Linux 也能跑，改它们时没必要开虚拟机：
+纯函数那批（`ovpncipher.go`、`pool.go` 里的选路判定等）不碰 netns，但它们和整个包在一起，
+而非 Linux 上这个包根本编译不过（`hostdisk.go` 用 `unix.Statfs_t`）。所以非 Linux 机器要验
+纯逻辑，就把那一个文件连同 `go.mod` 拷进临时 module 单跑；正式回归一律在 Linux 上
+`go test ./...`，CI 也是这么跑的。
 
 ```bash
+# 在 Linux 上单独跑那批纯算法用例
 go test -run 'OvpnSrc|Gpg|OpenvpnCanBuildSource|DebStableVer|DataCipher|NodeSupportsAEAD|PoolGoneHosts|PoolReusePick' ./...
 ```
 
-前端在 `web/`（`index.html` / `app.js` / `login.html`），样式和结构都在 `index.html` 的
-`<style>` 里，改完重新 build 就通过 `go:embed` 带进二进制。想在非 Linux 机器上看界面效果，
+前端在 `cmd/fanout/web/`（`index.html` / `app.js` / `login.html`），样式和结构都在
+`index.html` 的 `<style>` 里。它必须和 Go 源码同目录：`go:embed` 的路径是相对源文件所在目录的，
+挪动 `web/` 而不同步挪源码，二进制里就没有界面了。想在非 Linux 机器上看界面效果，
 仓库外的静态托管 + 假接口即可，不必真起隧道。
 
 ## 已知限制
@@ -472,7 +480,7 @@ go test -run 'OvpnSrc|Gpg|OpenvpnCanBuildSource|DebStableVer|DataCipher|NodeSupp
 ## 上游与致谢
 
 - 原始项目：**[byJoey/fanout](https://github.com/byJoey/fanout)** —— 架构、功能和绝大部分代码
-  都来自这里。本仓库的改动集中在 `web/`（界面重写）、`restart.go`（重载合并）以及连接层的
-  健壮性修补。
+  都来自这里。本仓库的改动集中在 `cmd/fanout/web/`（界面重写）、`restart.go`（重载合并）
+  以及连接层的健壮性修补。
 - 上游作者的其他项目：[xray-cf-lite](https://github.com/byJoey/xray-cf-lite)。
 - 上游的交流群、教程和博客见 [byJoey/fanout 的 README](https://github.com/byJoey/fanout#readme)。

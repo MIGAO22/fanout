@@ -2,6 +2,7 @@ package main
 
 import (
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -185,6 +186,25 @@ func TestOvpnSrcDeps(t *testing.T) {
 	}
 }
 
+// testRepoRoot 从当前工作目录往上找 go.mod，返回仓库根。
+func testRepoRoot() (string, bool) {
+	dir, err := os.Getwd()
+	if err != nil {
+		return "", false
+	}
+	for i := 0; i < 8; i++ {
+		if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
+			return dir, true
+		}
+		up := filepath.Dir(dir)
+		if up == dir {
+			break
+		}
+		dir = up
+	}
+	return "", false
+}
+
 // 配方在 workflow 和 README 里还各有一份给人看的副本。漂移一次的代价是用户在自己 VPS 上
 // 等十几分钟、configure 才报 "lzo enabled but missing"，所以让单测去比对字面量。
 func TestOvpnSrcRecipeMirrorsWorkflow(t *testing.T) {
@@ -195,10 +215,20 @@ func TestOvpnSrcRecipeMirrorsWorkflow(t *testing.T) {
 	want := strings.Join(steps[1][4:], " ")
 	// 两份副本各自写自己的 --prefix（$PREFIX / 具体版本），所以只比开关序列
 	flags := strings.Join(ovpnSrcConfigureArgv("x")[2:], " ")
-	for _, f := range []string{".github/workflows/openvpn-src.yml", "README.md"} {
+	// 副本在仓库根，而 go test 的工作目录是包目录（现在是 cmd/fanout）。往上找 go.mod
+	// 定仓库根，比写死 ../../ 更耐挪动；只有"把测试二进制单独拷到别处跑"才会找不到，
+	// CI 里永远找得到——所以读到了却打不开要报错，不能跳过。
+	root, found := testRepoRoot()
+	if !found {
+		t.Skip("往上找不到 go.mod（不在仓库里跑），跳过副本比对")
+	}
+	for _, f := range []string{
+		filepath.Join(root, ".github", "workflows", "openvpn-src.yml"),
+		filepath.Join(root, "README.md"),
+	} {
 		b, err := os.ReadFile(f)
 		if err != nil {
-			t.Skipf("读不到 %s（不在仓库根跑的），跳过副本比对", f)
+			t.Fatalf("读不到副本 %s：%v，两份清单的比对不能跳过", f, err)
 		}
 		// workflow 里那行用反斜杠续行，压平空白再比
 		flat := strings.Join(strings.Fields(strings.ReplaceAll(string(b), `\`, " ")), " ")
