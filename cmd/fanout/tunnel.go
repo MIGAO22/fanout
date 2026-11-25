@@ -111,12 +111,18 @@ func (o *ovpnProc) deadReason() (string, bool) {
 
 // kill 结束进程。幂等：进程已退或从没起来都不报错。
 func (o *ovpnProc) kill() {
-	if o == nil || o.cmd == nil || o.cmd.Process == nil {
+	if o == nil {
 		return
 	}
-	// 先关 stopped 再动手：等退出的那个 goroutine 由此知道这是主动收手，
-	// 不会把"我们换了节点"报成"节点掉了"。
-	o.stopOnce.Do(func() { close(o.stopped) })
+	// 先记下"这是我主动收的手"，再去杀进程。放在 cmd 判空之前：进程早就自己退了
+	// 或者从没起来过时，盯着它的那个 goroutine 也得有人替它收工，否则每次换节点
+	// 都要漏一条挂在 select 上的 goroutine。
+	if o.stopped != nil {
+		o.stopOnce.Do(func() { close(o.stopped) })
+	}
+	if o.cmd == nil || o.cmd.Process == nil {
+		return
+	}
 	_ = o.cmd.Process.Kill()
 	// 把 done 排空一次，避免 Wait 的结果没人收
 	select {

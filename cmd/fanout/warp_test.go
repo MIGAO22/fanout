@@ -264,7 +264,10 @@ func TestWarpSetupCommandsOrder(t *testing.T) {
 	}
 	// 默认路由换过去之前，直连例外必须已经在位
 	for i, c := range cmds[:2] {
-		if !strings.Contains(strings.Join(c, " "), "route add") {
+		j := strings.Join(c, " ")
+		// 认 replace 不认 add：setupNetns 已经把同一批地址逐条 /32 放行过了
+		// （见 netnsDirectCmds），再 add 会撞 File exists，整套装架失败。
+		if !strings.Contains(j, "route replace") || strings.Contains(j, " default") {
 			t.Errorf("第 %d 条之前不该动设备：%v", i+1, c)
 		}
 	}
