@@ -62,6 +62,51 @@ type Tunnel struct {
 type ovpnProc struct {
 	cmd  *exec.Cmd
 	done chan error // 进程退出后由 wait goroutine 写入
+
+	// stopped 由 kill 关闭，用来告诉"等退出"的那位这次是我们自己动的手，
+	// 不必再把这一下当成掉线记进界面。
+	stopped  chan struct{}
+	stopOnce sync.Once
+
+	// dead 关闭表示进程已经退出，deadWhy 在那之前写好（靠 close 建立先后关系）。
+	// 健康检查拿它当**确定判据**：进程没了就不存在"再观察两轮"的意义，
+	// 原来要等满 HealthFailures × HealthInterval（默认 30 秒）才判死，
+	// 那 30 秒里界面是绿的、客户端却在等一条已经不存在的路。
+	dead    chan struct{}
+	deadWhy string
+}
+
+// newOvpnProc 造一个带完整 channel 的进程句柄。
+func newOvpnProc(cmd *exec.Cmd, done chan error) *ovpnProc {
+	return &ovpnProc{
+		cmd:     cmd,
+		done:    done,
+		stopped: make(chan struct{}),
+		dead:    make(chan struct{}),
+	}
+}
+
+// markDead 记下进程退出的原因；重复调用只有第一次有效。
+func (o *ovpnProc) markDead(why string) {
+	select {
+	case <-o.dead:
+	default:
+		o.deadWhy = why
+		close(o.dead)
+	}
+}
+
+// deadReason 报"这个进程是不是已经退出了"以及原因。
+func (o *ovpnProc) deadReason() (string, bool) {
+	if o == nil {
+		return "", false
+	}
+	select {
+	case <-o.dead:
+		return o.deadWhy, true
+	default:
+		return "", false
+	}
 }
 
 // kill 结束进程。幂等：进程已退或从没起来都不报错。
@@ -69,11 +114,35 @@ func (o *ovpnProc) kill() {
 	if o == nil || o.cmd == nil || o.cmd.Process == nil {
 		return
 	}
+	// 先关 stopped 再动手：等退出的那个 goroutine 由此知道这是主动收手，
+	// 不会把"我们换了节点"报成"节点掉了"。
+	o.stopOnce.Do(func() { close(o.stopped) })
 	_ = o.cmd.Process.Kill()
 	// 把 done 排空一次，避免 Wait 的结果没人收
 	select {
 	case <-o.done:
 	default:
+	}
+}
+
+// watchOvpnExit 在隧道已经起来之后继续盯着那个进程，把退出变成一条界面看得见的理由。
+//
+// waitTunUp 只在建立阶段等 done；就绪之后就没人收这个 channel 了，于是 openvpn 秒退
+// （节点端口不该答、证书过期、被 OOM 杀掉）在界面上仍然是一句"绿着"，
+// 真正的死因留在 logPath 里没人读。这里把它接上：谁先发生算谁。
+func watchOvpnExit(o *ovpnProc, logPath string) {
+	select {
+	case err := <-o.done:
+		why := "openvpn 进程已退出"
+		if err != nil {
+			why += "：" + err.Error()
+		}
+		if h := ovpnLogHint(logPath); h != "" {
+			why += "（" + h + "）"
+		}
+		o.markDead(oneLine(why, 220))
+	case <-o.stopped:
+		// 主动收手：换节点/停出口时调用方已经改过状态，这里不再记第二次原因。
 	}
 }
 
@@ -138,6 +207,29 @@ func (t *Tunnel) proc() *ovpnProc {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	return t.ovpn
+}
+
+// procDead 报"这条出口的 openvpn 进程是不是已经退了"。
+//
+// 这是确定证据，不是"探测失败第 N 次"那种需要防抖的信号：进程不会退了又活着。
+// 健康检查据此跳过 HealthFailures 直接重连，把界面上"绿着但全不通"的时间
+// 从 3 个检查周期压到 1 个。
+func (t *Tunnel) procDead() (string, bool) {
+	return t.proc().deadReason()
+}
+
+// netnsHasDefault 看这条 netns 此刻有没有默认路由。
+//
+// 它是"隧道到底有没有把流量接走"的直接证据：netns 建架时故意不装默认路由
+// （见 netnsDirectCmds），唯一的默认路由应该来自节点推送。没有就说明这条节点
+// 连上了却不接流量——表现是隧道状态是 up、客户端却一个包都出不去。
+func netnsHasDefault(ns string) bool {
+	out, err := cmdCombined(exec.Command("ip", "netns", "exec", ns,
+		"ip", "-o", "route", "show", "default"))
+	if err != nil {
+		return false
+	}
+	return routeHasDefault(string(out))
 }
 
 func (t *Tunnel) setProc(o *ovpnProc) {
@@ -285,9 +377,6 @@ func (t *Tunnel) setupNetns() error {
 	if err := run("ip", "netns", "exec", ns, "ip", "link", "set", peer, "up"); err != nil {
 		return err
 	}
-	if err := run("ip", "netns", "exec", ns, "ip", "route", "add", "default", "via", sub+".1"); err != nil {
-		return err
-	}
 
 	// netns 内的 DNS，仅用于 openvpn 解析远端主机名
 	nsDir := filepath.Join("/etc/netns", ns)
@@ -296,6 +385,21 @@ func (t *Tunnel) setupNetns() error {
 	}
 	if err := os.WriteFile(filepath.Join(nsDir, "resolv.conf"), []byte("nameserver 8.8.8.8\n"), 0644); err != nil {
 		return fmt.Errorf("写 resolv.conf 失败: %w", err)
+	}
+
+	// 这里刻意**不装默认路由**。openvpn 要连的地址和 DNS 逐条 /32 放行，
+	// 剩下的路一条都不给——隧道没连着时"出不去"是正确结果，
+	// "从母机出去"才是事故（原来那条 default via 母机就是漏口，见 netnsDirectCmds）。
+	// 隧道的默认路由由节点推送；开 WARP 时由 warpSetupCmds 换成 WireGuard 设备。
+	pins := netnsDirectCmds(netnsDirect{
+		Gw:  sub + ".1",
+		Dev: peer,
+		IPs: append(nodeEgressIPs(t), t.netnsNameservers()...),
+	})
+	for _, c := range pins {
+		if err := run("ip", append([]string{"netns", "exec", ns}, c...)...); err != nil {
+			return err
+		}
 	}
 
 	cidr := sub + ".0/30"
@@ -439,7 +543,8 @@ func (t *Tunnel) startOpenVPN(dir string, acc *WarpAccount) error {
 	go func() { done <- cmd.Wait() }()
 
 	old := t.proc()
-	t.setProc(&ovpnProc{cmd: cmd, done: done})
+	p := newOvpnProc(cmd, done)
+	t.setProc(p)
 	// 上一节点的进程如果还在（换节点时走到这一步），现在可以收了：
 	// 新进程已经起来了，旧 netns 也早就拆过，留着只会占着一个口。
 	old.kill()
@@ -462,6 +567,9 @@ func (t *Tunnel) startOpenVPN(dir string, acc *WarpAccount) error {
 		}
 		return fmt.Errorf("%v%s，详见 %s", waitErr, tail, logPath)
 	}
+	// 隧道起来了，之后这个进程的退出就只剩"意外"这一种：接着盯住它，
+	// 让健康检查第一轮就能判死，而不是等满 3 轮防抖。
+	go watchOvpnExit(p, logPath)
 	return nil
 }
 

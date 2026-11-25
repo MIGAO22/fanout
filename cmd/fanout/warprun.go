@@ -610,7 +610,7 @@ func (t *Tunnel) setupWarp(acc *WarpAccount) error {
 	// （不让用户流量只走到 Cloudflare 就出去），这条 /32 是 openvpn 剩下的唯一一条路。
 	// 留到 tun0 起来之后再装的话，换节点时新地址没人认识，openvpn 会当场
 	// "Network is unreachable" 退出，隧道再也起不来——rc1 在真机上就是这么死的。
-	for _, c := range warpGatePinCmds(dev, warpGateIPsOf(t)) {
+	for _, c := range warpGatePinCmds(dev, nodeEgressIPs(t)) {
 		if err := warpRun(ns, "", c); err != nil {
 			return fmt.Errorf("钉住节点地址失败: %v", err)
 		}
@@ -629,8 +629,10 @@ func (t *Tunnel) netnsNameservers() []string {
 	return warpNameservers(string(blob))
 }
 
-// warpGateIPsOf 汇总这条隧道要钉在 WARP 上的节点地址。
-func warpGateIPsOf(t *Tunnel) []string {
+// nodeEgressIPs 汇总这条隧道必须够得到的节点地址：配置里写明的 remote、
+// 备用 remote-entry，以及 CSV 那个 IP 兜底。WARP 拿它把节点钉在中转设备上，
+// setupNetns 拿它决定隧道起来之前允许直连谁（见 netnsDirectCmds）。
+func nodeEgressIPs(t *Tunnel) []string {
 	n := t.node()
 	ips := warpGateIPs(n.Config, n.IP)
 	for _, name := range warpGateNames(n.Config) {
@@ -643,7 +645,7 @@ func warpGateIPsOf(t *Tunnel) []string {
 // 失败必须往上传：漏掉这一步的话流量停在 Cloudflare，
 // 出口 IP 变成 WARP 的而不是节点的，用户以为中转生效了、实际根本没走 Gate。
 func (t *Tunnel) warpSplit(acc *WarpAccount) error {
-	for _, c := range warpSplitCmds(acc.devName(), "tun0", warpGateIPsOf(t)) {
+	for _, c := range warpSplitCmds(acc.devName(), "tun0", nodeEgressIPs(t)) {
 		if err := run("ip", append([]string{"netns", "exec", t.nsName()}, c...)...); err != nil {
 			return fmt.Errorf("WARP 分流失败: %w", err)
 		}
@@ -669,7 +671,7 @@ func (t *Tunnel) warpGuardTunnel(acc *WarpAccount) string {
 	if !st.TunUp {
 		why = "切断 WARP 转发（隧道没连着）"
 	}
-	for _, c := range warpGuardCmds(dev, "tun0", warpGateIPsOf(t), st.TunUp) {
+	for _, c := range warpGuardCmds(dev, "tun0", nodeEgressIPs(t), st.TunUp) {
 		if err := warpRun(ns, "", c); err != nil {
 			log.Printf("fanout: 出口 %d %s 没做成: %v", t.Slot, why, err)
 			return ""

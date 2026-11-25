@@ -1,6 +1,8 @@
 package main
 
 import (
+	"errors"
+	"os"
 	"strings"
 	"testing"
 )
@@ -82,5 +84,75 @@ func TestOneLine(t *testing.T) {
 	}
 	if oneLine("", 10) != "" {
 		t.Error("空串该还是空串")
+	}
+}
+
+// openvpn 进程退出在隧道就绪之后也必须被看见。
+//
+// 原来只有 waitTunUp 在建隧道那段时间等 done，就绪之后没人收，于是进程秒退
+// （被 OOM 杀掉、节点端口不该答、证书过期）在界面上仍然是一句"绿着"，
+// 判死要等满 HealthFailures × HealthInterval（默认 30 秒）。
+// 现在退出即记原因，健康检查拿它当确定判据。
+func TestWatchOvpnExitRecordsWhy(t *testing.T) {
+	dir := t.TempDir()
+	logPath := dir + "/fo1.log"
+	blob := "Fri Nov 25 22:40:01 2026 AUTH_FAILED,OpenVPN server: \n" +
+		"Fri Nov 25 22:40:01 2026 SIGTERM[hard,] received, process exiting\n"
+	if err := os.WriteFile(logPath, []byte(blob), 0600); err != nil {
+		t.Fatalf("写日志失败: %v", err)
+	}
+
+	p := newOvpnProc(nil, make(chan error, 1))
+	if _, dead := p.deadReason(); dead {
+		t.Fatal("刚建好的句柄不该已经是死的")
+	}
+	p.done <- errors.New("exit status 1")
+	watchOvpnExit(p, logPath) // 直接调，别靠 goroutine 的时序
+	why, dead := p.deadReason()
+	if !dead {
+		t.Fatal("进程退了必须记成已死，否则健康检查还得等三轮防抖")
+	}
+	for _, want := range []string{"openvpn 进程已退出", "exit status 1", "节点拒绝了用户名/密码"} {
+		if !strings.Contains(why, want) {
+			t.Errorf("原因里缺 %q：%s", want, why)
+		}
+	}
+	if len([]byte(why)) > 600 {
+		t.Errorf("那句要能进界面，太长了：%s", why)
+	}
+
+	// 重复收口只认第一次：换节点时旧句柄可能被 kill 和 watcher 同时碰到
+	p.markDead("第二次")
+	if again, _ := p.deadReason(); again != why {
+		t.Errorf("原因被覆盖了：%s -> %s", why, again)
+	}
+}
+
+// fanout 自己收掉进程（换节点、停出口、重连）不能算成"节点掉了"：
+// 调用方已经改过状态，这里再记一次会把一次正常换节点显示成一次掉线。
+func TestWatchOvpnExitStaysQuietWhenWeKillIt(t *testing.T) {
+	p := newOvpnProc(nil, make(chan error, 1))
+	p.stopOnce.Do(func() { close(p.stopped) })
+	watchOvpnExit(p, "/nonexistent/fo1.log")
+	if _, dead := p.deadReason(); dead {
+		t.Error("主动收手不该被记成进程意外退出")
+	}
+}
+
+// kill() 仍然要幂等且不报错：重连路径上会对同一个句柄调用两次
+// （reconnect 里一次、换节点时 old.kill() 又一次）。
+func TestOvpnProcKillIsIdempotent(t *testing.T) {
+	p := newOvpnProc(nil, make(chan error, 1))
+	p.kill()
+	p.kill()
+	select {
+	case <-p.stopped:
+	default:
+		t.Error("kill 之后 stopped 应已关闭，等退出的 goroutine 才能收工")
+	}
+	var nilProc *ovpnProc
+	nilProc.kill() // 不能 panic：setProc(nil) 之后老代码路径还会调一次
+	if _, dead := nilProc.deadReason(); dead {
+		t.Error("空句柄不该报死")
 	}
 }

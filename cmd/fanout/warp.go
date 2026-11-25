@@ -482,18 +482,22 @@ type warpSetupInput struct {
 //
 // 顺序是有讲究的：先开直连例外，再造设备，最后 replace 默认路由。
 // 反过来会把 Cloudflare 自己挡在隧道里，设备起了也握不上手。
-// 默认路由用 replace 而不是 add：netns 里已经有一条 via 母机的默认路由，
-// add 会直接回 File exists。
+// 默认路由用 replace 而不是 add：这一步会被健康检查反复补装（见 warpGuardCmds），
+// add 第二次就回 File exists，于是"路由其实是对的"被当成失败。
 func warpSetupCmds(in warpSetupInput) [][]string {
 	cmds := [][]string{}
 	for _, ip := range append([]string{in.Endpoint}, in.DirectIPs...) {
 		// 只给 IPv4 下例外：netns 里那条 veth 是纯 IPv4 的（见 netns.go），
-		// 给 IPv6 地址拼出 "ip route add fd00::1/32 via 10.x.y.1" 会让整套装架失败，
+		// 给 IPv6 地址拼出 "ip route replace fd00::1/32 via 10.x.y.1" 会让整套装架失败，
 		// 而失败的表现是这条出口连不上，看不出是 DNS 里混了个 v6。
+		//
+		// 用 replace 不用 add：setupNetns 已经把节点和 DNS 逐条 /32 放行过了
+		// （见 netnsDirectCmds），这里再 add 同一条会撞 File exists，
+		// 症状是"开了 WARP 之后每条出口都建不起来"。
 		if parsed := net.ParseIP(ip); parsed == nil || parsed.To4() == nil {
 			continue
 		}
-		cmds = append(cmds, []string{"ip", "route", "add", ip + "/32", "via", in.VethGw, "dev", in.Veth})
+		cmds = append(cmds, []string{"ip", "route", "replace", ip + "/32", "via", in.VethGw, "dev", in.Veth})
 	}
 	cmds = append(cmds,
 		// mtu 必须排在 type 之前：`ip link add` 的通用选项（mtu/address/…）由

@@ -377,6 +377,13 @@ func (m *Manager) tryNode(t *Tunnel) (string, error) {
 			// 这两种在界面上长得一样，但 WARP 那一跳的实况能把它们分开。
 			return "", fmt.Errorf("%v；%s", err, warpHopNote(t.nsName(), acc))
 		}
+		// 没开中转时先看默认路由在不在：netns 建架故意不装默认路由（见 netnsDirectCmds），
+		// 隧道的默认路由只能由节点推送。缺了就说明这个节点连上了却不接流量，
+		// 报"探测失败"会把人往网络问题上引，而实际该做的是换一个节点。
+		if !netnsHasDefault(t.nsName()) {
+			return "", fmt.Errorf("%v；节点没把默认路由推进隧道（连上了也不接流量），详见 %s",
+				err, t.nsName())
+		}
 		return "", err
 	}
 	if acc != nil && warpExitIsTransitOnly(ip) {

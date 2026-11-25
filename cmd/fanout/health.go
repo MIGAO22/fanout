@@ -107,6 +107,10 @@ func (m *Manager) healthSweep(fails map[int]int) {
 		t   *Tunnel
 		ok  bool
 		why string
+		// certain 为真表示这条结论不需要防抖：openvpn 进程退了不会是"抽风一次"。
+		// 探测失败要连错三轮才判死（Gate 的节点偶尔会卡一下，立刻换人是白烧槽位），
+		// 但进程已经没了还等三轮，就是让客户端在一条不存在的路由上等 30 秒。
+		certain bool
 	}
 	ch := make(chan verdict, len(tunnels))
 
@@ -138,6 +142,12 @@ func (m *Manager) healthSweep(fails map[int]int) {
 		wg.Add(1)
 		go func(t *Tunnel) {
 			defer wg.Done()
+			// 进程已经退了就不必再探测：curl 走的是这条 netns，而它现在
+			// 连默认路由都没有，等满超时只会白占一个并发名额。
+			if why, dead := t.procDead(); dead {
+				ch <- verdict{t: t, ok: false, why: why, certain: true}
+				return
+			}
 			sem <- struct{}{}
 			defer func() { <-sem }()
 			got, err := m.probeTunnel(t)
@@ -156,19 +166,23 @@ func (m *Manager) healthSweep(fails map[int]int) {
 	go func() { wg.Wait(); close(ch) }()
 
 	var down []*Tunnel
+	// 掉线原因跟着走：光记"已掉线"的话，journal 里分不出是节点死了、
+	// 出口 IP 变了，还是 openvpn 进程直接退了——这三种下一步做的事不一样。
+	whys := map[int]string{}
 	for v := range ch {
 		if v.ok {
 			fails[v.t.Slot] = 0
 			continue
 		}
 		fails[v.t.Slot]++
-		if fails[v.t.Slot] < cfg.HealthFailures {
+		if !v.certain && fails[v.t.Slot] < cfg.HealthFailures {
 			log.Printf("隧道 %d (%s) 探测失败 %d 次: %s",
 				v.t.Slot, v.t.host(), fails[v.t.Slot], v.why)
 			continue
 		}
 		fails[v.t.Slot] = 0
 		down = append(down, v.t)
+		whys[v.t.Slot] = v.why
 	}
 	if len(down) == 0 {
 		return
@@ -189,7 +203,7 @@ func (m *Manager) healthSweep(fails map[int]int) {
 		if i > 0 {
 			time.Sleep(time.Duration(200+rand.Intn(800)) * time.Millisecond)
 		}
-		log.Printf("隧道 %d (%s) 已掉线，正在换节点重连", t.Slot, t.host())
+		log.Printf("隧道 %d (%s) 已掉线，正在换节点重连：%s", t.Slot, t.host(), whys[t.Slot])
 		m.reconnect(t, t.host())
 	}
 }

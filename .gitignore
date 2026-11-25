@@ -1,3 +1,6 @@
-fanout
+# 只挡构建产物，别写 "fanout"——那会连 cmd/fanout/ 整个目录一起吃进 ignore，
+# 在里面新建的 .go 会静默不进版本控制（CI 报 undefined，本地却是绿的）。
+/fanout
+cmd/fanout/fanout
 *.tar.gz
 *.log

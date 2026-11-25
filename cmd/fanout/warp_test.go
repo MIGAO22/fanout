@@ -217,13 +217,14 @@ func TestWarpSetupCommandsOrder(t *testing.T) {
 	}
 	// 1~2：接入点和 DNS 先钉在直连侧。反过来先造设备，默认路由一换
 	// Cloudflare 自己就进了隧道，WireGuard 外层包再也出不去。
-	if got := strings.Join(cmds[0], " "); got != "ip route add 162.159.192.6/32 via 10.99.12.1 dev fop12" {
+	// 用 replace 不用 add：setupNetns 已经把同一批地址放行过一遍（见 netnsDirectCmds）。
+	if got := strings.Join(cmds[0], " "); got != "ip route replace 162.159.192.6/32 via 10.99.12.1 dev fop12" {
 		t.Errorf("第一条不是接入点直连例外：%s", got)
 	}
-	if got := strings.Join(cmds[1], " "); got != "ip route add 8.8.8.8/32 via 10.99.12.1 dev fop12" {
+	if got := strings.Join(cmds[1], " "); got != "ip route replace 8.8.8.8/32 via 10.99.12.1 dev fop12" {
 		t.Errorf("第二条不是 nameserver 直连例外：%s", got)
 	}
-	// 最后一条必须是 replace（netns 里已有一条 via 母机的默认路由，add 会 File exists）
+	// 最后一条必须是 replace：这一步会被健康检查反复补装，add 第二次就回 File exists
 	last := strings.Join(cmds[len(cmds)-1], " ")
 	if last != "ip route replace default dev fow12" {
 		t.Errorf("最后一条 = %q，必须是把默认路由换成 WARP 设备", last)
@@ -309,13 +310,14 @@ func TestGenericOptionsNeverFollowType(t *testing.T) {
 }
 
 func TestWarpSetupKeepsNonIPDirectOutOfRoutes(t *testing.T) {
-	// resolv.conf 里出现域名或坏值时不能拼出 ip route add xxx/32，那会让整套装架失败
+	// resolv.conf 里出现域名或坏值时不能拼出 ip route replace xxx/32，那会让整套装架失败
 	in := warpSetupInput{Dev: "fow1", PeerKey: warpPeerPub,
 		Endpoint: "162.159.192.6", Port: 2408, TunIP: "172.16.0.2", MTU: 1420,
 		VethGw: "10.1.1.1", Veth: "fop1", DirectIPs: []string{"fd00::1", "not-an-ip", "1.1.1.1"}}
 	var routes []string
 	for _, c := range warpSetupCmds(in) {
-		if len(c) > 3 && c[1] == "route" && c[2] == "add" {
+		// 只数直连例外那几条；末尾的 "replace default dev fow1" 是换默认路由，不算例外
+		if len(c) > 3 && c[1] == "route" && c[2] == "replace" && c[3] != "default" {
 			routes = append(routes, strings.Join(c, " "))
 		}
 	}
